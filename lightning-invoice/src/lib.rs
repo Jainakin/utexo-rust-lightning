@@ -42,6 +42,8 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::secp256k1::ecdsa::RecoverableSignature;
 
+use rgb_lib::ContractId;
+
 use core::cmp::Ordering;
 use core::fmt::{Display, Formatter, self};
 use core::iter::FilterMap;
@@ -98,6 +100,7 @@ pub enum Bolt11ParseError {
 	InvalidScriptHashLength,
 	InvalidRecoveryId,
 	InvalidSliceLength(String),
+	InvalidContractId,
 
 	/// Not an error, but used internally to signal that a part of the invoice should be ignored
 	/// according to BOLT11
@@ -432,6 +435,8 @@ pub enum TaggedField {
 	PaymentSecret(PaymentSecret),
 	PaymentMetadata(Vec<u8>),
 	Features(Bolt11InvoiceFeatures),
+	RgbAmount(RgbAmount),
+	RgbContractId(RgbContractId),
 }
 
 /// SHA-256 hash
@@ -467,6 +472,14 @@ pub struct ExpiryTime(Duration);
 /// `min_final_cltv_expiry_delta` to use for the last HTLC in the route
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct MinFinalCltvExpiryDelta(pub u64);
+
+/// Requested amount for the RGB asset
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RgbAmount(pub u64);
+
+/// Requested RGB contract ID
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RgbContractId(pub ContractId);
 
 /// Fallback address in case no LN payment is possible
 #[allow(missing_docs)]
@@ -518,6 +531,8 @@ pub mod constants {
 	pub const TAG_PAYMENT_SECRET: u8 = 16;
 	pub const TAG_PAYMENT_METADATA: u8 = 27;
 	pub const TAG_FEATURES: u8 = 5;
+	pub const TAG_RGB_AMOUNT: u8 = 30;
+	pub const TAG_RGB_CONTRACT_ID: u8 = 31;
 }
 
 impl InvoiceBuilder<tb::False, tb::False, tb::False, tb::False, tb::False, tb::False> {
@@ -605,6 +620,18 @@ impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool, M: tb::Boo
 			Ok(r) => self.tagged_fields.push(TaggedField::PrivateRoute(r)),
 			Err(e) => self.error = Some(e),
 		}
+		self
+	}
+
+	/// Sets the RGB amount.
+	pub fn rgb_amount(mut self, rgb_amount: u64) -> Self {
+		self.tagged_fields.push(TaggedField::RgbAmount(RgbAmount(rgb_amount)));
+		self
+	}
+
+	/// Sets the RGB contract ID.
+	pub fn rgb_contract_id(mut self, rgb_contract_id: ContractId) -> Self {
+		self.tagged_fields.push(TaggedField::RgbContractId(RgbContractId(rgb_contract_id)));
 		self
 	}
 }
@@ -1065,6 +1092,14 @@ impl RawBolt11Invoice {
 		find_extract!(self.known_tagged_fields(), TaggedField::Features(ref x), x)
 	}
 
+	pub fn rgb_amount(&self) -> Option<&RgbAmount> {
+		find_extract!(self.known_tagged_fields(), TaggedField::RgbAmount(ref x), x)
+	}
+
+	pub fn rgb_contract_id(&self) -> Option<&RgbContractId> {
+		find_extract!(self.known_tagged_fields(), TaggedField::RgbContractId(ref x), x)
+	}
+
 	/// This is not exported to bindings users as we don't support Vec<&NonOpaqueType>
 	pub fn fallbacks(&self) -> Vec<&Fallback> {
 		find_all_extract!(self.known_tagged_fields(), TaggedField::Fallback(ref x), x).collect()
@@ -1483,6 +1518,18 @@ impl Bolt11Invoice {
 	fn amount_pico_btc(&self) -> Option<u64> {
 		self.signed_invoice.amount_pico_btc()
 	}
+
+	/// Returns the invoice's `rgb_amount` if present
+	pub fn rgb_amount(&self) -> Option<u64> {
+		self.signed_invoice.rgb_amount()
+			.map(|x| x.0)
+	}
+
+	/// Returns the invoice's `rgb_contract_id` if present
+	pub fn rgb_contract_id(&self) -> Option<ContractId> {
+		self.signed_invoice.rgb_contract_id()
+			.map(|x| x.0)
+	}
 }
 
 impl From<TaggedField> for RawTaggedField {
@@ -1506,6 +1553,8 @@ impl TaggedField {
 			TaggedField::PaymentSecret(_) => constants::TAG_PAYMENT_SECRET,
 			TaggedField::PaymentMetadata(_) => constants::TAG_PAYMENT_METADATA,
 			TaggedField::Features(_) => constants::TAG_FEATURES,
+			TaggedField::RgbAmount(_) => constants::TAG_RGB_AMOUNT,
+			TaggedField::RgbContractId(_) => constants::TAG_RGB_CONTRACT_ID,
 		};
 
 		u5::try_from_u8(tag).expect("all tags defined are <32")

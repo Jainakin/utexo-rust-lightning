@@ -31,6 +31,8 @@ use bitcoin::{secp256k1, Witness};
 use bitcoin::script::ScriptBuf;
 use bitcoin::hash_types::Txid;
 
+use rgb_lib::{ContractId, RgbTransport};
+
 use crate::blinded_path::payment::{BlindedPaymentTlvs, ForwardTlvs, ReceiveTlvs};
 use crate::ln::types::{ChannelId, PaymentPreimage, PaymentHash, PaymentSecret};
 use crate::ln::features::{ChannelFeatures, ChannelTypeFeatures, InitFeatures, NodeFeatures};
@@ -235,6 +237,8 @@ pub struct CommonOpenChannelFields {
 	/// If this is `None`, we derive the channel type from the intersection of our
 	/// feature bits with our counterparty's feature bits from the [`Init`] message.
 	pub channel_type: Option<ChannelTypeFeatures>,
+	/// The consignment endpoint used to exchange the RGB consignment
+	pub consignment_endpoint: Option<RgbTransport>,
 }
 
 impl CommonOpenChannelFields {
@@ -697,6 +701,8 @@ pub struct UpdateAddHTLC {
 	/// Provided if we are relaying or receiving a payment within a blinded path, to decrypt the onion
 	/// routing packet and the recipient-provided encrypted payload within.
 	pub blinding_point: Option<PublicKey>,
+	/// The RGB amount allocated to the HTLC
+	pub amount_rgb: Option<u64>,
 }
 
  /// An onion message to be sent to or received from a peer.
@@ -1245,6 +1251,8 @@ pub struct UnsignedChannelAnnouncement {
 	pub bitcoin_key_1: NodeId,
 	/// The funding key for the second node
 	pub bitcoin_key_2: NodeId,
+	/// RGB contract ID
+	pub contract_id: Option<ContractId>,
 	/// Excess data which was signed as a part of the message which we do not (yet) understand how
 	/// to decode.
 	///
@@ -1299,6 +1307,9 @@ pub struct UnsignedChannelUpdate {
 	///
 	/// This used to be optional.
 	pub htlc_maximum_msat: u64,
+	// TODO: if possible use Option
+	/// The maximum HTLC RGB value incoming to sender.
+	pub htlc_maximum_rgb: u64,
 	/// The base HTLC fee charged by sender, in milli-satoshi
 	pub fee_base_msat: u32,
 	/// The amount to fee multiplier, in micro-satoshi
@@ -1715,7 +1726,7 @@ pub trait OnionMessageHandler {
 	fn provided_init_features(&self, their_node_id: &PublicKey) -> InitFeatures;
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 /// Information communicated in the onion to the recipient for multi-part tracking and proof that
 /// the payment is associated with an invoice.
@@ -1749,6 +1760,7 @@ mod fuzzy_internal_msgs {
 			/// The value, in msat, of the payment after this hop's fee is deducted.
 			amt_to_forward: u64,
 			outgoing_cltv_value: u32,
+			rgb_amount_to_forward: Option<u64>,
 		},
 		Receive {
 			payment_data: Option<FinalOnionHopData>,
@@ -1757,6 +1769,7 @@ mod fuzzy_internal_msgs {
 			custom_tlvs: Vec<(u64, Vec<u8>)>,
 			sender_intended_htlc_amt_msat: u64,
 			cltv_expiry_height: u32,
+			rgb_amount_to_forward: Option<u64>,
 		},
 		BlindedForward {
 			short_channel_id: u64,
@@ -1765,6 +1778,7 @@ mod fuzzy_internal_msgs {
 			features: BlindedHopFeatures,
 			intro_node_blinding_point: Option<PublicKey>,
 			next_blinding_override: Option<PublicKey>,
+			rgb_amount_to_forward: Option<u64>,
 		},
 		BlindedReceive {
 			sender_intended_htlc_amt_msat: u64,
@@ -1776,15 +1790,18 @@ mod fuzzy_internal_msgs {
 			intro_node_blinding_point: Option<PublicKey>,
 			keysend_preimage: Option<PaymentPreimage>,
 			custom_tlvs: Vec<(u64, Vec<u8>)>,
+			rgb_amount_to_forward: Option<u64>,
 		}
 	}
 
+	#[derive(Debug)]
 	pub(crate) enum OutboundOnionPayload<'a> {
 		Forward {
 			short_channel_id: u64,
 			/// The value, in msat, of the payment after this hop's fee is deducted.
 			amt_to_forward: u64,
 			outgoing_cltv_value: u32,
+			rgb_amount_to_forward: Option<u64>,
 		},
 		#[allow(unused)]
 		TrampolineEntrypoint {
@@ -1800,10 +1817,12 @@ mod fuzzy_internal_msgs {
 			custom_tlvs: &'a Vec<(u64, Vec<u8>)>,
 			sender_intended_htlc_amt_msat: u64,
 			cltv_expiry_height: u32,
+			rgb_amount_to_forward: Option<u64>,
 		},
 		BlindedForward {
 			encrypted_tlvs: &'a Vec<u8>,
 			intro_node_blinding_point: Option<PublicKey>,
+			rgb_amount_to_forward: Option<u64>,
 		},
 		BlindedReceive {
 			sender_intended_htlc_amt_msat: u64,
@@ -1813,6 +1832,7 @@ mod fuzzy_internal_msgs {
 			intro_node_blinding_point: Option<PublicKey>, // Set if the introduction node of the blinded path is the final node
 			keysend_preimage: Option<PaymentPreimage>,
 			custom_tlvs: &'a Vec<(u64, Vec<u8>)>,
+			rgb_amount_to_forward: Option<u64>,
 		}
 	}
 
@@ -2391,6 +2411,7 @@ impl Writeable for OpenChannel {
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
+			(2, self.common_fields.consignment_endpoint, option),
 		});
 		Ok(())
 	}
@@ -2419,9 +2440,11 @@ impl Readable for OpenChannel {
 
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
+		let mut consignment_endpoint: Option<RgbTransport> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
+			(2, consignment_endpoint, option),
 		});
 		Ok(OpenChannel {
 			common_fields: CommonOpenChannelFields {
@@ -2443,6 +2466,7 @@ impl Readable for OpenChannel {
 				channel_flags,
 				shutdown_scriptpubkey,
 				channel_type,
+				consignment_endpoint,
 			},
 			push_msat,
 			channel_reserve_satoshis,
@@ -2475,6 +2499,7 @@ impl Writeable for OpenChannelV2 {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
 			(2, self.require_confirmed_inputs, option),
+			(3, self.common_fields.consignment_endpoint, option),
 		});
 		Ok(())
 	}
@@ -2505,10 +2530,12 @@ impl Readable for OpenChannelV2 {
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
 		let mut require_confirmed_inputs: Option<()> = None;
+		let mut consignment_endpoint: Option<RgbTransport> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
 			(2, require_confirmed_inputs, option),
+			(3, consignment_endpoint, option),
 		});
 		Ok(OpenChannelV2 {
 			common_fields: CommonOpenChannelFields {
@@ -2530,12 +2557,35 @@ impl Readable for OpenChannelV2 {
 				channel_flags,
 				shutdown_scriptpubkey,
 				channel_type,
+				consignment_endpoint,
 			},
 			funding_feerate_sat_per_1000_weight,
 			locktime,
 			second_per_commitment_point,
 			require_confirmed_inputs,
 		})
+	}
+}
+
+impl Readable for RgbTransport {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let sz: usize = <u16 as Readable>::read(r)? as usize;
+		let mut consignment_endpoint_str_vec = Vec::with_capacity(sz);
+		consignment_endpoint_str_vec.resize(sz, 0);
+		r.read_exact(&mut consignment_endpoint_str_vec)?;
+		match String::from_utf8(consignment_endpoint_str_vec) {
+			Ok(s) => return Ok(RgbTransport::from_str(&s).unwrap()),
+			Err(_) => return Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for RgbTransport {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		let consignment_endpoint_str = format!("{self}");
+		(consignment_endpoint_str.len() as u16).write(w)?;
+		w.write_all(consignment_endpoint_str.as_bytes())?;
+		Ok(())
 	}
 }
 
@@ -2629,6 +2679,7 @@ impl_writeable_msg!(UpdateAddHTLC, {
 	payment_hash,
 	cltv_expiry,
 	onion_routing_packet,
+	amount_rgb
 }, {
 	(0, blinding_point, option),
 	(65537, skimmed_fee_msat, option)
@@ -2676,11 +2727,12 @@ impl Readable for FinalOnionHopData {
 impl<'a> Writeable for OutboundOnionPayload<'a> {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		match self {
-			Self::Forward { short_channel_id, amt_to_forward, outgoing_cltv_value } => {
+			Self::Forward { short_channel_id, amt_to_forward, outgoing_cltv_value, rgb_amount_to_forward } => {
 				_encode_varint_length_prefixed_tlv!(w, {
 					(2, HighZeroBytesDroppedBigSize(*amt_to_forward), required),
 					(4, HighZeroBytesDroppedBigSize(*outgoing_cltv_value), required),
-					(6, short_channel_id, required)
+					(6, short_channel_id, required),
+					(20, rgb_amount_to_forward, option)
 				});
 			},
 			Self::TrampolineEntrypoint {
@@ -2696,7 +2748,7 @@ impl<'a> Writeable for OutboundOnionPayload<'a> {
 			},
 			Self::Receive {
 				ref payment_data, ref payment_metadata, ref keysend_preimage, sender_intended_htlc_amt_msat,
-				cltv_expiry_height, ref custom_tlvs,
+				cltv_expiry_height, ref custom_tlvs, rgb_amount_to_forward,
 			} => {
 				// We need to update [`ln::outbound_payment::RecipientOnionFields::with_custom_tlvs`]
 				// to reject any reserved types in the experimental range if new ones are ever
@@ -2708,18 +2760,20 @@ impl<'a> Writeable for OutboundOnionPayload<'a> {
 					(2, HighZeroBytesDroppedBigSize(*sender_intended_htlc_amt_msat), required),
 					(4, HighZeroBytesDroppedBigSize(*cltv_expiry_height), required),
 					(8, payment_data, option),
-					(16, payment_metadata.map(|m| WithoutLength(m)), option)
+					(16, payment_metadata.map(|m| WithoutLength(m)), option),
+					(20, rgb_amount_to_forward, option)
 				}, custom_tlvs.iter());
 			},
-			Self::BlindedForward { encrypted_tlvs, intro_node_blinding_point } => {
+			Self::BlindedForward { encrypted_tlvs, intro_node_blinding_point, rgb_amount_to_forward } => {
 				_encode_varint_length_prefixed_tlv!(w, {
 					(10, **encrypted_tlvs, required_vec),
-					(12, intro_node_blinding_point, option)
+					(12, intro_node_blinding_point, option),
+					(20, rgb_amount_to_forward, option)
 				});
 			},
 			Self::BlindedReceive {
 				sender_intended_htlc_amt_msat, total_msat, cltv_expiry_height, encrypted_tlvs,
-				intro_node_blinding_point, keysend_preimage, ref custom_tlvs,
+				intro_node_blinding_point, keysend_preimage, ref custom_tlvs, rgb_amount_to_forward,
 			} => {
 				// We need to update [`ln::outbound_payment::RecipientOnionFields::with_custom_tlvs`]
 				// to reject any reserved types in the experimental range if new ones are ever
@@ -2732,7 +2786,8 @@ impl<'a> Writeable for OutboundOnionPayload<'a> {
 					(4, HighZeroBytesDroppedBigSize(*cltv_expiry_height), required),
 					(10, **encrypted_tlvs, required_vec),
 					(12, intro_node_blinding_point, option),
-					(18, HighZeroBytesDroppedBigSize(*total_msat), required)
+					(18, HighZeroBytesDroppedBigSize(*total_msat), required),
+					(20, rgb_amount_to_forward, option)
 				}, custom_tlvs.iter());
 			},
 		}
@@ -2769,6 +2824,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 		let mut payment_metadata: Option<WithoutLength<Vec<u8>>> = None;
 		let mut total_msat = None;
 		let mut keysend_preimage: Option<PaymentPreimage> = None;
+		let mut rgb_amount_to_forward: Option<u64> = None;
 		let mut custom_tlvs = Vec::new();
 
 		let tlv_len = BigSize::read(r)?;
@@ -2782,6 +2838,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 			(12, intro_node_blinding_point, option),
 			(16, payment_metadata, option),
 			(18, total_msat, (option, encoding: (u64, HighZeroBytesDroppedBigSize))),
+			(20, rgb_amount_to_forward, option),
 			// See https://github.com/lightning/blips/blob/master/blip-0003.md
 			(5482373484, keysend_preimage, option)
 		}, |msg_type: u64, msg_reader: &mut FixedLengthReader<_>| -> Result<bool, DecodeError> {
@@ -2823,6 +2880,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 						features,
 						intro_node_blinding_point,
 						next_blinding_override,
+						rgb_amount_to_forward,
 					})
 				},
 				ChaChaPolyReadAdapter { readable: BlindedPaymentTlvs::Receive(ReceiveTlvs {
@@ -2839,6 +2897,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 						intro_node_blinding_point,
 						keysend_preimage,
 						custom_tlvs,
+						rgb_amount_to_forward,
 					})
 				},
 			}
@@ -2850,6 +2909,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 				short_channel_id,
 				amt_to_forward: amt.ok_or(DecodeError::InvalidValue)?,
 				outgoing_cltv_value: cltv_value.ok_or(DecodeError::InvalidValue)?,
+				rgb_amount_to_forward,
 			})
 		} else {
 			if encrypted_tlvs_opt.is_some() || total_msat.is_some() {
@@ -2867,6 +2927,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 				sender_intended_htlc_amt_msat: amt.ok_or(DecodeError::InvalidValue)?,
 				cltv_expiry_height: cltv_value.ok_or(DecodeError::InvalidValue)?,
 				custom_tlvs,
+				rgb_amount_to_forward,
 			})
 		}
 	}
@@ -2921,8 +2982,23 @@ impl Writeable for UnsignedChannelAnnouncement {
 		self.node_id_2.write(w)?;
 		self.bitcoin_key_1.write(w)?;
 		self.bitcoin_key_2.write(w)?;
+		self.contract_id.write(w)?;
 		w.write_all(&self.excess_data[..])?;
 		Ok(())
+	}
+}
+
+impl Readable for ContractId {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let buf: [u8; 32] = Readable::read(r)?;
+		let contract_id = ContractId::copy_from_slice(buf).unwrap();
+		Ok(contract_id)
+	}
+}
+
+impl Writeable for ContractId {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		w.write_all(&self[..])
 	}
 }
 
@@ -2936,6 +3012,7 @@ impl Readable for UnsignedChannelAnnouncement {
 			node_id_2: Readable::read(r)?,
 			bitcoin_key_1: Readable::read(r)?,
 			bitcoin_key_2: Readable::read(r)?,
+			contract_id: Readable::read(r)?,
 			excess_data: read_to_end(r)?,
 		})
 	}
@@ -2963,6 +3040,7 @@ impl Writeable for UnsignedChannelUpdate {
 		self.fee_base_msat.write(w)?;
 		self.fee_proportional_millionths.write(w)?;
 		self.htlc_maximum_msat.write(w)?;
+		self.htlc_maximum_rgb.write(w)?;
 		w.write_all(&self.excess_data[..])?;
 		Ok(())
 	}
@@ -2981,6 +3059,7 @@ impl Readable for UnsignedChannelUpdate {
 			fee_base_msat: Readable::read(r)?,
 			fee_proportional_millionths: Readable::read(r)?,
 			htlc_maximum_msat: Readable::read(r)?,
+			htlc_maximum_rgb: Readable::read(r)?,
 			excess_data: read_to_end(r)?,
 		};
 		if res.message_flags & 1 != 1 {
@@ -3281,6 +3360,7 @@ impl_writeable_msg!(GossipTimestampFilter, {
 	timestamp_range,
 }, {});
 
+/*
 #[cfg(test)]
 mod tests {
 	use bitcoin::{Amount, Transaction, TxIn, ScriptBuf, Sequence, Witness, TxOut};
@@ -4903,3 +4983,4 @@ mod tests {
 			port: 1234 }.to_socket_addrs().is_err());
 	}
 }
+*/

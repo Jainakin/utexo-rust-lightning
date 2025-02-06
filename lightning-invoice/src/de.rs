@@ -13,6 +13,7 @@ use bech32::{u5, FromBase32};
 use bitcoin::{PubkeyHash, ScriptHash, WitnessVersion};
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256;
+use rgb_lib::ContractId;
 use crate::prelude::*;
 use lightning_types::payment::PaymentSecret;
 use lightning_types::routing::{RoutingFees, RouteHint, RouteHintHop};
@@ -22,7 +23,7 @@ use bitcoin::secp256k1::PublicKey;
 
 use super::{Bolt11Invoice, Sha256, TaggedField, ExpiryTime, MinFinalCltvExpiryDelta, Fallback, PayeePubKey, Bolt11InvoiceSignature, PositiveTimestamp,
 	Bolt11SemanticError, PrivateRoute, Bolt11ParseError, ParseOrSemanticError, Description, RawTaggedField, Currency, RawHrp, SiPrefix, RawBolt11Invoice,
-	constants, SignedRawBolt11Invoice, RawDataPart, Bolt11InvoiceFeatures};
+	constants, SignedRawBolt11Invoice, RawDataPart, Bolt11InvoiceFeatures, RgbAmount, RgbContractId};
 
 use self::hrp_sm::parse_hrp;
 
@@ -466,6 +467,10 @@ impl FromBase32 for TaggedField {
 				Ok(TaggedField::PaymentMetadata(Vec::<u8>::from_base32(field_data)?)),
 			constants::TAG_FEATURES =>
 				Ok(TaggedField::Features(Bolt11InvoiceFeatures::from_base32(field_data)?)),
+			constants::TAG_RGB_AMOUNT =>
+				Ok(TaggedField::RgbAmount(RgbAmount::from_base32(field_data)?)),
+			constants::TAG_RGB_CONTRACT_ID =>
+				Ok(TaggedField::RgbContractId(RgbContractId::from_base32(field_data)?)),
 			_ => {
 				// "A reader MUST skip over unknown fields"
 				Err(Bolt11ParseError::Skip)
@@ -612,12 +617,39 @@ impl FromBase32 for PrivateRoute {
 				cltv_expiry_delta: u16::from_be_bytes(hop_bytes[49..51].try_into().expect("slice too big?")),
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
+				htlc_maximum_rgb: None,
 			};
 
 			route_hops.push(hop);
 		}
 
 		Ok(PrivateRoute(RouteHint(route_hops)))
+	}
+}
+
+impl FromBase32 for RgbAmount {
+	type Err = Bolt11ParseError;
+
+	fn from_base32(field_data: &[u5]) -> Result<RgbAmount, Bolt11ParseError> {
+		let rgb_amount = parse_u64_be(field_data);
+		if let Some(rgb_amount) = rgb_amount {
+			Ok(RgbAmount(rgb_amount))
+		} else {
+			Err(Bolt11ParseError::IntegerOverflowError)
+		}
+	}
+}
+
+impl FromBase32 for RgbContractId {
+	type Err = Bolt11ParseError;
+
+	fn from_base32(field_data: &[u5]) -> Result<RgbContractId, Bolt11ParseError> {
+		let bytes = Vec::<u8>::from_base32(field_data)?;
+		let rgb_contract_id_str = String::from(str::from_utf8(&bytes)?);
+		match ContractId::from_str(&rgb_contract_id_str) {
+			Ok(cid) => Ok(RgbContractId(cid)),
+			Err(_) => Err(Bolt11ParseError::InvalidContractId),
+		}
 	}
 }
 
@@ -668,6 +700,9 @@ impl Display for Bolt11ParseError {
 			},
 			Bolt11ParseError::Skip => {
 				f.write_str("the tagged field has to be skipped because of an unexpected, but allowed property")
+			},
+			Bolt11ParseError::InvalidContractId => {
+				f.write_str("invalid RGB contract ID")
 			},
 		}
 	}

@@ -30,6 +30,8 @@ use crate::routing::scoring::WriteableScore;
 use crate::util::logger::Logger;
 use crate::util::ser::{Readable, ReadableArgs, Writeable};
 
+use std::path::PathBuf;
+
 /// The alphabet of characters allowed for namespaces and keys.
 pub const KVSTORE_NAMESPACE_KEY_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
 
@@ -264,7 +266,7 @@ impl<ChannelSigner: EcdsaChannelSigner, K: KVStore + ?Sized> Persist<ChannelSign
 
 /// Read previously persisted [`ChannelMonitor`]s from the store.
 pub fn read_channel_monitors<K: Deref, ES: Deref, SP: Deref>(
-	kv_store: K, entropy_source: ES, signer_provider: SP,
+	kv_store: K, entropy_source: ES, signer_provider: SP, ldk_data_dir: PathBuf,
 ) -> Result<Vec<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>)>, io::Error>
 where
 	K::Target: KVStore,
@@ -293,7 +295,7 @@ where
 		match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>)>::read(
 			&mut io::Cursor::new(
 				kv_store.read(CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE, &stored_key)?),
-			(&*entropy_source, &*signer_provider),
+			(&*entropy_source, &*signer_provider, ldk_data_dir.clone()),
 		) {
 			Ok((block_hash, channel_monitor)) => {
 				if channel_monitor.get_funding_txo().0.txid != txid
@@ -415,7 +417,8 @@ where
 	entropy_source: ES,
 	signer_provider: SP,
 	broadcaster: BI,
-	fee_estimator: FE
+	fee_estimator: FE,
+	ldk_data_dir: PathBuf,
 }
 
 #[allow(dead_code)]
@@ -447,7 +450,7 @@ where
 	/// [`MonitorUpdatingPersister::cleanup_stale_updates`].
 	pub fn new(
 		kv_store: K, logger: L, maximum_pending_updates: u64, entropy_source: ES,
-		signer_provider: SP, broadcaster: BI, fee_estimator: FE
+		signer_provider: SP, broadcaster: BI, fee_estimator: FE, ldk_data_dir: PathBuf,
 	) -> Self {
 		MonitorUpdatingPersister {
 			kv_store,
@@ -456,7 +459,8 @@ where
 			entropy_source,
 			signer_provider,
 			broadcaster,
-			fee_estimator
+			fee_estimator,
+			ldk_data_dir,
 		}
 	}
 
@@ -546,7 +550,7 @@ where
 		}
 		match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>)>::read(
 			&mut monitor_cursor,
-			(&*self.entropy_source, &*self.signer_provider),
+			(&*self.entropy_source, &*self.signer_provider, self.ldk_data_dir.clone()),
 		) {
 			Ok((blockhash, channel_monitor)) => {
 				if channel_monitor.get_funding_txo().0.txid != outpoint.txid

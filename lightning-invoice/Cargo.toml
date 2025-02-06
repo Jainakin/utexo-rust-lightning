@@ -23,6 +23,12 @@ lightning-types = { version = "0.1.0", path = "../lightning-types", default-feat
 serde = { version = "1.0.118", optional = true }
 bitcoin = { version = "0.32.2", default-features = false, features = ["secp-recovery"] }
 
+# RGB and related
+rgb-lib = { version = "0.3.0-alpha.11", features = [
+    "electrum",
+    "esplora",
+], git = "https://github.com/RGB-Tools/rgb-lib.git", rev = "952cd185" }
+
 [dev-dependencies]
 serde_json = { version = "1"}
 hashbrown = { version = "0.13", default-features = false }

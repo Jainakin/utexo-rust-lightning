@@ -37,6 +37,13 @@ impl_fmt_traits! {
 	}
 }
 
+impl PaymentHash {
+	/// Create a payment hash consisting of all-zeros data (e.g. when uninitialized or a placeholder).
+	pub fn new_zero() -> Self {
+		Self([0; 32])
+	}
+}
+
 /// The payment preimage is the "secret key" which is used to claim the funds of an HTLC on-chain
 /// or in a lightning channel.
 ///

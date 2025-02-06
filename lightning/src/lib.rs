@@ -153,3 +153,5 @@ mod prelude {
 extern crate backtrace;
 
 mod sync;
+
+pub mod rgb_utils;

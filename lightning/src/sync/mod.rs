@@ -41,14 +41,14 @@ mod ext_impl {
 		fn held_by_thread(&self) -> LockHeldState { LockHeldState::Unsupported }
 		type ExclLock = MutexGuard<'a, T>;
 		#[inline]
-		fn unsafe_well_ordered_double_lock_self(&'a self) -> MutexGuard<T> { self.lock().unwrap() }
+		fn unsafe_well_ordered_double_lock_self(&'a self) -> MutexGuard<'a, T> { self.lock().unwrap() }
 	}
 	impl<'a, T: 'a> LockTestExt<'a> for RwLock<T> {
 		#[inline]
 		fn held_by_thread(&self) -> LockHeldState { LockHeldState::Unsupported }
 		type ExclLock = RwLockWriteGuard<'a, T>;
 		#[inline]
-		fn unsafe_well_ordered_double_lock_self(&'a self) -> RwLockWriteGuard<T> { self.write().unwrap() }
+		fn unsafe_well_ordered_double_lock_self(&'a self) -> RwLockWriteGuard<'a, T> { self.write().unwrap() }
 	}
 }
 

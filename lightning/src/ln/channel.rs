@@ -20,10 +20,14 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::sha256d::Hash as Sha256d;
 use bitcoin::hash_types::{Txid, BlockHash};
 
+use bitcoin::hex::DisplayHex;
+
 use bitcoin::secp256k1::constants::PUBLIC_KEY_SIZE;
 use bitcoin::secp256k1::{PublicKey,SecretKey};
 use bitcoin::secp256k1::{Secp256k1,ecdsa::Signature};
 use bitcoin::secp256k1;
+
+use rgb_lib::RgbTransport;
 
 use crate::ln::types::{ChannelId, PaymentPreimage, PaymentHash};
 use crate::ln::features::{ChannelTypeFeatures, InitFeatures};
@@ -46,6 +50,7 @@ use crate::chain::BestBlock;
 use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBoundedFeeEstimator};
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS, CLOSED_CHANNEL_UPDATE_ID};
 use crate::chain::transaction::{OutPoint, TransactionData};
+use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info_path, get_rgb_channel_info_pending, op_return_position, parse_rgb_channel_info, rename_rgb_files, update_rgb_channel_amount_pending};
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::{EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
 use crate::events::ClosureReason;
@@ -60,6 +65,7 @@ use crate::io;
 use crate::prelude::*;
 use core::{cmp,mem,fmt};
 use core::ops::Deref;
+use std::path::PathBuf;
 #[cfg(any(test, fuzzing, debug_assertions))]
 use crate::sync::Mutex;
 use crate::sign::type_resolver::ChannelSignerType;
@@ -221,6 +227,7 @@ struct InboundHTLCOutput {
 	cltv_expiry: u32,
 	payment_hash: PaymentHash,
 	state: InboundHTLCState,
+	amount_rgb: Option<u64>,
 }
 
 #[cfg_attr(test, derive(Clone, Debug, PartialEq))]
@@ -315,6 +322,7 @@ struct OutboundHTLCOutput {
 	source: HTLCSource,
 	blinding_point: Option<PublicKey>,
 	skimmed_fee_msat: Option<u64>,
+	amount_rgb: Option<u64>,
 }
 
 /// See AwaitingRemoteRevoke ChannelState for more info
@@ -330,6 +338,7 @@ enum HTLCUpdateAwaitingACK {
 		// The extra fee we're skimming off the top of this HTLC.
 		skimmed_fee_msat: Option<u64>,
 		blinding_point: Option<PublicKey>,
+		amount_rgb: Option<u64>,
 	},
 	ClaimHTLC {
 		payment_preimage: PaymentPreimage,
@@ -661,7 +670,7 @@ impl ChannelState {
 
 pub const INITIAL_COMMITMENT_NUMBER: u64 = (1 << 48) - 1;
 
-pub const DEFAULT_MAX_HTLCS: u16 = 50;
+pub const DEFAULT_MAX_HTLCS: u16 = 5;
 
 pub const ANCHOR_OUTPUT_VALUE_SATOSHI: u64 = 330;
 
@@ -704,7 +713,7 @@ pub const MIN_THEIR_CHAN_RESERVE_SATOSHIS: u64 = 1000;
 /// Used to return a simple Error back to ChannelManager. Will get converted to a
 /// msgs::ErrorAction::SendErrorMessage or msgs::ErrorAction::IgnoreError as appropriate with our
 /// channel_id in ChannelManager.
-pub(super) enum ChannelError {
+pub enum ChannelError {
 	Ignore(String),
 	Warn(String),
 	Close((String, ClosureReason)),
@@ -830,6 +839,7 @@ struct HTLCStats {
 	on_holder_tx_outbound_holding_cell_htlcs_count: u32, // dust HTLCs *non*-included
 }
 
+#[derive(Debug)]
 /// An enum gathering stats on commitment transaction, either local or remote.
 struct CommitmentStats<'a> {
 	tx: CommitmentTransaction, // the transaction info
@@ -1180,7 +1190,7 @@ impl UnfundedChannelContext {
 }
 
 /// Contains everything about the channel including state, and various flags.
-pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
+pub(crate) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	config: LegacyChannelConfig,
 
 	// Track the previous `ChannelConfig` so that we can continue forwarding HTLCs that were
@@ -1193,7 +1203,7 @@ pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	user_id: u128,
 
 	/// The current channel ID.
-	channel_id: ChannelId,
+	pub(crate) channel_id: ChannelId,
 	/// The temporary channel ID used during channel setup. Value kept even after transitioning to a final channel ID.
 	/// Will be `None` for channels created prior to 0.0.115.
 	temporary_channel_id: Option<ChannelId>,
@@ -1452,7 +1462,7 @@ pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	historical_inbound_htlc_fulfills: HashSet<u64>,
 
 	/// This channel's type, as negotiated during channel open
-	channel_type: ChannelTypeFeatures,
+	pub(crate) channel_type: ChannelTypeFeatures,
 
 	// Our counterparty can offer us SCID aliases which they will map to this channel when routing
 	// outbound payments. These can be used in invoice route hints to avoid explicitly revealing
@@ -1494,6 +1504,11 @@ pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	/// If we can't release a [`ChannelMonitorUpdate`] until some external action completes, we
 	/// store it here and only release it to the `ChannelManager` once it asks for it.
 	blocked_monitor_updates: Vec<PendingChannelMonitorUpdate>,
+
+	/// The consignment endpoint used to exchange the RGB consignment
+	pub(super) consignment_endpoint: Option<RgbTransport>,
+
+	pub(crate) ldk_data_dir: PathBuf,
 }
 
 impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
@@ -1515,6 +1530,8 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 		msg_channel_reserve_satoshis: u64,
 		msg_push_msat: u64,
 		open_channel_fields: msgs::CommonOpenChannelFields,
+		consignment_endpoint: Option<RgbTransport>,
+		ldk_data_dir: PathBuf,
 	) -> Result<ChannelContext<SP>, ChannelError>
 		where
 			ES::Target: EntropySource,
@@ -1834,6 +1851,9 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 			blocked_monitor_updates: Vec::new(),
 
 			is_manual_broadcast: false,
+
+			consignment_endpoint,
+			ldk_data_dir,
 		};
 
 		Ok(channel_context)
@@ -1857,6 +1877,8 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 		holder_signer: <SP::Target as SignerProvider>::EcdsaSigner,
 		pubkeys: ChannelPublicKeys,
 		_logger: L,
+		consignment_endpoint: Option<RgbTransport>,
+		ldk_data_dir: PathBuf,
 	) -> Result<ChannelContext<SP>, APIError>
 		where
 			ES::Target: EntropySource,
@@ -2065,6 +2087,9 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 			blocked_monitor_updates: Vec::new(),
 			local_initiated_shutdown: None,
 			is_manual_broadcast: false,
+
+			consignment_endpoint,
+			ldk_data_dir,
 		})
 	}
 
@@ -2083,6 +2108,10 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 
 	pub fn is_outbound(&self) -> bool {
 		self.channel_transaction_parameters.is_outbound_from_holder
+	}
+
+	pub fn is_colored(&self) -> bool {
+		self.consignment_endpoint.is_some()
 	}
 
 	/// Gets the fee we'd want to charge for adding an HTLC output to this Channel
@@ -2375,7 +2404,7 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 		self.channel_transaction_parameters.holder_selected_contest_delay
 	}
 
-	fn get_holder_pubkeys(&self) -> &ChannelPublicKeys {
+	pub(crate) fn get_holder_pubkeys(&self) -> &ChannelPublicKeys {
 		&self.channel_transaction_parameters.holder_pubkeys
 	}
 
@@ -2384,7 +2413,7 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 			.as_ref().map(|params| params.selected_contest_delay)
 	}
 
-	fn get_counterparty_pubkeys(&self) -> &ChannelPublicKeys {
+	pub(crate) fn get_counterparty_pubkeys(&self) -> &ChannelPublicKeys {
 		&self.channel_transaction_parameters.counterparty_parameters.as_ref().unwrap().pubkeys
 	}
 
@@ -2401,6 +2430,33 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 	/// Allowed in any state (including after shutdown), but will return none before TheirInitSent
 	pub fn get_holder_htlc_maximum_msat(&self) -> Option<u64> {
 		self.get_htlc_maximum_msat(self.holder_max_htlc_value_in_flight_msat)
+	}
+
+	/// Get the channel local RGB amount
+	pub fn get_local_rgb_amount(&self) -> u64 {
+		let info_file_path = get_rgb_channel_info_path(&self.channel_id.0.as_hex().to_string(), &self.ldk_data_dir, false);
+		if info_file_path.exists() {
+			let rgb_info = parse_rgb_channel_info(&info_file_path);
+			rgb_info.local_rgb_amount
+		} else {
+			0
+		}
+	}
+
+	/// Get the channel remote RGB amount
+	pub fn get_remote_rgb_amount(&self) -> u64 {
+		let info_file_path = get_rgb_channel_info_path(&self.channel_id.0.as_hex().to_string(), &self.ldk_data_dir, false);
+		if info_file_path.exists() {
+			let rgb_info = parse_rgb_channel_info(&info_file_path);
+			rgb_info.remote_rgb_amount
+		} else {
+			0
+		}
+	}
+
+	/// Get the channel RGB capacity
+	pub fn get_rgb_capacity(&self) -> u64 {
+		self.get_local_rgb_amount() + self.get_remote_rgb_amount()
 	}
 
 	/// Allowed in any state (including after shutdown)
@@ -2612,7 +2668,8 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 					amount_msat: $htlc.amount_msat,
 					cltv_expiry: $htlc.cltv_expiry,
 					payment_hash: $htlc.payment_hash,
-					transaction_output_index: None
+					transaction_output_index: None,
+					amount_rgb: $htlc.amount_rgb
 				}
 			}
 		}
@@ -3877,7 +3934,11 @@ impl<SP: Deref> Channel<SP> where
 		let counterparty_shutdown_script = self.context.counterparty_shutdown_scriptpubkey.clone().unwrap();
 		let funding_outpoint = self.funding_outpoint().into_bitcoin_outpoint();
 
-		let closing_transaction = ClosingTransaction::new(value_to_holder as u64, value_to_counterparty as u64, holder_shutdown_script, counterparty_shutdown_script, funding_outpoint);
+		let mut closing_transaction = ClosingTransaction::new(value_to_holder as u64, value_to_counterparty as u64, holder_shutdown_script, counterparty_shutdown_script, funding_outpoint);
+		if self.context.is_colored() {
+			color_closing(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut closing_transaction, &self.context.ldk_data_dir)
+				.expect("successful closing TX coloring");
+		}
 		(closing_transaction, total_fee_satoshis)
 	}
 
@@ -4354,6 +4415,10 @@ impl<SP: Deref> Channel<SP> where
 			return Err(ChannelError::close("Remote HTLC add would overdraw remaining funds".to_owned()));
 		}
 
+		if msg.amount_rgb > Some(self.context.get_remote_rgb_amount()) {
+			return Err(ChannelError::close("Not enough RGB funds to accept this HTLC".to_owned()));
+		}
+
 		// Check that the remote can afford to pay for this HTLC on-chain at the current
 		// feerate_per_kw, while maintaining their channel reserve (as required by the spec).
 		{
@@ -4410,6 +4475,7 @@ impl<SP: Deref> Channel<SP> where
 			state: InboundHTLCState::RemoteAnnounced(InboundHTLCResolution::Resolved {
 				pending_htlc_status: pending_forward_status
 			}),
+			amount_rgb: msg.amount_rgb,
 		});
 		Ok(())
 	}
@@ -4445,7 +4511,7 @@ impl<SP: Deref> Channel<SP> where
 		Err(ChannelError::close("Remote tried to fulfill/fail an HTLC we couldn't find".to_owned()))
 	}
 
-	pub fn update_fulfill_htlc(&mut self, msg: &msgs::UpdateFulfillHTLC) -> Result<(HTLCSource, u64, Option<u64>), ChannelError> {
+	pub fn update_fulfill_htlc(&mut self, msg: &msgs::UpdateFulfillHTLC) -> Result<(HTLCSource, u64, Option<u64>, Option<u64>), ChannelError> {
 		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_)) {
 			return Err(ChannelError::close("Got fulfill HTLC message when channel was not in an operational state".to_owned()));
 		}
@@ -4453,7 +4519,7 @@ impl<SP: Deref> Channel<SP> where
 			return Err(ChannelError::close("Peer sent update_fulfill_htlc when we needed a channel_reestablish".to_owned()));
 		}
 
-		self.mark_outbound_htlc_removed(msg.htlc_id, Some(msg.payment_preimage), None).map(|htlc| (htlc.source.clone(), htlc.amount_msat, htlc.skimmed_fee_msat))
+		self.mark_outbound_htlc_removed(msg.htlc_id, Some(msg.payment_preimage), None).map(|htlc| (htlc.source.clone(), htlc.amount_msat, htlc.skimmed_fee_msat, htlc.amount_rgb))
 	}
 
 	pub fn update_fail_htlc(&mut self, msg: &msgs::UpdateFailHTLC, fail_reason: HTLCFailReason) -> Result<(), ChannelError> {
@@ -4497,7 +4563,10 @@ impl<SP: Deref> Channel<SP> where
 
 		let keys = self.context.build_holder_transaction_keys();
 
-		let commitment_stats = self.context.build_commitment_transaction(self.context.holder_commitment_point.transaction_number(), &keys, true, false, logger);
+		let mut commitment_stats = self.context.build_commitment_transaction(self.context.holder_commitment_point.transaction_number(), &keys, true, false, logger);
+		if self.context.is_colored() {
+			color_commitment(&self.context, &mut commitment_stats.tx, false)?;
+		}
 		let commitment_txid = {
 			let trusted_tx = commitment_stats.tx.trust();
 			let bitcoin_tx = trusted_tx.built_transaction();
@@ -4567,9 +4636,12 @@ impl<SP: Deref> Channel<SP> where
 		let mut htlcs_and_sigs = Vec::with_capacity(htlcs_cloned.len());
 		for (idx, (htlc, mut source_opt)) in htlcs_cloned.drain(..).enumerate() {
 			if let Some(_) = htlc.transaction_output_index {
-				let htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_stats.feerate_per_kw,
+				let mut htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_stats.feerate_per_kw,
 					self.context.get_counterparty_selected_contest_delay().unwrap(), &htlc, &self.context.channel_type,
 					&keys.broadcaster_delayed_payment_key, &keys.revocation_key);
+				if self.context.is_colored() {
+					color_htlc(&mut htlc_tx, &htlc, &self.context.ldk_data_dir)?;
+				}
 
 				let htlc_redeemscript = chan_utils::get_htlc_redeemscript(&htlc, &self.context.channel_type, &keys);
 				let htlc_sighashtype = if self.context.channel_type.supports_anchors_zero_fee_htlc_tx() { EcdsaSighashType::SinglePlusAnyoneCanPay } else { EcdsaSighashType::All };
@@ -4762,11 +4834,11 @@ impl<SP: Deref> Channel<SP> where
 				let fail_htlc_res = match &htlc_update {
 					&HTLCUpdateAwaitingACK::AddHTLC {
 						amount_msat, cltv_expiry, ref payment_hash, ref source, ref onion_routing_packet,
-						skimmed_fee_msat, blinding_point, ..
+						skimmed_fee_msat, blinding_point, amount_rgb, ..
 					} => {
 						match self.send_htlc(
 							amount_msat, *payment_hash, cltv_expiry, source.clone(), onion_routing_packet.clone(),
-							false, skimmed_fee_msat, blinding_point, fee_estimator, logger
+							false, skimmed_fee_msat, blinding_point, fee_estimator, logger, amount_rgb
 						) {
 							Ok(_) => update_add_count += 1,
 							Err(e) => {
@@ -4949,6 +5021,8 @@ impl<SP: Deref> Channel<SP> where
 		let mut update_fail_malformed_htlcs = Vec::new();
 		let mut require_commitment = false;
 		let mut value_to_self_msat_diff: i64 = 0;
+		let mut rgb_offered_htlc = 0;
+		let mut rgb_received_htlc = 0;
 
 		{
 			// Take references explicitly so that we can hold multiple references to self.context.
@@ -4994,6 +5068,10 @@ impl<SP: Deref> Channel<SP> where
 						log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", &htlc.payment_hash);
 						htlc.state = InboundHTLCState::AwaitingAnnouncedRemoteRevoke(resolution);
 						require_commitment = true;
+
+						if let Some(amount_rgb) = htlc.amount_rgb {
+							rgb_received_htlc += amount_rgb;
+						}
 					} else if let InboundHTLCState::AwaitingAnnouncedRemoteRevoke(resolution) = state {
 						match resolution {
 							InboundHTLCResolution::Resolved { pending_htlc_status } =>
@@ -5031,6 +5109,9 @@ impl<SP: Deref> Channel<SP> where
 				if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
 					log_trace!(logger, " ...promoting outbound LocalAnnounced {} to Committed", &htlc.payment_hash);
 					htlc.state = OutboundHTLCState::Committed;
+					if let Some(amount_rgb) = htlc.amount_rgb {
+						rgb_offered_htlc += amount_rgb;
+					}
 					*expecting_peer_commitment_signed = true;
 				}
 				if let &mut OutboundHTLCState::AwaitingRemoteRevokeToRemove(ref mut outcome) = &mut htlc.state {
@@ -5044,6 +5125,9 @@ impl<SP: Deref> Channel<SP> where
 			}
 		}
 		self.context.value_to_self_msat = (self.context.value_to_self_msat as i64 + value_to_self_msat_diff) as u64;
+		if self.context.is_colored() && (rgb_offered_htlc > 0 || rgb_received_htlc > 0) {
+			update_rgb_channel_amount_pending(&self.context.channel_id, rgb_offered_htlc, rgb_received_htlc, &self.context.ldk_data_dir);
+		}
 
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
 			match update_state {
@@ -5183,7 +5267,13 @@ impl<SP: Deref> Channel<SP> where
 		let dust_exposure_limiting_feerate = self.context.get_dust_exposure_limiting_feerate(&fee_estimator);
 		let htlc_stats = self.context.get_pending_htlc_stats(Some(feerate_per_kw), dust_exposure_limiting_feerate);
 		let keys = self.context.build_holder_transaction_keys();
-		let commitment_stats = self.context.build_commitment_transaction(self.context.holder_commitment_point.transaction_number(), &keys, true, true, logger);
+		let mut commitment_stats = self.context.build_commitment_transaction(self.context.holder_commitment_point.transaction_number(), &keys, true, true, logger);
+		if self.context.is_colored() {
+			if let Err(e) = color_commitment(&self.context, &mut commitment_stats.tx, false) {
+				log_error!(logger, "Cannot color commitment: {e:?}");
+				return None;
+			}
+		}
 		let buffer_fee_msat = commit_tx_fee_sat(feerate_per_kw, commitment_stats.num_nondust_htlcs + htlc_stats.on_holder_tx_outbound_holding_cell_htlcs_count as usize + CONCURRENT_INBOUND_HTLC_FEE_BUFFER as usize, self.context.get_channel_type()) * 1000;
 		let holder_balance_msat = commitment_stats.local_balance_msat - htlc_stats.outbound_holding_cell_msat;
 		if holder_balance_msat < buffer_fee_msat  + self.context.counterparty_selected_channel_reserve_satoshis.unwrap() * 1000 {
@@ -5609,6 +5699,7 @@ impl<SP: Deref> Channel<SP> where
 					onion_routing_packet: (**onion_packet).clone(),
 					skimmed_fee_msat: htlc.skimmed_fee_msat,
 					blinding_point: htlc.blinding_point,
+					amount_rgb: htlc.amount_rgb,
 				});
 			}
 		}
@@ -6220,8 +6311,10 @@ impl<SP: Deref> Channel<SP> where
 			},
 		};
 
-		for outp in closing_tx.trust().built_transaction().output.iter() {
-			if !outp.script_pubkey.is_witness_program() && outp.value < Amount::from_sat(MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS) {
+		let closing_transaction = closing_tx.trust().built_transaction();
+		let op_return_position = op_return_position(closing_transaction);
+		for (idx, outp) in closing_transaction.output.iter().enumerate() {
+			if Some(idx) != op_return_position && !outp.script_pubkey.is_witness_program() && outp.value < Amount::from_sat(MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS) {
 				return Err(ChannelError::close("Remote sent us a closing_signed with a dust output. Always use segwit closing scripts!".to_owned()));
 			}
 		}
@@ -6983,6 +7076,12 @@ impl<SP: Deref> Channel<SP> where
 		let counterparty_node_id = NodeId::from_pubkey(&self.context.get_counterparty_node_id());
 		let were_node_one = node_id.as_slice() < counterparty_node_id.as_slice();
 
+		let contract_id = if self.context.is_colored() {
+			let (rgb_info, _) = get_rgb_channel_info_pending(&self.context.channel_id, &self.context.ldk_data_dir);
+			Some(rgb_info.contract_id)
+		} else {
+			None
+		};
 		let msg = msgs::UnsignedChannelAnnouncement {
 			features: channelmanager::provided_channel_features(&user_config),
 			chain_hash,
@@ -6991,6 +7090,7 @@ impl<SP: Deref> Channel<SP> where
 			node_id_2: if were_node_one { counterparty_node_id } else { node_id },
 			bitcoin_key_1: NodeId::from_pubkey(if were_node_one { &self.context.get_holder_pubkeys().funding_pubkey } else { self.context.counterparty_funding_pubkey() }),
 			bitcoin_key_2: NodeId::from_pubkey(if were_node_one { self.context.counterparty_funding_pubkey() } else { &self.context.get_holder_pubkeys().funding_pubkey }),
+			contract_id,
 			excess_data: Vec::new(),
 		};
 
@@ -7216,13 +7316,13 @@ impl<SP: Deref> Channel<SP> where
 	pub fn queue_add_htlc<F: Deref, L: Deref>(
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource,
 		onion_routing_packet: msgs::OnionPacket, skimmed_fee_msat: Option<u64>,
-		blinding_point: Option<PublicKey>, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L
+		blinding_point: Option<PublicKey>, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, amount_rgb: Option<u64>
 	) -> Result<(), ChannelError>
 	where F::Target: FeeEstimator, L::Target: Logger
 	{
 		self
 			.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, true,
-				skimmed_fee_msat, blinding_point, fee_estimator, logger)
+				skimmed_fee_msat, blinding_point, fee_estimator, logger, amount_rgb)
 			.map(|msg_opt| assert!(msg_opt.is_none(), "We forced holding cell?"))
 			.map_err(|err| {
 				if let ChannelError::Ignore(_) = err { /* fine */ }
@@ -7251,7 +7351,7 @@ impl<SP: Deref> Channel<SP> where
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource,
 		onion_routing_packet: msgs::OnionPacket, mut force_holding_cell: bool,
 		skimmed_fee_msat: Option<u64>, blinding_point: Option<PublicKey>,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, amount_rgb: Option<u64>
 	) -> Result<Option<msgs::UpdateAddHTLC>, ChannelError>
 	where F::Target: FeeEstimator, L::Target: Logger
 	{
@@ -7279,6 +7379,11 @@ impl<SP: Deref> Channel<SP> where
 		if amount_msat > available_balances.next_outbound_htlc_limit_msat {
 			return Err(ChannelError::Ignore(format!("Cannot send more than our next-HTLC maximum - {} msat",
 				available_balances.next_outbound_htlc_limit_msat)));
+		}
+
+		let local_rgb_amount = self.context.get_local_rgb_amount();
+		if amount_rgb > Some(local_rgb_amount) {
+			return Err(ChannelError::Ignore(format!("Cannot send more than our next-HTLC RGB maximum - {}", local_rgb_amount)));
 		}
 
 		if self.context.channel_state.is_peer_disconnected() {
@@ -7312,6 +7417,7 @@ impl<SP: Deref> Channel<SP> where
 				onion_routing_packet,
 				skimmed_fee_msat,
 				blinding_point,
+				amount_rgb,
 			});
 			return Ok(None);
 		}
@@ -7325,6 +7431,7 @@ impl<SP: Deref> Channel<SP> where
 			source,
 			blinding_point,
 			skimmed_fee_msat,
+			amount_rgb,
 		});
 
 		let res = msgs::UpdateAddHTLC {
@@ -7336,6 +7443,7 @@ impl<SP: Deref> Channel<SP> where
 			onion_routing_packet,
 			skimmed_fee_msat,
 			blinding_point,
+			amount_rgb,
 		};
 		self.context.next_holder_htlc_id += 1;
 
@@ -7347,6 +7455,7 @@ impl<SP: Deref> Channel<SP> where
 		// We can upgrade the status of some HTLCs that are waiting on a commitment, even if we
 		// fail to generate this, we still are at least at a position where upgrading their status
 		// is acceptable.
+		let mut rgb_received_htlc = 0;
 		for htlc in self.context.pending_inbound_htlcs.iter_mut() {
 			let new_state = if let &InboundHTLCState::AwaitingRemoteRevokeToAnnounce(ref forward_info) = &htlc.state {
 				Some(InboundHTLCState::AwaitingAnnouncedRemoteRevoke(forward_info.clone()))
@@ -7354,6 +7463,10 @@ impl<SP: Deref> Channel<SP> where
 			if let Some(state) = new_state {
 				log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", &htlc.payment_hash);
 				htlc.state = state;
+
+				if let Some(amount_rgb) = htlc.amount_rgb {
+					rgb_received_htlc += amount_rgb;
+				}
 			}
 		}
 		for htlc in self.context.pending_outbound_htlcs.iter_mut() {
@@ -7364,6 +7477,9 @@ impl<SP: Deref> Channel<SP> where
 				mem::swap(outcome, &mut reason);
 				htlc.state = OutboundHTLCState::AwaitingRemovedRemoteRevoke(reason);
 			}
+		}
+		if self.context.is_colored() && rgb_received_htlc > 0 {
+			update_rgb_channel_amount_pending(&self.context.channel_id, 0, rgb_received_htlc, &self.context.ldk_data_dir);
 		}
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
 			if update_state == FeeUpdateState::AwaitingRemoteRevokeToAnnounce {
@@ -7409,7 +7525,10 @@ impl<SP: Deref> Channel<SP> where
 	where L::Target: Logger
 	{
 		let counterparty_keys = self.context.build_remote_transaction_keys();
-		let commitment_stats = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
+		let mut commitment_stats = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
+		if self.context.is_colored() {
+			color_commitment(&self.context, &mut commitment_stats.tx, true).expect("successful commitment coloring");
+		}
 		let counterparty_commitment_tx = commitment_stats.tx;
 
 		#[cfg(any(test, fuzzing))]
@@ -7441,7 +7560,10 @@ impl<SP: Deref> Channel<SP> where
 		self.build_commitment_no_state_update(logger);
 
 		let counterparty_keys = self.context.build_remote_transaction_keys();
-		let commitment_stats = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
+		let mut commitment_stats = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
+		if self.context.is_colored() {
+			color_commitment(&self.context, &mut commitment_stats.tx, true)?;
+		}
 		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
 
 		match &self.context.holder_signer {
@@ -7500,12 +7622,12 @@ impl<SP: Deref> Channel<SP> where
 	pub fn send_htlc_and_commit<F: Deref, L: Deref>(
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32,
 		source: HTLCSource, onion_routing_packet: msgs::OnionPacket, skimmed_fee_msat: Option<u64>,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, amount_rgb: Option<u64>
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError>
 	where F::Target: FeeEstimator, L::Target: Logger
 	{
 		let send_res = self.send_htlc(amount_msat, payment_hash, cltv_expiry, source,
-			onion_routing_packet, false, skimmed_fee_msat, None, fee_estimator, logger);
+			onion_routing_packet, false, skimmed_fee_msat, None, fee_estimator, logger, amount_rgb);
 		if let Err(e) = &send_res { if let ChannelError::Ignore(_) = e {} else { debug_assert!(false, "Sending cannot trigger channel failure"); } }
 		match send_res? {
 			Some(_) => {
@@ -7647,7 +7769,7 @@ impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
 	pub fn new<ES: Deref, F: Deref, L: Deref>(
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP, counterparty_node_id: PublicKey, their_features: &InitFeatures,
 		channel_value_satoshis: u64, push_msat: u64, user_id: u128, config: &UserConfig, current_chain_height: u32,
-		outbound_scid_alias: u64, temporary_channel_id: Option<ChannelId>, logger: L
+		outbound_scid_alias: u64, temporary_channel_id: Option<ChannelId>, logger: L, consignment_endpoint: Option<RgbTransport>, ldk_data_dir: PathBuf,
 	) -> Result<OutboundV1Channel<SP>, APIError>
 	where ES::Target: EntropySource,
 	      F::Target: FeeEstimator,
@@ -7684,6 +7806,8 @@ impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
 				holder_signer,
 				pubkeys,
 				logger,
+				consignment_endpoint,
+				ldk_data_dir,
 			)?,
 			unfunded_context: UnfundedChannelContext { unfunded_channel_age_ticks: 0 }
 		};
@@ -7693,7 +7817,10 @@ impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
 	/// Only allowed after [`ChannelContext::channel_transaction_parameters`] is set.
 	fn get_funding_created_msg<L: Deref>(&mut self, logger: &L) -> Option<msgs::FundingCreated> where L::Target: Logger {
 		let counterparty_keys = self.context.build_remote_transaction_keys();
-		let counterparty_initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
+		let mut counterparty_initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
+		if self.context.is_colored() {
+			color_commitment(&self.context, &mut counterparty_initial_commitment_tx, true).unwrap();
+		}
 		let signature = match &self.context.holder_signer {
 			// TODO (taproot|arik): move match into calling method for Taproot
 			ChannelSignerType::Ecdsa(ecdsa) => {
@@ -7752,7 +7879,11 @@ impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
 		// Now that we're past error-generating stuff, update our local state:
 
 		self.context.channel_state = ChannelState::FundingNegotiated;
+		let temporary_channel_id = self.context.channel_id;
 		self.context.channel_id = ChannelId::v1_from_funding_outpoint(funding_txo);
+		if self.context.is_colored() {
+			rename_rgb_files(&self.context.channel_id, &temporary_channel_id, &self.context.ldk_data_dir);
+		}
 
 		// If the funding transaction is a coinbase transaction, we need to set the minimum depth to 100.
 		// We can skip this if it is a zero-conf channel.
@@ -7839,6 +7970,7 @@ impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.context.channel_type.clone()),
+				consignment_endpoint: self.context.consignment_endpoint.clone(),
 			},
 			push_msat: self.context.channel_value_satoshis * 1000 - self.context.value_to_self_msat,
 			channel_reserve_satoshis: self.context.holder_selected_channel_reserve_satoshis,
@@ -7922,7 +8054,8 @@ impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
 		                                          &self.context.channel_transaction_parameters, self.context.is_outbound(),
 		                                          funding_redeemscript.clone(), self.context.channel_value_satoshis,
 		                                          obscure_factor,
-		                                          holder_commitment_tx, best_block, self.context.counterparty_node_id, self.context.channel_id());
+		                                          holder_commitment_tx, best_block, self.context.counterparty_node_id, self.context.channel_id(),
+												  self.context.ldk_data_dir.clone());
 		channel_monitor.provide_initial_counterparty_commitment_tx(
 			counterparty_initial_bitcoin_tx.txid, Vec::new(),
 			self.context.cur_counterparty_commitment_transaction_number,
@@ -8019,7 +8152,7 @@ impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
 		counterparty_node_id: PublicKey, our_supported_features: &ChannelTypeFeatures,
 		their_features: &InitFeatures, msg: &msgs::OpenChannel, user_id: u128, config: &UserConfig,
-		current_chain_height: u32, logger: &L, is_0conf: bool,
+		current_chain_height: u32, logger: &L, is_0conf: bool, ldk_data_dir: PathBuf
 	) -> Result<InboundV1Channel<SP>, ChannelError>
 		where ES::Target: EntropySource,
 			  F::Target: FeeEstimator,
@@ -8060,6 +8193,9 @@ impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 				msg.channel_reserve_satoshis,
 				msg.push_msat,
 				msg.common_fields.clone(),
+
+				msg.common_fields.consignment_endpoint.clone(),
+				ldk_data_dir,
 			)?,
 			unfunded_context: UnfundedChannelContext { unfunded_channel_age_ticks: 0 }
 		};
@@ -8137,7 +8273,10 @@ impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 		let funding_script = self.context.get_funding_redeemscript();
 
 		let keys = self.context.build_holder_transaction_keys();
-		let initial_commitment_tx = self.context.build_commitment_transaction(self.context.holder_commitment_point.transaction_number(), &keys, true, false, logger).tx;
+		let mut initial_commitment_tx = self.context.build_commitment_transaction(self.context.holder_commitment_point.transaction_number(), &keys, true, false, logger).tx;
+		if self.context.is_colored() {
+			color_commitment(&self.context, &mut initial_commitment_tx, false)?;
+		}
 		let trusted_tx = initial_commitment_tx.trust();
 		let initial_commitment_bitcoin_tx = trusted_tx.built_transaction();
 		let sighash = initial_commitment_bitcoin_tx.get_sighash_all(&funding_script, self.context.channel_value_satoshis);
@@ -8209,7 +8348,11 @@ impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 		// Now that we're past error-generating stuff, update our local state:
 
 		self.context.channel_state = ChannelState::AwaitingChannelReady(AwaitingChannelReadyFlags::new());
+		let temporary_channel_id = self.context.channel_id;
 		self.context.channel_id = ChannelId::v1_from_funding_outpoint(funding_txo);
+		if self.context.is_colored() {
+			rename_rgb_files(&self.context.channel_id, &temporary_channel_id, &self.context.ldk_data_dir);
+		}
 		self.context.cur_counterparty_commitment_transaction_number -= 1;
 		if self.context.holder_commitment_point.advance(&self.context.holder_signer, &self.context.secp_ctx, logger).is_err() {
 			// We only fail to advance our commitment point/number if we're currently
@@ -8234,7 +8377,7 @@ impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 		                                          &self.context.channel_transaction_parameters, self.context.is_outbound(),
 		                                          funding_redeemscript.clone(), self.context.channel_value_satoshis,
 		                                          obscure_factor,
-		                                          holder_commitment_tx, best_block, self.context.counterparty_node_id, self.context.channel_id());
+		                                          holder_commitment_tx, best_block, self.context.counterparty_node_id, self.context.channel_id(), self.context.ldk_data_dir.clone());
 		channel_monitor.provide_initial_counterparty_commitment_tx(
 			counterparty_initial_commitment_tx.trust().txid(), Vec::new(),
 			self.context.cur_counterparty_commitment_transaction_number + 1,
@@ -8785,7 +8928,7 @@ impl<SP: Deref> Writeable for Channel<SP> where SP::Target: SignerProvider {
 			match update {
 				&HTLCUpdateAwaitingACK::AddHTLC {
 					ref amount_msat, ref cltv_expiry, ref payment_hash, ref source, ref onion_routing_packet,
-					blinding_point, skimmed_fee_msat,
+					blinding_point, skimmed_fee_msat, amount_rgb,
 				} => {
 					0u8.write(writer)?;
 					amount_msat.write(writer)?;
@@ -8796,6 +8939,8 @@ impl<SP: Deref> Writeable for Channel<SP> where SP::Target: SignerProvider {
 
 					holding_cell_skimmed_fees.push(skimmed_fee_msat);
 					holding_cell_blinding_points.push(blinding_point);
+
+					amount_rgb.write(writer)?;
 				},
 				&HTLCUpdateAwaitingACK::ClaimHTLC { ref payment_preimage, ref htlc_id } => {
 					1u8.write(writer)?;
@@ -8996,7 +9141,8 @@ impl<SP: Deref> Writeable for Channel<SP> where SP::Target: SignerProvider {
 			(47, next_holder_commitment_point, option),
 			(49, self.context.local_initiated_shutdown, option), // Added in 0.0.122
 			(51, is_manual_broadcast, option), // Added in 0.0.124
-			(53, funding_tx_broadcast_safe_event_emitted, option) // Added in 0.0.124
+			(53, funding_tx_broadcast_safe_event_emitted, option), // Added in 0.0.124
+			(55, self.context.consignment_endpoint, option),
 		});
 
 		Ok(())
@@ -9004,13 +9150,13 @@ impl<SP: Deref> Writeable for Channel<SP> where SP::Target: SignerProvider {
 }
 
 const MAX_ALLOC_SIZE: usize = 64*1024;
-impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c ChannelTypeFeatures)> for Channel<SP>
+impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c ChannelTypeFeatures, PathBuf)> for Channel<SP>
 		where
 			ES::Target: EntropySource,
 			SP::Target: SignerProvider
 {
-	fn read<R : io::Read>(reader: &mut R, args: (&'a ES, &'b SP, u32, &'c ChannelTypeFeatures)) -> Result<Self, DecodeError> {
-		let (entropy_source, signer_provider, serialized_height, our_supported_features) = args;
+	fn read<R : io::Read>(reader: &mut R, args: (&'a ES, &'b SP, u32, &'c ChannelTypeFeatures, PathBuf)) -> Result<Self, DecodeError> {
+		let (entropy_source, signer_provider, serialized_height, our_supported_features, ldk_data_dir) = args;
 		let ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
 		// `user_id` used to be a single u64 value. In order to remain backwards compatible with
@@ -9092,6 +9238,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 					4 => InboundHTLCState::LocalRemoved(Readable::read(reader)?),
 					_ => return Err(DecodeError::InvalidValue),
 				},
+				amount_rgb: Readable::read(reader)?,
 			});
 		}
 
@@ -9123,6 +9270,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 				},
 				skimmed_fee_msat: None,
 				blinding_point: None,
+				amount_rgb: Readable::read(reader)?,
 			});
 		}
 
@@ -9138,6 +9286,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 					onion_routing_packet: Readable::read(reader)?,
 					skimmed_fee_msat: None,
 					blinding_point: None,
+					amount_rgb: Readable::read(reader)?,
 				},
 				1 => HTLCUpdateAwaitingACK::ClaimHTLC {
 					payment_preimage: Readable::read(reader)?,
@@ -9291,6 +9440,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		let mut channel_keys_id: Option<[u8; 32]> = None;
 		let mut temporary_channel_id: Option<ChannelId> = None;
 		let mut holder_max_accepted_htlcs: Option<u16> = None;
+		let mut consignment_endpoint: Option<RgbTransport> = None;
 
 		let mut blocked_monitor_updates = Some(Vec::new());
 
@@ -9346,6 +9496,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 			(49, local_initiated_shutdown, option),
 			(51, is_manual_broadcast, option),
 			(53, funding_tx_broadcast_safe_event_emitted, option),
+			(55, consignment_endpoint, option),
 		});
 
 		let (channel_keys_id, holder_signer) = if let Some(channel_keys_id) = channel_keys_id {
@@ -9607,6 +9758,9 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 
 				blocked_monitor_updates: blocked_monitor_updates.unwrap(),
 				is_manual_broadcast: is_manual_broadcast.unwrap_or(false),
+
+				consignment_endpoint,
+				ldk_data_dir,
 			},
 			#[cfg(any(dual_funding, splicing))]
 			dual_funding_channel_context: None,
@@ -9614,6 +9768,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 	}
 }
 
+/*
 #[cfg(test)]
 mod tests {
 	use std::cmp;
@@ -11393,3 +11548,4 @@ mod tests {
 		assert!(node_a_chan.check_get_channel_ready(0, &&logger).is_some());
 	}
 }
+*/

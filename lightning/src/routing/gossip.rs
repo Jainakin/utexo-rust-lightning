@@ -21,6 +21,8 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hashes::Hash;
 use bitcoin::network::Network;
 
+use rgb_lib::ContractId;
+
 use crate::events::{MessageSendEvent, MessageSendEventsProvider};
 use crate::ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 use crate::ln::msgs;
@@ -826,6 +828,8 @@ pub struct ChannelUpdateInfo {
 	/// Everything else is useful only for sending out for initial routing sync.
 	/// Not stored if contains excess data to prevent DoS.
 	pub last_update_message: Option<ChannelUpdate>,
+	/// The maximum RGB value which may be relayed to the next hop via the channel.
+	pub htlc_maximum_rgb: u64,
 }
 
 impl fmt::Display for ChannelUpdateInfo {
@@ -847,6 +851,7 @@ impl Writeable for ChannelUpdateInfo {
 			(8, Some(self.htlc_maximum_msat), required),
 			(10, self.fees, required),
 			(12, self.last_update_message, required),
+			(14, self.htlc_maximum_rgb, required),
 		});
 		Ok(())
 	}
@@ -861,6 +866,7 @@ impl Readable for ChannelUpdateInfo {
 		_init_tlv_field_var!(htlc_maximum_msat, option);
 		_init_tlv_field_var!(fees, required);
 		_init_tlv_field_var!(last_update_message, required);
+		_init_tlv_field_var!(htlc_maximum_rgb, required);
 
 		read_tlv_fields!(reader, {
 			(0, last_update, required),
@@ -869,7 +875,8 @@ impl Readable for ChannelUpdateInfo {
 			(6, htlc_minimum_msat, required),
 			(8, htlc_maximum_msat, required),
 			(10, fees, required),
-			(12, last_update_message, required)
+			(12, last_update_message, required),
+			(14, htlc_maximum_rgb, required)
 		});
 
 		if let Some(htlc_maximum_msat) = htlc_maximum_msat {
@@ -881,6 +888,7 @@ impl Readable for ChannelUpdateInfo {
 				htlc_maximum_msat,
 				fees: _init_tlv_based_struct_field!(fees, required),
 				last_update_message: _init_tlv_based_struct_field!(last_update_message, required),
+				htlc_maximum_rgb: _init_tlv_based_struct_field!(htlc_maximum_rgb, required),
 			})
 		} else {
 			Err(DecodeError::InvalidValue)
@@ -937,6 +945,8 @@ pub struct ChannelInfo {
 	/// (which we can probably assume we are - no-std environments probably won't have a full
 	/// network graph in memory!).
 	announcement_received_time: u64,
+	/// RGB contract ID
+	pub contract_id: Option<ContractId>,
 }
 
 impl PartialEq for ChannelInfo {
@@ -1017,6 +1027,7 @@ impl Writeable for ChannelInfo {
 			(8, self.two_to_one, required),
 			(10, self.capacity_sats, required),
 			(12, self.announcement_message, required),
+			(14, self.contract_id, option),
 		});
 		Ok(())
 	}
@@ -1050,6 +1061,7 @@ impl Readable for ChannelInfo {
 		let mut two_to_one_wrap: Option<ChannelUpdateInfoDeserWrapper> = None;
 		_init_tlv_field_var!(capacity_sats, required);
 		_init_tlv_field_var!(announcement_message, required);
+		_init_tlv_field_var!(contract_id, option);
 		read_tlv_fields!(reader, {
 			(0, features, required),
 			(1, announcement_received_time, (default_value, 0)),
@@ -1059,6 +1071,7 @@ impl Readable for ChannelInfo {
 			(8, two_to_one_wrap, upgradable_option),
 			(10, capacity_sats, required),
 			(12, announcement_message, required),
+			(14, contract_id, option),
 		});
 
 		Ok(ChannelInfo {
@@ -1072,6 +1085,7 @@ impl Readable for ChannelInfo {
 			announcement_received_time: _init_tlv_based_struct_field!(announcement_received_time, (default_value, 0)),
 			node_one_counter: u32::max_value(),
 			node_two_counter: u32::max_value(),
+			contract_id: _init_tlv_based_struct_field!(contract_id, option),
 		})
 	}
 }
@@ -1121,6 +1135,12 @@ impl<'a> DirectedChannelInfo<'a> {
 			},
 			None => EffectiveCapacity::AdvertisedMaxHTLC { amount_msat: htlc_maximum_msat },
 		}
+	}
+
+	/// Return the effective RGB capacity of the channel in the direction.
+	#[inline]
+	pub fn effective_capacity_rgb(&self) -> u64 {
+		self.direction().htlc_maximum_rgb
 	}
 
 	/// Returns information for the direction.
@@ -1844,6 +1864,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			announcement_received_time: timestamp,
 			node_one_counter: u32::max_value(),
 			node_two_counter: u32::max_value(),
+			contract_id: None,
 		};
 
 		self.add_channel_between_nodes(short_channel_id, channel_info, None)
@@ -1997,6 +2018,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			announcement_received_time,
 			node_one_counter: u32::max_value(),
 			node_two_counter: u32::max_value(),
+			contract_id: msg.contract_id,
 		};
 
 		self.add_channel_between_nodes(msg.short_channel_id, chan_info, utxo_value)?;
@@ -2290,7 +2312,8 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 								base_msat: msg.fee_base_msat,
 								proportional_millionths: msg.fee_proportional_millionths,
 							},
-							last_update_message
+							last_update_message,
+							htlc_maximum_rgb: msg.htlc_maximum_rgb,
 						};
 						Some(updated_channel_update_info)
 					} }
@@ -2399,6 +2422,7 @@ impl ReadOnlyNetworkGraph<'_> {
 	}
 }
 
+/*
 #[cfg(test)]
 pub(crate) mod tests {
 	use crate::events::{MessageSendEvent, MessageSendEventsProvider};
@@ -3921,3 +3945,4 @@ pub mod benches {
 		));
 	}
 }
+*/

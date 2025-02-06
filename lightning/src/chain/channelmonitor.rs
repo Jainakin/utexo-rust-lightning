@@ -56,6 +56,7 @@ use crate::events::bump_transaction::{AnchorDescriptor, BumpTransactionEvent};
 use crate::prelude::*;
 
 use core::{cmp, mem};
+use std::path::PathBuf;
 use crate::io::{self, Error};
 use core::ops::Deref;
 use crate::sync::{Mutex, LockTestExt};
@@ -215,12 +216,14 @@ pub struct HTLCUpdate {
 	pub(crate) payment_preimage: Option<PaymentPreimage>,
 	pub(crate) source: HTLCSource,
 	pub(crate) htlc_value_satoshis: Option<u64>,
+	pub(crate) htlc_value_rgb: Option<u64>,
 }
 impl_writeable_tlv_based!(HTLCUpdate, {
 	(0, payment_hash, required),
 	(1, htlc_value_satoshis, option),
 	(2, source, required),
 	(4, payment_preimage, option),
+	(6, htlc_value_rgb, option),
 });
 
 /// If an HTLC expires within this many blocks, don't try to claim it in a shared transaction,
@@ -426,6 +429,7 @@ enum OnchainEvent {
 		source: HTLCSource,
 		payment_hash: PaymentHash,
 		htlc_value_satoshis: Option<u64>,
+		htlc_value_rgb: Option<u64>,
 		/// None in the second case, above, ie when there is no relevant output in the commitment
 		/// transaction which appeared on chain.
 		commitment_tx_output_idx: Option<u32>,
@@ -507,6 +511,7 @@ impl_writeable_tlv_based_enum_upgradable!(OnchainEvent,
 		(1, htlc_value_satoshis, option),
 		(2, payment_hash, required),
 		(3, commitment_tx_output_idx, option),
+		(4, htlc_value_rgb, option),
 	},
 	(1, MaturingOutput) => {
 		(0, descriptor, required),
@@ -1104,6 +1109,7 @@ impl<Signer: EcdsaChannelSigner> Writeable for ChannelMonitorImpl<Signer> {
 				writer.write_all(&$htlc_output.cltv_expiry.to_be_bytes())?;
 				writer.write_all(&$htlc_output.payment_hash.0[..])?;
 				$htlc_output.transaction_output_index.write(writer)?;
+				$htlc_output.amount_rgb.write(writer)?;
 			}
 		}
 
@@ -1328,7 +1334,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	                  funding_redeemscript: ScriptBuf, channel_value_satoshis: u64,
 	                  commitment_transaction_number_obscure_factor: u64,
 	                  initial_holder_commitment_tx: HolderCommitmentTransaction,
-	                  best_block: BestBlock, counterparty_node_id: PublicKey, channel_id: ChannelId,
+	                  best_block: BestBlock, counterparty_node_id: PublicKey, channel_id: ChannelId, ldk_data_dir: PathBuf,
 	) -> ChannelMonitor<Signer> {
 
 		assert!(commitment_transaction_number_obscure_factor <= (1 << 48));
@@ -1366,7 +1372,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 
 		let onchain_tx_handler = OnchainTxHandler::new(
 			channel_value_satoshis, channel_keys_id, destination_script.into(), keys,
-			channel_parameters.clone(), initial_holder_commitment_tx, secp_ctx
+			channel_parameters.clone(), initial_holder_commitment_tx, secp_ctx, ldk_data_dir
 		);
 
 		let mut outputs_to_watch = new_hash_map();
@@ -2643,6 +2649,7 @@ macro_rules! fail_unbroadcast_htlcs {
 									source: (**source).clone(),
 									payment_hash: htlc.payment_hash.clone(),
 									htlc_value_satoshis: Some(htlc.amount_msat / 1000),
+									htlc_value_rgb: htlc.amount_rgb,
 									commitment_tx_output_idx: None,
 								},
 							};
@@ -2783,11 +2790,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	) where L::Target: Logger {
 		self.initial_counterparty_commitment_info = Some((their_per_commitment_point.clone(),
 			feerate_per_kw, to_broadcaster_value, to_countersignatory_value));
-
-		#[cfg(debug_assertions)] {
-			let rebuilt_commitment_tx = self.initial_counterparty_commitment_tx().unwrap();
-			debug_assert_eq!(rebuilt_commitment_tx.trust().txid(), txid);
-		}
 
 		self.provide_latest_counterparty_commitment_tx(txid, htlc_outputs, commitment_number,
 				their_per_commitment_point, logger);
@@ -3186,10 +3188,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 					}
 				},
 			}
-		}
-
-		#[cfg(debug_assertions)] {
-			self.counterparty_commitment_txs_from_update(updates);
 		}
 
 		// If the updates succeeded and we were in an already closed channel state, then there's no
@@ -4091,7 +4089,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		// Produce actionable events from on-chain events having reached their threshold.
 		for entry in onchain_events_reaching_threshold_conf.drain(..) {
 			match entry.event {
-				OnchainEvent::HTLCUpdate { ref source, payment_hash, htlc_value_satoshis, commitment_tx_output_idx } => {
+				OnchainEvent::HTLCUpdate { ref source, payment_hash, htlc_value_satoshis, htlc_value_rgb, commitment_tx_output_idx } => {
 					// Check for duplicate HTLC resolutions.
 					#[cfg(debug_assertions)]
 					{
@@ -4115,6 +4113,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 						payment_preimage: None,
 						source: source.clone(),
 						htlc_value_satoshis,
+						htlc_value_rgb,
 					}));
 					self.htlcs_resolved_on_chain.push(IrrevocablyResolvedHTLC {
 						commitment_tx_output_idx,
@@ -4411,7 +4410,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 							if pending_htlc.payment_hash == $htlc_output.payment_hash && pending_htlc.amount_msat == $htlc_output.amount_msat {
 								if let &Some(ref source) = pending_source {
 									log_claim!("revoked counterparty commitment tx", false, pending_htlc, true);
-									payment_data = Some(((**source).clone(), $htlc_output.payment_hash, $htlc_output.amount_msat));
+									payment_data = Some(((**source).clone(), $htlc_output.payment_hash, $htlc_output.amount_msat, $htlc_output.amount_rgb));
 									break;
 								}
 							}
@@ -4430,7 +4429,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 								// transaction. This implies we either learned a preimage, the HTLC
 								// has timed out, or we screwed up. In any case, we should now
 								// resolve the source HTLC with the original sender.
-								payment_data = Some(((*source).clone(), htlc_output.payment_hash, htlc_output.amount_msat));
+								payment_data = Some(((*source).clone(), htlc_output.payment_hash, htlc_output.amount_msat, htlc_output.amount_rgb));
 							} else if !$holder_tx {
 								if let Some(current_counterparty_commitment_txid) = &self.current_counterparty_commitment_txid {
 									check_htlc_valid_counterparty!(htlc_output, self.counterparty_claimable_outpoints.get(current_counterparty_commitment_txid).unwrap());
@@ -4482,7 +4481,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 
 			// Check that scan_commitment, above, decided there is some source worth relaying an
 			// HTLC resolution backwards to and figure out whether we learned a preimage from it.
-			if let Some((source, payment_hash, amount_msat)) = payment_data {
+			if let Some((source, payment_hash, amount_msat, amount_rgb)) = payment_data {
 				if accepted_preimage_claim {
 					if !self.pending_monitor_events.iter().any(
 						|update| if let &MonitorEvent::HTLCEvent(ref upd) = update { upd.source == source } else { false }) {
@@ -4502,6 +4501,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 							payment_preimage: Some(payment_preimage),
 							payment_hash,
 							htlc_value_satoshis: Some(amount_msat / 1000),
+							htlc_value_rgb: amount_rgb,
 						}));
 					}
 				} else if offered_preimage_claim {
@@ -4525,6 +4525,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 							payment_preimage: Some(payment_preimage),
 							payment_hash,
 							htlc_value_satoshis: Some(amount_msat / 1000),
+							htlc_value_rgb: amount_rgb,
 						}));
 					}
 				} else {
@@ -4545,6 +4546,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 						event: OnchainEvent::HTLCUpdate {
 							source, payment_hash,
 							htlc_value_satoshis: Some(amount_msat / 1000),
+							htlc_value_rgb: amount_rgb,
 							commitment_tx_output_idx: Some(input.previous_output.vout),
 						},
 					};
@@ -4659,9 +4661,9 @@ where
 
 const MAX_ALLOC_SIZE: usize = 64*1024;
 
-impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP)>
+impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP, PathBuf)>
 		for (BlockHash, ChannelMonitor<SP::EcdsaSigner>) {
-	fn read<R: io::Read>(reader: &mut R, args: (&'a ES, &'b SP)) -> Result<Self, DecodeError> {
+	fn read<R: io::Read>(reader: &mut R, args: (&'a ES, &'b SP, PathBuf)) -> Result<Self, DecodeError> {
 		macro_rules! unwrap_obj {
 			($key: expr) => {
 				match $key {
@@ -4671,7 +4673,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			}
 		}
 
-		let (entropy_source, signer_provider) = args;
+		let (entropy_source, signer_provider, ldk_data_dir) = args;
 
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
@@ -4738,9 +4740,10 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 					let cltv_expiry: u32 = Readable::read(reader)?;
 					let payment_hash: PaymentHash = Readable::read(reader)?;
 					let transaction_output_index: Option<u32> = Readable::read(reader)?;
+					let amount_rgb: Option<u64> = Readable::read(reader)?;
 
 					HTLCOutputInCommitment {
-						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index
+						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index, amount_rgb
 					}
 				}
 			}
@@ -4847,7 +4850,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			}
 		}
 		let onchain_tx_handler: OnchainTxHandler<SP::EcdsaSigner> = ReadableArgs::read(
-			reader, (entropy_source, signer_provider, channel_value_satoshis, channel_keys_id)
+			reader, (entropy_source, signer_provider, channel_value_satoshis, channel_keys_id, ldk_data_dir)
 		)?;
 
 		let lockdown_from_offchain = Readable::read(reader)?;

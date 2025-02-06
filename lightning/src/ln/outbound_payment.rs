@@ -22,6 +22,7 @@ use crate::ln::features::Bolt12InvoiceFeatures;
 use crate::ln::onion_utils;
 use crate::ln::onion_utils::{DecodedOnionFailure, HTLCFailReason};
 use crate::offers::invoice::Bolt12Invoice;
+use crate::rgb_utils::{filter_first_hops, get_rgb_payment_info_path, is_payment_rgb, parse_rgb_payment_info};
 use crate::routing::router::{BlindedTail, InFlightHtlcs, Path, PaymentParameters, Route, RouteParameters, Router};
 use crate::sign::{EntropySource, NodeSigner, Recipient};
 use crate::util::errors::APIError;
@@ -33,6 +34,8 @@ use crate::util::ser::ReadableArgs;
 use core::fmt::{self, Display, Formatter};
 use core::ops::Deref;
 use core::time::Duration;
+
+use std::path::PathBuf;
 
 use crate::prelude::*;
 use crate::sync::Mutex;
@@ -667,13 +670,15 @@ pub(super) struct SendAlongPathArgs<'a> {
 pub(super) struct OutboundPayments {
 	pub(super) pending_outbound_payments: Mutex<HashMap<PaymentId, PendingOutboundPayment>>,
 	pub(super) retry_lock: Mutex<()>,
+	pub(super) ldk_data_dir: PathBuf,
 }
 
 impl OutboundPayments {
-	pub(super) fn new() -> Self {
+	pub(super) fn new(ldk_data_dir: PathBuf) -> Self {
 		Self {
 			pending_outbound_payments: Mutex::new(new_hash_map()),
 			retry_lock: Mutex::new(()),
+			ldk_data_dir,
 		}
 	}
 
@@ -832,8 +837,12 @@ impl OutboundPayments {
 		}
 
 		let amount_msat = invoice.amount_msats();
+		let mut filtered_first_hops = first_hops.into_iter().collect::<Vec<_>>();
+		let rgb_payment = is_payment_rgb(&self.ldk_data_dir, &payment_hash).then(|| {
+			filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut filtered_first_hops)
+		});
 		let mut route_params = RouteParameters::from_payment_params_and_value(
-			payment_params, amount_msat
+			payment_params, amount_msat, rgb_payment,
 		);
 
 		if let Some(max_fee_msat) = max_total_routing_fee_msat {
@@ -847,7 +856,7 @@ impl OutboundPayments {
 		};
 		let route = match self.find_initial_route(
 			payment_id, payment_hash, &recipient_onion, None, &mut route_params, router,
-			&first_hops, &inflight_htlcs, node_signer, best_block_height, logger,
+			&filtered_first_hops, &inflight_htlcs, node_signer, best_block_height, logger,
 		) {
 			Ok(route) => route,
 			Err(e) => {
@@ -888,7 +897,7 @@ impl OutboundPayments {
 		);
 		if let Err(e) = result {
 			self.handle_pay_route_err(
-				e, payment_id, payment_hash, route, route_params, router, first_hops,
+				e, payment_id, payment_hash, route, route_params, router, filtered_first_hops,
 				&inflight_htlcs, entropy_source, node_signer, best_block_height, logger,
 				pending_events, &send_payment_along_path
 			);
@@ -918,11 +927,19 @@ impl OutboundPayments {
 			for (pmt_id, pmt) in outbounds.iter_mut() {
 				if pmt.is_auto_retryable_now() {
 					if let PendingOutboundPayment::Retryable { pending_amt_msat, total_msat, payment_params: Some(params), payment_hash, remaining_max_total_routing_fee_msat, .. } = pmt {
+						let rgb_payment_info_path = get_rgb_payment_info_path(payment_hash, &self.ldk_data_dir, false);
+						let rgb_payment = if rgb_payment_info_path.exists() {
+							let rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_path);
+							Some((rgb_payment_info.contract_id, rgb_payment_info.amount))
+						} else {
+							None
+						};
 						if pending_amt_msat < total_msat {
 							retry_id_route_params = Some((*payment_hash, *pmt_id, RouteParameters {
 								final_value_msat: *total_msat - *pending_amt_msat,
 								payment_params: params.clone(),
 								max_total_routing_fee_msat: *remaining_max_total_routing_fee_msat,
+								rgb_payment,
 							}));
 							break
 						}
@@ -963,7 +980,7 @@ impl OutboundPayments {
 	fn find_initial_route<R: Deref, NS: Deref, IH, L: Deref>(
 		&self, payment_id: PaymentId, payment_hash: PaymentHash,
 		recipient_onion: &RecipientOnionFields, keysend_preimage: Option<PaymentPreimage>,
-		route_params: &mut RouteParameters, router: &R, first_hops: &Vec<ChannelDetails>,
+		route_params: &mut RouteParameters, router: &R, filtered_first_hops: &Vec<ChannelDetails>,
 		inflight_htlcs: &IH, node_signer: &NS, best_block_height: u32, logger: &L,
 	) -> Result<Route, RetryableSendFailure>
 	where
@@ -991,7 +1008,7 @@ impl OutboundPayments {
 
 		let mut route = router.find_route_with_id(
 			&node_signer.get_node_id(Recipient::Node).unwrap(), route_params,
-			Some(&first_hops.iter().collect::<Vec<_>>()), inflight_htlcs(),
+			Some(&filtered_first_hops.iter().collect::<Vec<_>>()), inflight_htlcs(),
 			payment_hash, payment_id,
 		).map_err(|_| {
 			log_error!(logger, "Failed to find route for payment with id {} and hash {}",
@@ -1028,9 +1045,13 @@ impl OutboundPayments {
 		IH: Fn() -> InFlightHtlcs,
 		SP: Fn(SendAlongPathArgs) -> Result<(), APIError>,
 	{
+		let mut filtered_first_hops = first_hops.into_iter().collect::<Vec<_>>();
+		is_payment_rgb(&self.ldk_data_dir, &payment_hash).then(|| {
+			filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut filtered_first_hops)
+		});
 		let route = self.find_initial_route(
 			payment_id, payment_hash, &recipient_onion, keysend_preimage, &mut route_params, router,
-			&first_hops, &inflight_htlcs, node_signer, best_block_height, logger,
+			&filtered_first_hops, &inflight_htlcs, node_signer, best_block_height, logger,
 		)?;
 
 		let onion_session_privs = self.add_new_pending_payment(payment_hash,
@@ -1048,7 +1069,7 @@ impl OutboundPayments {
 		log_info!(logger, "Sending payment with id {} and hash {} returned {:?}",
 			payment_id, payment_hash, res);
 		if let Err(e) = res {
-			self.handle_pay_route_err(e, payment_id, payment_hash, route, route_params, router, first_hops, &inflight_htlcs, entropy_source, node_signer, best_block_height, logger, pending_events, &send_payment_along_path);
+			self.handle_pay_route_err(e, payment_id, payment_hash, route, route_params, router, filtered_first_hops, &inflight_htlcs, entropy_source, node_signer, best_block_height, logger, pending_events, &send_payment_along_path);
 		}
 		Ok(())
 	}
@@ -1075,10 +1096,15 @@ impl OutboundPayments {
 			}
 		}
 
+		let mut filtered_first_hops = first_hops.into_iter().collect::<Vec<_>>();
+		is_payment_rgb(&self.ldk_data_dir, &payment_hash).then(|| {
+			filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut filtered_first_hops)
+		});
+
 		let mut route = match router.find_route_with_id(
 			&node_signer.get_node_id(Recipient::Node).unwrap(), &route_params,
-			Some(&first_hops.iter().collect::<Vec<_>>()), inflight_htlcs(),
-			payment_hash, payment_id,
+			Some(&filtered_first_hops.iter().collect::<Vec<&ChannelDetails>>()), inflight_htlcs(),
+			payment_hash, payment_id
 		) {
 			Ok(route) => route,
 			Err(e) => {
@@ -1196,7 +1222,7 @@ impl OutboundPayments {
 			&send_payment_along_path);
 		log_info!(logger, "Result retrying payment id {}: {:?}", &payment_id, res);
 		if let Err(e) = res {
-			self.handle_pay_route_err(e, payment_id, payment_hash, route, route_params, router, first_hops, inflight_htlcs, entropy_source, node_signer, best_block_height, logger, pending_events, send_payment_along_path);
+			self.handle_pay_route_err(e, payment_id, payment_hash, route, route_params, router, filtered_first_hops, inflight_htlcs, entropy_source, node_signer, best_block_height, logger, pending_events, send_payment_along_path);
 		}
 	}
 

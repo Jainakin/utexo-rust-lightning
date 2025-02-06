@@ -11,6 +11,8 @@
 
 use bitcoin::secp256k1::{PublicKey, Secp256k1, self};
 
+use rgb_lib::ContractId;
+
 use crate::blinded_path::{BlindedHop, Direction, IntroductionNode};
 use crate::blinded_path::message::{BlindedMessagePath, MessageContext, MessageForwardNode};
 use crate::blinded_path::payment::{BlindedPaymentPath, ForwardTlvs, PaymentConstraints, PaymentForwardNode, PaymentRelay, ReceiveTlvs};
@@ -403,6 +405,10 @@ pub struct RouteHop {
 	///
 	/// Will be `true` for objects serialized with LDK version 0.0.116 and before.
 	pub maybe_announced_channel: bool,
+	/// How much to pay the node.
+	pub payment_amount: u64,
+	/// RGB amount to send to the following node
+	pub rgb_amount: Option<u64>,
 }
 
 impl_writeable_tlv_based!(RouteHop, {
@@ -413,6 +419,8 @@ impl_writeable_tlv_based!(RouteHop, {
 	(6, channel_features, required),
 	(8, fee_msat, required),
 	(10, cltv_expiry_delta, required),
+	(12, rgb_amount, option),
+	(14, payment_amount, required),
 });
 
 /// The blinded portion of a [`Path`], if we're routing to a recipient who provided blinded paths in
@@ -556,6 +564,7 @@ impl Writeable for Route {
 			(2, blinded_tails, optional_vec),
 			(3, self.route_params.as_ref().map(|p| p.final_value_msat), option),
 			(5, self.route_params.as_ref().and_then(|p| p.max_total_routing_fee_msat), option),
+			(7, self.route_params.as_ref().and_then(|p| p.rgb_payment), option),
 		});
 		Ok(())
 	}
@@ -583,7 +592,8 @@ impl Readable for Route {
 			(1, payment_params, (option: ReadableArgs, min_final_cltv_expiry_delta)),
 			(2, blinded_tails, optional_vec),
 			(3, final_value_msat, option),
-			(5, max_total_routing_fee_msat, option)
+			(5, max_total_routing_fee_msat, option),
+			(7, rgb_payment, option)
 		});
 		let blinded_tails = blinded_tails.unwrap_or(Vec::new());
 		if blinded_tails.len() != 0 {
@@ -596,7 +606,7 @@ impl Readable for Route {
 		// If we previously wrote the corresponding fields, reconstruct RouteParameters.
 		let route_params = match (payment_params, final_value_msat) {
 			(Some(payment_params), Some(final_value_msat)) => {
-				Some(RouteParameters { payment_params, final_value_msat, max_total_routing_fee_msat })
+				Some(RouteParameters { payment_params, final_value_msat, max_total_routing_fee_msat, rgb_payment })
 			}
 			_ => None,
 		};
@@ -623,14 +633,17 @@ pub struct RouteParameters {
 	///
 	/// Note that values below a few sats may result in some paths being spuriously ignored.
 	pub max_total_routing_fee_msat: Option<u64>,
+
+	/// The contract ID and RGB amount info
+	pub rgb_payment: Option<(ContractId, u64)>,
 }
 
 impl RouteParameters {
 	/// Constructs [`RouteParameters`] from the given [`PaymentParameters`] and a payment amount.
 	///
 	/// [`Self::max_total_routing_fee_msat`] defaults to 1% of the payment amount + 50 sats
-	pub fn from_payment_params_and_value(payment_params: PaymentParameters, final_value_msat: u64) -> Self {
-		Self { payment_params, final_value_msat, max_total_routing_fee_msat: Some(final_value_msat / 100 + 50_000) }
+	pub fn from_payment_params_and_value(payment_params: PaymentParameters, final_value_msat: u64, rgb_payment: Option<(ContractId, u64)>) -> Self {
+		Self { payment_params, final_value_msat, max_total_routing_fee_msat: Some(final_value_msat / 100 + 50_000), rgb_payment }
 	}
 
 	/// Sets the maximum number of hops that can be included in a payment path, based on the provided
@@ -654,6 +667,7 @@ impl Writeable for RouteParameters {
 			// LDK versions prior to 0.0.114 had the `final_cltv_expiry_delta` parameter in
 			// `RouteParameters` directly. For compatibility, we write it here.
 			(4, self.payment_params.payee.final_cltv_expiry_delta(), option),
+			(5, self.rgb_payment, option),
 		});
 		Ok(())
 	}
@@ -666,6 +680,7 @@ impl Readable for RouteParameters {
 			(1, max_total_routing_fee_msat, option),
 			(2, final_value_msat, required),
 			(4, final_cltv_delta, option),
+			(5, rgb_payment, option),
 		});
 		let mut payment_params: PaymentParameters = payment_params.0.unwrap();
 		if let Payee::Clear { ref mut final_cltv_expiry_delta, .. } = payment_params.payee {
@@ -677,6 +692,7 @@ impl Readable for RouteParameters {
 			payment_params,
 			final_value_msat: final_value_msat.0.unwrap(),
 			max_total_routing_fee_msat,
+			rgb_payment,
 		})
 	}
 }
@@ -1133,6 +1149,7 @@ impl_writeable_tlv_based!(RouteHintHop, {
 	(3, htlc_maximum_msat, option),
 	(4, fees, required),
 	(6, cltv_expiry_delta, required),
+	(7, htlc_maximum_rgb, option),
 });
 
 #[derive(Eq, PartialEq)]
@@ -1479,6 +1496,16 @@ impl<'a> CandidateRouteHop<'a> {
 			CandidateRouteHop::Blinded(hop) =>
 				EffectiveCapacity::HintMaxHTLC { amount_msat: hop.hint.payinfo.htlc_maximum_msat },
 			CandidateRouteHop::OneHopBlinded(_) => EffectiveCapacity::Infinite,
+		}
+	}
+
+	/// Fetch the effective RGB capacity of this hop.
+	fn effective_capacity_rgb(&self) -> u64 {
+		match self {
+			CandidateRouteHop::FirstHop(hop) => hop.details.next_outbound_htlc_limit_rgb,
+			CandidateRouteHop::PublicHop(hop) => hop.info.effective_capacity_rgb(),
+			CandidateRouteHop::PrivateHop(PrivateHopCandidate { hint: RouteHintHop { htlc_maximum_rgb: Some(max), .. }, .. }) => *max,
+			_ => u64::MAX,
 		}
 	}
 
@@ -2439,11 +2466,31 @@ where L::Target: Logger {
 						_ => (false, None),
 					};
 
+					let mut contributes_sufficient_rgb_value = true;
+					if let Some(rgb_amount) = route_params.rgb_payment.map(|(_, amt)| amt) {
+						if $candidate.effective_capacity_rgb() < rgb_amount {
+							contributes_sufficient_rgb_value = false;
+						}
+					}
+
 					// If HTLC minimum is larger than the amount we're going to transfer, we shouldn't
 					// bother considering this channel. If retrying with recommended_value_msat may
 					// allow us to hit the HTLC minimum limit, set htlc_minimum_limit so that we go
 					// around again with a higher amount.
-					if !contributes_sufficient_value {
+					if !contributes_sufficient_rgb_value {
+						if should_log_candidate {
+							log_trace!(logger,
+								"Ignoring {} due to its HTLC RGB maximum limit.",
+								LoggedCandidateHop(&$candidate));
+
+							if let Some(details) = first_hop_details {
+								log_trace!(logger,
+									"First hop candidate next_outbound_htlc_limit_rgb: {}",
+									details.next_outbound_htlc_limit_rgb,
+								);
+							}
+						}
+					} else if !contributes_sufficient_value {
 						if should_log_candidate {
 							log_trace!(logger, "Ignoring {} due to insufficient value contribution (channel max {:?}).",
 								LoggedCandidateHop(&$candidate),
@@ -2724,7 +2771,7 @@ where L::Target: Logger {
 				if !features.requires_unknown_bits() {
 					for chan_id in $node.channels.iter() {
 						let chan = network_channels.get(chan_id).unwrap();
-						if !chan.features.requires_unknown_bits() {
+						if !chan.features.requires_unknown_bits() && chan.contract_id == route_params.rgb_payment.map(|(cid, _)| cid) {
 							if let Some((directed_channel, source)) = chan.as_directed_to(&$node_id) {
 								if first_hops.is_none() || *source != our_node_id {
 									if directed_channel.direction().enabled {
@@ -3347,6 +3394,8 @@ where L::Target: Logger {
 				fee_msat: hop.fee_msat,
 				cltv_expiry_delta: hop.candidate.cltv_expiry_delta(),
 				maybe_announced_channel,
+				payment_amount: final_value_msat,
+				rgb_amount: None,
 			});
 		}
 		let mut final_cltv_delta = final_cltv_expiry_delta;
@@ -3550,6 +3599,7 @@ fn build_route_from_hops_internal<L: Deref>(
 	get_route(our_node_pubkey, route_params, network_graph, None, logger, &scorer, &Default::default(), random_seed_bytes)
 }
 
+/*
 #[cfg(test)]
 mod tests {
 	use crate::blinded_path::BlindedHop;
@@ -8976,3 +9026,4 @@ pub mod benches {
 		}));
 	}
 }
+*/
