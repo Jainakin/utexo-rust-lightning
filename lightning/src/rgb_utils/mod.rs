@@ -141,12 +141,18 @@ async fn _get_rgb_wallet(ldk_data_dir: &Path) -> Wallet {
 async fn _accept_transfer(
 	ldk_data_dir: &Path, funding_txid: String, consignment_endpoint: RgbTransport,
 ) -> Result<(RgbTransfer, u64), RgbLibError> {
+	let funding_vout = 1;
 	let (data_dir, bitcoin_network, pubkey) = _get_wallet_data(ldk_data_dir);
 	let indexer_url = _get_indexer_url(ldk_data_dir);
 	tokio::task::spawn_blocking(move || {
 		let mut wallet = _new_rgb_wallet(data_dir, bitcoin_network, pubkey);
 		wallet.go_online(true, indexer_url).unwrap();
-		wallet.accept_transfer(funding_txid.clone(), 0, consignment_endpoint, STATIC_BLINDING)
+		wallet.accept_transfer(
+			funding_txid.clone(),
+			funding_vout,
+			consignment_endpoint,
+			STATIC_BLINDING,
+		)
 	})
 	.await
 	.unwrap()
@@ -333,7 +339,9 @@ where
 	let txid = modified_tx.compute_txid();
 	commitment_transaction.built = BuiltCommitmentTransaction { transaction: modified_tx, txid };
 
-	wallet.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap()).unwrap();
+	wallet
+		.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap(), None)
+		.unwrap();
 
 	// save RGB transfer data to disk
 	let rgb_amount = if counterparty {
@@ -391,7 +399,9 @@ pub(crate) fn color_htlc(
 	};
 	let txid = &modified_tx.compute_txid();
 
-	wallet.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap()).unwrap();
+	wallet
+		.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap(), None)
+		.unwrap();
 
 	// save RGB transfer data to disk
 	let transfer_info = TransferInfo { contract_id, rgb_amount: htlc_amount_rgb };
@@ -463,7 +473,9 @@ pub(crate) fn color_closing(
 	let txid = &modified_tx.compute_txid();
 	closing_transaction.built = modified_tx;
 
-	wallet.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap()).unwrap();
+	wallet
+		.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap(), None)
+		.unwrap();
 
 	// save RGB transfer data to disk
 	let transfer_info = TransferInfo { contract_id, rgb_amount: holder_vout_amount };

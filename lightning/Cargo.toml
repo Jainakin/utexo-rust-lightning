@@ -53,10 +53,10 @@ libm = { version = "0.2", optional = true, default-features = false }
 
 # RGB and related
 futures = "0.3"
-rgb-lib = { version = "0.3.0-alpha.11", features = [
+rgb-lib = { version = "0.3.0-alpha.12", features = [
     "electrum",
     "esplora",
-], git = "https://github.com/RGB-Tools/rgb-lib.git", rev = "952cd185" }
+] }
 serde = { version = "^1.0", features = [
     "derive",
 ] }
