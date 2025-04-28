@@ -24,7 +24,7 @@ use rgb_lib::{
 		DatabaseType, Outpoint, WalletData,
 	},
 	BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError, FileContent, RgbTransfer,
-	RgbTransport, RgbTxid, Wallet,
+	RgbTransport, RgbTxid, Wallet, WitnessOrd,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -43,8 +43,10 @@ pub const BITCOIN_NETWORK_FNAME: &str = "bitcoin_network";
 pub const INDEXER_URL_FNAME: &str = "indexer_url";
 /// Name of the file containing the wallet fingerprint
 pub const WALLET_FINGERPRINT_FNAME: &str = "wallet_fingerprint";
-/// Name of the file containing the wallet account xPub
-pub const WALLET_ACCOUNT_XPUB_FNAME: &str = "wallet_account_xpub";
+/// Name of the file containing the account-level xPub of the vanilla-side of the wallet
+pub const WALLET_ACCOUNT_XPUB_VANILLA_FNAME: &str = "wallet_account_xpub_vanilla";
+/// Name of the file containing the account-level xPub of the colored-side of the wallet
+pub const WALLET_ACCOUNT_XPUB_COLORED_FNAME: &str = "wallet_account_xpub_colored";
 const INBOUND_EXT: &str = "inbound";
 const OUTBOUND_EXT: &str = "outbound";
 
@@ -52,6 +54,7 @@ const OUTBOUND_EXT: &str = "outbound";
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RgbInfo {
 	/// Channel contract ID
+	#[serde(with = "contract_id_serde")]
 	pub contract_id: ContractId,
 	/// Channel RGB local amount
 	pub local_rgb_amount: u64,
@@ -63,6 +66,7 @@ pub struct RgbInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RgbPaymentInfo {
 	/// RGB contract ID
+	#[serde(with = "contract_id_serde")]
 	pub contract_id: ContractId,
 	/// RGB payment amount
 	pub amount: u64,
@@ -80,9 +84,31 @@ pub struct RgbPaymentInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransferInfo {
 	/// Transfer contract ID
+	#[serde(with = "contract_id_serde")]
 	pub contract_id: ContractId,
 	/// Transfer RGB amount
 	pub rgb_amount: u64,
+}
+
+mod contract_id_serde {
+	use super::*;
+	use serde::{Deserializer, Serializer};
+	use std::str::FromStr;
+
+	pub fn serialize<S>(id: &ContractId, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.serialize_str(&id.to_string())
+	}
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<ContractId, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let s = String::deserialize(deserializer)?;
+		ContractId::from_str(&s).map_err(serde::de::Error::custom)
+	}
 }
 
 fn _get_file_in_parent(ldk_data_dir: &Path, fname: &str) -> PathBuf {
@@ -103,49 +129,63 @@ fn _get_bitcoin_network(ldk_data_dir: &Path) -> BitcoinNetwork {
 	BitcoinNetwork::from_str(&bitcoin_network).unwrap()
 }
 
-fn _get_account_xpub(ldk_data_dir: &Path) -> String {
-	_read_file_in_parent(ldk_data_dir, WALLET_ACCOUNT_XPUB_FNAME)
+fn _get_account_xpub_colored(ldk_data_dir: &Path) -> String {
+	_read_file_in_parent(ldk_data_dir, WALLET_ACCOUNT_XPUB_COLORED_FNAME)
+}
+
+fn _get_account_xpub_vanilla(ldk_data_dir: &Path) -> String {
+	_read_file_in_parent(ldk_data_dir, WALLET_ACCOUNT_XPUB_VANILLA_FNAME)
 }
 
 fn _get_indexer_url(ldk_data_dir: &Path) -> String {
 	_read_file_in_parent(ldk_data_dir, INDEXER_URL_FNAME)
 }
 
-fn _new_rgb_wallet(data_dir: String, bitcoin_network: BitcoinNetwork, pubkey: String) -> Wallet {
+fn _new_rgb_wallet(
+	data_dir: String, bitcoin_network: BitcoinNetwork, account_xpub_vanilla: String,
+	account_xpub_colored: String,
+) -> Wallet {
 	Wallet::new(WalletData {
 		data_dir,
 		bitcoin_network,
 		database_type: DatabaseType::Sqlite,
 		max_allocations_per_utxo: 1,
-		pubkey,
+		account_xpub_vanilla,
+		account_xpub_colored,
 		mnemonic: None,
 		vanilla_keychain: None,
 	})
 	.expect("valid rgb-lib wallet")
 }
 
-fn _get_wallet_data(ldk_data_dir: &Path) -> (String, BitcoinNetwork, String) {
+fn _get_wallet_data(ldk_data_dir: &Path) -> (String, BitcoinNetwork, String, String) {
 	let data_dir = ldk_data_dir.parent().unwrap().to_string_lossy().to_string();
 	let bitcoin_network = _get_bitcoin_network(ldk_data_dir);
-	let pubkey = _get_account_xpub(ldk_data_dir);
-	(data_dir, bitcoin_network, pubkey)
+	let account_xpub_vanilla = _get_account_xpub_vanilla(ldk_data_dir);
+	let account_xpub_colored = _get_account_xpub_colored(ldk_data_dir);
+	(data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored)
 }
 
 async fn _get_rgb_wallet(ldk_data_dir: &Path) -> Wallet {
-	let (data_dir, bitcoin_network, pubkey) = _get_wallet_data(ldk_data_dir);
-	tokio::task::spawn_blocking(move || _new_rgb_wallet(data_dir, bitcoin_network, pubkey))
-		.await
-		.unwrap()
+	let (data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored) =
+		_get_wallet_data(ldk_data_dir);
+	tokio::task::spawn_blocking(move || {
+		_new_rgb_wallet(data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored)
+	})
+	.await
+	.unwrap()
 }
 
 async fn _accept_transfer(
 	ldk_data_dir: &Path, funding_txid: String, consignment_endpoint: RgbTransport,
 ) -> Result<(RgbTransfer, u64), RgbLibError> {
 	let funding_vout = 1;
-	let (data_dir, bitcoin_network, pubkey) = _get_wallet_data(ldk_data_dir);
+	let (data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored) =
+		_get_wallet_data(ldk_data_dir);
 	let indexer_url = _get_indexer_url(ldk_data_dir);
 	tokio::task::spawn_blocking(move || {
-		let mut wallet = _new_rgb_wallet(data_dir, bitcoin_network, pubkey);
+		let mut wallet =
+			_new_rgb_wallet(data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored);
 		wallet.go_online(true, indexer_url).unwrap();
 		wallet.accept_transfer(
 			funding_txid.clone(),
@@ -340,7 +380,11 @@ where
 	commitment_transaction.built = BuiltCommitmentTransaction { transaction: modified_tx, txid };
 
 	wallet
-		.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap(), None)
+		.consume_fascia(
+			fascia.clone(),
+			RgbTxid::from_str(&txid.to_string()).unwrap(),
+			Some(WitnessOrd::Ignored),
+		)
 		.unwrap();
 
 	// save RGB transfer data to disk
@@ -400,7 +444,11 @@ pub(crate) fn color_htlc(
 	let txid = &modified_tx.compute_txid();
 
 	wallet
-		.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap(), None)
+		.consume_fascia(
+			fascia.clone(),
+			RgbTxid::from_str(&txid.to_string()).unwrap(),
+			Some(WitnessOrd::Ignored),
+		)
 		.unwrap();
 
 	// save RGB transfer data to disk
@@ -474,7 +522,11 @@ pub(crate) fn color_closing(
 	closing_transaction.built = modified_tx;
 
 	wallet
-		.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap(), None)
+		.consume_fascia(
+			fascia.clone(),
+			RgbTxid::from_str(&txid.to_string()).unwrap(),
+			Some(WitnessOrd::Ignored),
+		)
 		.unwrap();
 
 	// save RGB transfer data to disk
