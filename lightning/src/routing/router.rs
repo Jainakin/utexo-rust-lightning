@@ -2771,7 +2771,7 @@ where L::Target: Logger {
 				if !features.requires_unknown_bits() {
 					for chan_id in $node.channels.iter() {
 						let chan = network_channels.get(chan_id).unwrap();
-						if !chan.features.requires_unknown_bits() && chan.contract_id == route_params.rgb_payment.map(|(cid, _)| cid) {
+						if !chan.features.requires_unknown_bits() && route_params.rgb_payment.map_or(true, |(cid, _)| Some(cid) == chan.contract_id) {
 							if let Some((directed_channel, source)) = chan.as_directed_to(&$node_id) {
 								if first_hops.is_none() || *source != our_node_id {
 									if directed_channel.direction().enabled {
