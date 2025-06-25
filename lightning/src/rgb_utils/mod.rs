@@ -23,8 +23,8 @@ use rgb_lib::{
 		rust_only::{AssetColoringInfo, ColoringInfo},
 		DatabaseType, Outpoint, WalletData,
 	},
-	BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError, FileContent, RgbTransfer,
-	RgbTransport, RgbTxid, Wallet, WitnessOrd,
+	AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
+	FileContent, RgbTransfer, RgbTransport, RgbTxid, Wallet, WitnessOrd,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -47,6 +47,8 @@ pub const WALLET_FINGERPRINT_FNAME: &str = "wallet_fingerprint";
 pub const WALLET_ACCOUNT_XPUB_VANILLA_FNAME: &str = "wallet_account_xpub_vanilla";
 /// Name of the file containing the account-level xPub of the colored-side of the wallet
 pub const WALLET_ACCOUNT_XPUB_COLORED_FNAME: &str = "wallet_account_xpub_colored";
+/// Name of the file containing the master fingerprint of the wallet
+pub const WALLET_MASTER_FINGERPRINT_FNAME: &str = "wallet_master_fingerprint";
 const INBOUND_EXT: &str = "inbound";
 const OUTBOUND_EXT: &str = "outbound";
 
@@ -56,6 +58,8 @@ pub struct RgbInfo {
 	/// Channel contract ID
 	#[serde(with = "contract_id_serde")]
 	pub contract_id: ContractId,
+	/// Channel schema
+	pub schema: AssetSchema,
 	/// Channel RGB local amount
 	pub local_rgb_amount: u64,
 	/// Channel RGB remote amount
@@ -137,13 +141,17 @@ fn _get_account_xpub_vanilla(ldk_data_dir: &Path) -> String {
 	_read_file_in_parent(ldk_data_dir, WALLET_ACCOUNT_XPUB_VANILLA_FNAME)
 }
 
+fn _get_master_fingerprint(ldk_data_dir: &Path) -> String {
+	_read_file_in_parent(ldk_data_dir, WALLET_MASTER_FINGERPRINT_FNAME)
+}
+
 fn _get_indexer_url(ldk_data_dir: &Path) -> String {
 	_read_file_in_parent(ldk_data_dir, INDEXER_URL_FNAME)
 }
 
 fn _new_rgb_wallet(
 	data_dir: String, bitcoin_network: BitcoinNetwork, account_xpub_vanilla: String,
-	account_xpub_colored: String,
+	account_xpub_colored: String, master_fingerprint: String,
 ) -> Wallet {
 	Wallet::new(WalletData {
 		data_dir,
@@ -152,25 +160,34 @@ fn _new_rgb_wallet(
 		max_allocations_per_utxo: 1,
 		account_xpub_vanilla,
 		account_xpub_colored,
+		master_fingerprint,
 		mnemonic: None,
 		vanilla_keychain: None,
+		supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa, AssetSchema::Uda],
 	})
 	.expect("valid rgb-lib wallet")
 }
 
-fn _get_wallet_data(ldk_data_dir: &Path) -> (String, BitcoinNetwork, String, String) {
+fn _get_wallet_data(ldk_data_dir: &Path) -> (String, BitcoinNetwork, String, String, String) {
 	let data_dir = ldk_data_dir.parent().unwrap().to_string_lossy().to_string();
 	let bitcoin_network = _get_bitcoin_network(ldk_data_dir);
 	let account_xpub_vanilla = _get_account_xpub_vanilla(ldk_data_dir);
 	let account_xpub_colored = _get_account_xpub_colored(ldk_data_dir);
-	(data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored)
+	let master_fingerprint = _get_master_fingerprint(ldk_data_dir);
+	(data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored, master_fingerprint)
 }
 
 async fn _get_rgb_wallet(ldk_data_dir: &Path) -> Wallet {
-	let (data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored) =
+	let (data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored, master_fingerprint) =
 		_get_wallet_data(ldk_data_dir);
 	tokio::task::spawn_blocking(move || {
-		_new_rgb_wallet(data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored)
+		_new_rgb_wallet(
+			data_dir,
+			bitcoin_network,
+			account_xpub_vanilla,
+			account_xpub_colored,
+			master_fingerprint,
+		)
 	})
 	.await
 	.unwrap()
@@ -178,14 +195,19 @@ async fn _get_rgb_wallet(ldk_data_dir: &Path) -> Wallet {
 
 async fn _accept_transfer(
 	ldk_data_dir: &Path, funding_txid: String, consignment_endpoint: RgbTransport,
-) -> Result<(RgbTransfer, u64), RgbLibError> {
+) -> Result<(RgbTransfer, Vec<Assignment>), RgbLibError> {
 	let funding_vout = 1;
-	let (data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored) =
+	let (data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored, master_fingerprint) =
 		_get_wallet_data(ldk_data_dir);
 	let indexer_url = _get_indexer_url(ldk_data_dir);
 	tokio::task::spawn_blocking(move || {
-		let mut wallet =
-			_new_rgb_wallet(data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored);
+		let mut wallet = _new_rgb_wallet(
+			data_dir,
+			bitcoin_network,
+			account_xpub_vanilla,
+			account_xpub_colored,
+			master_fingerprint,
+		);
 		wallet.go_online(true, indexer_url).unwrap();
 		wallet.accept_transfer(
 			funding_txid.clone(),
@@ -350,14 +372,8 @@ where
 		output_map.insert(vout_p2wsh as u32, vout_p2wsh_amt);
 	}
 
-	let asset_coloring_info = AssetColoringInfo {
-		input_outpoints: vec![Outpoint {
-			txid: funding_outpoint.txid.to_string(),
-			vout: funding_outpoint.index as u32,
-		}],
-		output_map,
-		static_blinding: Some(STATIC_BLINDING),
-	};
+	let asset_coloring_info =
+		AssetColoringInfo { output_map, static_blinding: Some(STATIC_BLINDING) };
 	let coloring_info = ColoringInfo {
 		asset_info_map: HashMap::from_iter([(contract_id, asset_coloring_info)]),
 		static_blinding: Some(STATIC_BLINDING),
@@ -417,10 +433,6 @@ pub(crate) fn color_htlc(
 	let contract_id = transfer_info.contract_id;
 
 	let asset_coloring_info = AssetColoringInfo {
-		input_outpoints: vec![Outpoint {
-			txid: commitment_txid,
-			vout: consignment_htlc_outpoint.vout,
-		}],
 		output_map: HashMap::from([(0, htlc_amount_rgb)]),
 		static_blinding: Some(STATIC_BLINDING),
 	};
@@ -492,14 +504,8 @@ pub(crate) fn color_closing(
 		output_map.insert(counterparty_vout as u32, counterparty_vout_amount);
 	}
 
-	let asset_coloring_info = AssetColoringInfo {
-		input_outpoints: vec![Outpoint {
-			txid: funding_outpoint.txid.to_string(),
-			vout: funding_outpoint.index as u32,
-		}],
-		output_map,
-		static_blinding: Some(STATIC_BLINDING),
-	};
+	let asset_coloring_info =
+		AssetColoringInfo { output_map, static_blinding: Some(STATIC_BLINDING) };
 	let coloring_info = ColoringInfo {
 		asset_info_map: HashMap::from_iter([(contract_id, asset_coloring_info)]),
 		static_blinding: Some(STATIC_BLINDING),
@@ -660,7 +666,7 @@ pub(crate) fn handle_funding(
 		funding_txid.clone(),
 		consignment_endpoint,
 	));
-	let (consignment, remote_rgb_amount) = match accept_res {
+	let (consignment, remote_rgb_assignments) = match accept_res {
 		Ok(res) => res,
 		Err(RgbLibError::InvalidConsignment) => {
 			return Err(MsgHandleErrInternal::send_err_msg_no_close(
@@ -676,7 +682,13 @@ pub(crate) fn handle_funding(
 		},
 		Err(RgbLibError::UnknownRgbSchema { schema_id }) => {
 			return Err(MsgHandleErrInternal::send_err_msg_no_close(
-				format!("Unsupported RGB schema: {schema_id}"),
+				format!("Unknown RGB schema: {schema_id}"),
+				*temporary_channel_id,
+			))
+		},
+		Err(RgbLibError::UnsupportedSchema { asset_schema }) => {
+			return Err(MsgHandleErrInternal::send_err_msg_no_close(
+				format!("Unsupported RGB schema: {asset_schema}"),
 				*temporary_channel_id,
 			))
 		},
@@ -694,8 +706,23 @@ pub(crate) fn handle_funding(
 		ldk_data_dir.join(format!("consignment_{}", temporary_channel_id.0.as_hex()));
 	consignment.save_file(consignment_path).expect("unable to write file");
 
-	let rgb_info =
-		RgbInfo { contract_id: consignment.contract_id(), local_rgb_amount: 0, remote_rgb_amount };
+	if remote_rgb_assignments.len() != 1 {
+		return Err(MsgHandleErrInternal::send_err_msg_no_close(
+			format!("Unexpected number of RGB assignments: {}", remote_rgb_assignments.len()),
+			*temporary_channel_id,
+		));
+	}
+	let remote_rgb_amount = match remote_rgb_assignments[0] {
+		Assignment::Fungible(amt) => amt,
+		Assignment::NonFungible => 1,
+		_ => unreachable!("unsupported schema"),
+	};
+	let rgb_info = RgbInfo {
+		contract_id: consignment.contract_id(),
+		schema: AssetSchema::from_schema_id(consignment.schema_id()).unwrap(),
+		local_rgb_amount: 0,
+		remote_rgb_amount,
+	};
 	let temporary_channel_id_str = temporary_channel_id.0.as_hex().to_string();
 	write_rgb_channel_info(
 		&get_rgb_channel_info_path(&temporary_channel_id_str, ldk_data_dir, true),
