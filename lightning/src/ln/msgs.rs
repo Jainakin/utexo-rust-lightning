@@ -1307,8 +1307,7 @@ pub struct UnsignedChannelUpdate {
 	///
 	/// This used to be optional.
 	pub htlc_maximum_msat: u64,
-	// TODO: if possible use Option
-	/// The maximum HTLC RGB value incoming to sender.
+	/// The maximum HTLC RGB value it will send through this channel for a single HTLC.
 	pub htlc_maximum_rgb: u64,
 	/// The base HTLC fee charged by sender, in milli-satoshi
 	pub fee_base_msat: u32,
