@@ -407,8 +407,8 @@ pub struct RouteHop {
 	pub maybe_announced_channel: bool,
 	/// How much to pay the node.
 	pub payment_amount: u64,
-	/// RGB amount to send to the following node
-	pub rgb_amount: Option<u64>,
+	/// RGB payment to send to the following node
+	pub rgb_payment: Option<(ContractId, u64)>,
 }
 
 impl_writeable_tlv_based!(RouteHop, {
@@ -419,7 +419,7 @@ impl_writeable_tlv_based!(RouteHop, {
 	(6, channel_features, required),
 	(8, fee_msat, required),
 	(10, cltv_expiry_delta, required),
-	(12, rgb_amount, option),
+	(12, rgb_payment, option),
 	(14, payment_amount, required),
 });
 
@@ -3395,7 +3395,7 @@ where L::Target: Logger {
 				cltv_expiry_delta: hop.candidate.cltv_expiry_delta(),
 				maybe_announced_channel,
 				payment_amount: final_value_msat,
-				rgb_amount: None,
+				rgb_payment: None,
 			});
 		}
 		let mut final_cltv_delta = final_cltv_expiry_delta;

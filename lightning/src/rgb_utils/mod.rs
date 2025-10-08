@@ -278,10 +278,10 @@ where
 	let mut output_map = HashMap::new();
 
 	for htlc in commitment_transaction.htlcs() {
-		if htlc.amount_rgb.unwrap_or(0) == 0 {
+		if htlc.rgb_payment.map_or(true, |(_, a)| a == 0) {
 			continue;
 		}
-		let htlc_amount_rgb = htlc.amount_rgb.expect("this HTLC has RGB assets");
+		let (_, htlc_amount_rgb) = htlc.rgb_payment.expect("this HTLC has RGB assets");
 
 		let htlc_vout = htlc.transaction_output_index.unwrap();
 
@@ -420,10 +420,10 @@ where
 pub(crate) fn color_htlc(
 	htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitment, ldk_data_dir: &Path,
 ) -> Result<(), ChannelError> {
-	if htlc.amount_rgb.unwrap_or(0) == 0 {
+	if htlc.rgb_payment.map_or(true, |(_, a)| a == 0) {
 		return Ok(());
 	}
-	let htlc_amount_rgb = htlc.amount_rgb.expect("this HTLC has RGB assets");
+	let (_, htlc_amount_rgb) = htlc.rgb_payment.expect("this HTLC has RGB assets");
 
 	let consignment_htlc_outpoint = htlc_tx.input.first().unwrap().previous_output;
 	let commitment_txid = consignment_htlc_outpoint.txid.to_string();

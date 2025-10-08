@@ -24,6 +24,7 @@ use bitcoin::hashes::hash160::Hash as Hash160;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::ripemd160::Hash as Ripemd160;
 use bitcoin::hash_types::Txid;
+use rgb_lib::ContractId;
 
 use crate::chain::chaininterface::fee_for_weight;
 use crate::chain::package::WEIGHT_REVOKED_OUTPUT;
@@ -581,8 +582,8 @@ pub struct HTLCOutputInCommitment {
 	/// below the dust limit (in which case no output appears in the commitment transaction and the
 	/// value is spent to additional transaction fees).
 	pub transaction_output_index: Option<u32>,
-	/// The RGB amount allocated to the HTLC
-	pub amount_rgb: Option<u64>,
+	/// The RGB payment allocated to the HTLC
+	pub rgb_payment: Option<(ContractId, u64)>,
 }
 
 impl HTLCOutputInCommitment {
@@ -600,7 +601,7 @@ impl_writeable_tlv_based!(HTLCOutputInCommitment, {
 	(4, cltv_expiry, required),
 	(6, payment_hash, required),
 	(8, transaction_output_index, option),
-	(10, amount_rgb, option),
+	(10, rgb_payment, option),
 });
 
 #[inline]

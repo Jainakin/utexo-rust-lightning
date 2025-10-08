@@ -30,6 +30,7 @@ use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::secp256k1;
 use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
+use rgb_lib::ContractId;
 
 use crate::io::{Cursor, Read};
 use core::ops::Deref;
@@ -179,7 +180,7 @@ pub(super) fn construct_onion_keys<T: secp256k1::Signing>(
 pub(super) fn build_onion_payloads<'a>(
 	path: &'a Path, total_msat: u64, recipient_onion: &'a RecipientOnionFields,
 	starting_htlc_offset: u32, keysend_preimage: &Option<PaymentPreimage>,
-) -> Result<(Vec<msgs::OutboundOnionPayload<'a>>, u64, u32, Option<u64>), APIError> {
+) -> Result<(Vec<msgs::OutboundOnionPayload<'a>>, u64, u32, Option<(ContractId, u64)>), APIError> {
 	let mut res: Vec<msgs::OutboundOnionPayload> = Vec::with_capacity(
 		path.hops.len() + path.blinded_tail.as_ref().map_or(0, |t| t.hops.len()),
 	);
@@ -234,14 +235,14 @@ fn build_onion_payloads_callback<'a, H, B, F>(
 	hops: H, mut blinded_tail: Option<BlindedTailHopIter<'a, B>>, total_msat: u64,
 	recipient_onion: &'a RecipientOnionFields, starting_htlc_offset: u32,
 	keysend_preimage: &Option<PaymentPreimage>, mut callback: F,
-) -> Result<(u64, u32, Option<u64>), APIError>
+) -> Result<(u64, u32, Option<(ContractId, u64)>), APIError>
 where
 	H: DoubleEndedIterator<Item = &'a RouteHop>,
 	B: ExactSizeIterator<Item = &'a BlindedHop>,
 	F: FnMut(PayloadCallbackAction, msgs::OutboundOnionPayload<'a>),
 {
 	// The rgb_amount at the last hop
-	let mut last_amount_rgb = None;
+	let mut last_rgb_payment = None;
 	let mut last_msat_amount = 0;
 	let mut cur_accumulated_fees = 0;
 	let mut cur_cltv = starting_htlc_offset;
@@ -251,11 +252,11 @@ where
 		// First hop gets special values so that it can check, on receipt, that everything is
 		// exactly as it should be (and the next hop isn't trying to probe to find out if we're
 		// the intended recipient).
-		let (value_msat, value_rgb) = if last_msat_amount == 0 {
-			(hop.fee_msat, hop.rgb_amount)
+		let (value_msat, rgb_payment) = if last_msat_amount == 0 {
+			(hop.fee_msat, hop.rgb_payment)
 		} else {
 			cur_accumulated_fees += hop.fee_msat;
-			(last_msat_amount, last_amount_rgb)
+			(last_msat_amount, last_rgb_payment)
 		};
 		let cltv = if cur_cltv == starting_htlc_offset {
 			hop.cltv_expiry_delta + starting_htlc_offset
@@ -285,7 +286,7 @@ where
 								intro_node_blinding_point: blinding_point.take(),
 								keysend_preimage: *keysend_preimage,
 								custom_tlvs: &recipient_onion.custom_tlvs,
-								rgb_amount_to_forward: value_rgb,
+								rgb_payment_to_forward: rgb_payment,
 							},
 						);
 					} else {
@@ -294,7 +295,7 @@ where
 							msgs::OutboundOnionPayload::BlindedForward {
 								encrypted_tlvs: &blinded_hop.encrypted_payload,
 								intro_node_blinding_point: blinding_point.take(),
-								rgb_amount_to_forward: value_rgb,
+								rgb_payment_to_forward: rgb_payment,
 							},
 						);
 					}
@@ -311,7 +312,7 @@ where
 						custom_tlvs: &recipient_onion.custom_tlvs,
 						sender_intended_htlc_amt_msat: value_msat,
 						cltv_expiry_height: cltv,
-						rgb_amount_to_forward: value_rgb,
+						rgb_payment_to_forward: rgb_payment,
 					},
 				);
 			}
@@ -320,11 +321,11 @@ where
 				short_channel_id: last_short_channel_id,
 				amt_to_forward: value_msat,
 				outgoing_cltv_value: cltv,
-				rgb_amount_to_forward: value_rgb,
+				rgb_payment_to_forward: rgb_payment,
 			};
 			callback(PayloadCallbackAction::PushFront, payload);
 		}
-		last_amount_rgb = hop.rgb_amount;
+		last_rgb_payment = hop.rgb_payment;
 		last_msat_amount = hop.payment_amount + cur_accumulated_fees;
 
 		if last_msat_amount >= 21000000 * 100000000 * 1000 {
@@ -336,7 +337,7 @@ where
 		}
 		last_short_channel_id = hop.short_channel_id;
 	}
-	Ok((last_msat_amount, cur_cltv, last_amount_rgb))
+	Ok((last_msat_amount, cur_cltv, last_rgb_payment))
 }
 
 pub(crate) const MIN_FINAL_VALUE_ESTIMATE_WITH_OVERPAY: u64 = 100_000_000;
@@ -350,7 +351,7 @@ pub(crate) fn set_max_path_length(
 		short_channel_id: 42,
 		amt_to_forward: TOTAL_BITCOIN_SUPPLY_SATOSHIS,
 		outgoing_cltv_value: route_params.payment_params.max_total_cltv_expiry_delta,
-		rgb_amount_to_forward: route_params.rgb_payment.map(|(_, amt)| amt),
+		rgb_payment_to_forward: route_params.rgb_payment,
 	}
 	.serialized_length()
 	.saturating_add(PAYLOAD_HMAC_LEN);
@@ -383,7 +384,7 @@ pub(crate) fn set_max_path_length(
 		cltv_expiry_delta: route_params.payment_params.max_total_cltv_expiry_delta,
 		maybe_announced_channel: false,
 		payment_amount: final_value_msat_with_overpay_buffer,
-		rgb_amount: route_params.rgb_payment.map(|(_, amt)| amt),
+		rgb_payment: route_params.rgb_payment,
 	};
 	let mut num_reserved_bytes: usize = 0;
 	let build_payloads_res = build_onion_payloads_callback(
@@ -1189,11 +1190,11 @@ pub fn create_payment_onion<T: secp256k1::Signing>(
 	secp_ctx: &Secp256k1<T>, path: &Path, session_priv: &SecretKey, total_msat: u64,
 	recipient_onion: &RecipientOnionFields, cur_block_height: u32, payment_hash: &PaymentHash,
 	keysend_preimage: &Option<PaymentPreimage>, prng_seed: [u8; 32],
-) -> Result<(msgs::OnionPacket, u64, u32, Option<u64>), APIError> {
+) -> Result<(msgs::OnionPacket, u64, u32, Option<(ContractId, u64)>), APIError> {
 	let onion_keys = construct_onion_keys(&secp_ctx, &path, &session_priv).map_err(|_| {
 		APIError::InvalidRoute { err: "Pubkey along hop was maliciously selected".to_owned() }
 	})?;
-	let (onion_payloads, htlc_msat, htlc_cltv, htlc_amount_rgb) = build_onion_payloads(
+	let (onion_payloads, htlc_msat, htlc_cltv, htlc_rgb_payment) = build_onion_payloads(
 		&path,
 		total_msat,
 		recipient_onion,
@@ -1204,7 +1205,7 @@ pub fn create_payment_onion<T: secp256k1::Signing>(
 		.map_err(|_| APIError::InvalidRoute {
 			err: "Route size too large considering onion data".to_owned(),
 		})?;
-	Ok((onion_packet, htlc_msat, htlc_cltv, htlc_amount_rgb))
+	Ok((onion_packet, htlc_msat, htlc_cltv, htlc_rgb_payment))
 }
 
 pub(crate) fn decode_next_untagged_hop<T, R: ReadableArgs<T>, N: NextPacketBytes>(
@@ -1483,7 +1484,7 @@ mod tests {
 			RawOnionHopData::new(msgs::OutboundOnionPayload::Forward {
 				short_channel_id: 1,
 				amt_to_forward: 15000,
-				rgb_amount_to_forward: None,
+				rgb_payment_to_forward: None,
 				outgoing_cltv_value: 1500,
 			}),
 			/*
@@ -1507,13 +1508,13 @@ mod tests {
 			RawOnionHopData::new(msgs::OutboundOnionPayload::Forward {
 				short_channel_id: 3,
 				amt_to_forward: 12500,
-				rgb_amount_to_forward: None,
+				rgb_payment_to_forward: None,
 				outgoing_cltv_value: 1250,
 			}),
 			RawOnionHopData::new(msgs::OutboundOnionPayload::Forward {
 				short_channel_id: 4,
 				amt_to_forward: 10000,
-				rgb_amount_to_forward: None,
+				rgb_payment_to_forward: None,
 				outgoing_cltv_value: 1000,
 			}),
 			/*

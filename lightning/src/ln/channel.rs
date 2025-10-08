@@ -27,7 +27,7 @@ use bitcoin::secp256k1::{PublicKey,SecretKey};
 use bitcoin::secp256k1::{Secp256k1,ecdsa::Signature};
 use bitcoin::secp256k1;
 
-use rgb_lib::RgbTransport;
+use rgb_lib::{ContractId, RgbTransport};
 
 use crate::ln::types::{ChannelId, PaymentPreimage, PaymentHash};
 use crate::ln::features::{ChannelTypeFeatures, InitFeatures};
@@ -227,7 +227,7 @@ struct InboundHTLCOutput {
 	cltv_expiry: u32,
 	payment_hash: PaymentHash,
 	state: InboundHTLCState,
-	amount_rgb: Option<u64>,
+	rgb_payment: Option<(ContractId, u64)>,
 }
 
 #[cfg_attr(test, derive(Clone, Debug, PartialEq))]
@@ -322,7 +322,7 @@ struct OutboundHTLCOutput {
 	source: HTLCSource,
 	blinding_point: Option<PublicKey>,
 	skimmed_fee_msat: Option<u64>,
-	amount_rgb: Option<u64>,
+	rgb_payment: Option<(ContractId, u64)>,
 }
 
 /// See AwaitingRemoteRevoke ChannelState for more info
@@ -338,7 +338,7 @@ enum HTLCUpdateAwaitingACK {
 		// The extra fee we're skimming off the top of this HTLC.
 		skimmed_fee_msat: Option<u64>,
 		blinding_point: Option<PublicKey>,
-		amount_rgb: Option<u64>,
+		rgb_payment: Option<(ContractId, u64)>,
 	},
 	ClaimHTLC {
 		payment_preimage: PaymentPreimage,
@@ -2669,7 +2669,7 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 					cltv_expiry: $htlc.cltv_expiry,
 					payment_hash: $htlc.payment_hash,
 					transaction_output_index: None,
-					amount_rgb: $htlc.amount_rgb
+					rgb_payment: $htlc.rgb_payment
 				}
 			}
 		}
@@ -4415,8 +4415,10 @@ impl<SP: Deref> Channel<SP> where
 			return Err(ChannelError::close("Remote HTLC add would overdraw remaining funds".to_owned()));
 		}
 
-		if msg.amount_rgb > Some(self.context.get_remote_rgb_amount()) {
-			return Err(ChannelError::close("Not enough RGB funds to accept this HTLC".to_owned()));
+		if let Some((_, amount_rgb)) = msg.rgb_payment {
+			if amount_rgb > self.context.get_remote_rgb_amount() {
+				return Err(ChannelError::close("Not enough RGB funds to accept this HTLC".to_owned()));
+			}
 		}
 
 		// Check that the remote can afford to pay for this HTLC on-chain at the current
@@ -4475,7 +4477,7 @@ impl<SP: Deref> Channel<SP> where
 			state: InboundHTLCState::RemoteAnnounced(InboundHTLCResolution::Resolved {
 				pending_htlc_status: pending_forward_status
 			}),
-			amount_rgb: msg.amount_rgb,
+			rgb_payment: msg.rgb_payment,
 		});
 		Ok(())
 	}
@@ -4511,7 +4513,7 @@ impl<SP: Deref> Channel<SP> where
 		Err(ChannelError::close("Remote tried to fulfill/fail an HTLC we couldn't find".to_owned()))
 	}
 
-	pub fn update_fulfill_htlc(&mut self, msg: &msgs::UpdateFulfillHTLC) -> Result<(HTLCSource, u64, Option<u64>, Option<u64>), ChannelError> {
+	pub fn update_fulfill_htlc(&mut self, msg: &msgs::UpdateFulfillHTLC) -> Result<(HTLCSource, u64, Option<u64>, Option<(ContractId, u64)>), ChannelError> {
 		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_)) {
 			return Err(ChannelError::close("Got fulfill HTLC message when channel was not in an operational state".to_owned()));
 		}
@@ -4519,7 +4521,7 @@ impl<SP: Deref> Channel<SP> where
 			return Err(ChannelError::close("Peer sent update_fulfill_htlc when we needed a channel_reestablish".to_owned()));
 		}
 
-		self.mark_outbound_htlc_removed(msg.htlc_id, Some(msg.payment_preimage), None).map(|htlc| (htlc.source.clone(), htlc.amount_msat, htlc.skimmed_fee_msat, htlc.amount_rgb))
+		self.mark_outbound_htlc_removed(msg.htlc_id, Some(msg.payment_preimage), None).map(|htlc| (htlc.source.clone(), htlc.amount_msat, htlc.skimmed_fee_msat, htlc.rgb_payment))
 	}
 
 	pub fn update_fail_htlc(&mut self, msg: &msgs::UpdateFailHTLC, fail_reason: HTLCFailReason) -> Result<(), ChannelError> {
@@ -4834,11 +4836,11 @@ impl<SP: Deref> Channel<SP> where
 				let fail_htlc_res = match &htlc_update {
 					&HTLCUpdateAwaitingACK::AddHTLC {
 						amount_msat, cltv_expiry, ref payment_hash, ref source, ref onion_routing_packet,
-						skimmed_fee_msat, blinding_point, amount_rgb, ..
+						skimmed_fee_msat, blinding_point, rgb_payment, ..
 					} => {
 						match self.send_htlc(
 							amount_msat, *payment_hash, cltv_expiry, source.clone(), onion_routing_packet.clone(),
-							false, skimmed_fee_msat, blinding_point, fee_estimator, logger, amount_rgb
+							false, skimmed_fee_msat, blinding_point, fee_estimator, logger, rgb_payment
 						) {
 							Ok(_) => update_add_count += 1,
 							Err(e) => {
@@ -5069,7 +5071,7 @@ impl<SP: Deref> Channel<SP> where
 						htlc.state = InboundHTLCState::AwaitingAnnouncedRemoteRevoke(resolution);
 						require_commitment = true;
 
-						if let Some(amount_rgb) = htlc.amount_rgb {
+						if let Some((_, amount_rgb)) = htlc.rgb_payment {
 							rgb_received_htlc += amount_rgb;
 						}
 					} else if let InboundHTLCState::AwaitingAnnouncedRemoteRevoke(resolution) = state {
@@ -5109,7 +5111,7 @@ impl<SP: Deref> Channel<SP> where
 				if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
 					log_trace!(logger, " ...promoting outbound LocalAnnounced {} to Committed", &htlc.payment_hash);
 					htlc.state = OutboundHTLCState::Committed;
-					if let Some(amount_rgb) = htlc.amount_rgb {
+					if let Some((_, amount_rgb)) = htlc.rgb_payment {
 						rgb_offered_htlc += amount_rgb;
 					}
 					*expecting_peer_commitment_signed = true;
@@ -5699,7 +5701,7 @@ impl<SP: Deref> Channel<SP> where
 					onion_routing_packet: (**onion_packet).clone(),
 					skimmed_fee_msat: htlc.skimmed_fee_msat,
 					blinding_point: htlc.blinding_point,
-					amount_rgb: htlc.amount_rgb,
+					rgb_payment: htlc.rgb_payment,
 				});
 			}
 		}
@@ -7316,13 +7318,13 @@ impl<SP: Deref> Channel<SP> where
 	pub fn queue_add_htlc<F: Deref, L: Deref>(
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource,
 		onion_routing_packet: msgs::OnionPacket, skimmed_fee_msat: Option<u64>,
-		blinding_point: Option<PublicKey>, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, amount_rgb: Option<u64>
+		blinding_point: Option<PublicKey>, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, rgb_payment: Option<(ContractId, u64)>
 	) -> Result<(), ChannelError>
 	where F::Target: FeeEstimator, L::Target: Logger
 	{
 		self
 			.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, true,
-				skimmed_fee_msat, blinding_point, fee_estimator, logger, amount_rgb)
+				skimmed_fee_msat, blinding_point, fee_estimator, logger, rgb_payment)
 			.map(|msg_opt| assert!(msg_opt.is_none(), "We forced holding cell?"))
 			.map_err(|err| {
 				if let ChannelError::Ignore(_) = err { /* fine */ }
@@ -7351,7 +7353,7 @@ impl<SP: Deref> Channel<SP> where
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource,
 		onion_routing_packet: msgs::OnionPacket, mut force_holding_cell: bool,
 		skimmed_fee_msat: Option<u64>, blinding_point: Option<PublicKey>,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, amount_rgb: Option<u64>
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, rgb_payment: Option<(ContractId, u64)>
 	) -> Result<Option<msgs::UpdateAddHTLC>, ChannelError>
 	where F::Target: FeeEstimator, L::Target: Logger
 	{
@@ -7381,9 +7383,11 @@ impl<SP: Deref> Channel<SP> where
 				available_balances.next_outbound_htlc_limit_msat)));
 		}
 
-		let local_rgb_amount = self.context.get_local_rgb_amount();
-		if amount_rgb > Some(local_rgb_amount) {
-			return Err(ChannelError::Ignore(format!("Cannot send more than our next-HTLC RGB maximum - {}", local_rgb_amount)));
+		if let Some((_, amount_rgb)) = rgb_payment {
+			let local_rgb_amount = self.context.get_local_rgb_amount();
+			if amount_rgb > local_rgb_amount {
+				return Err(ChannelError::Ignore(format!("Cannot send more than our next-HTLC RGB maximum - {}", local_rgb_amount)));
+			}
 		}
 
 		if self.context.channel_state.is_peer_disconnected() {
@@ -7417,7 +7421,7 @@ impl<SP: Deref> Channel<SP> where
 				onion_routing_packet,
 				skimmed_fee_msat,
 				blinding_point,
-				amount_rgb,
+				rgb_payment,
 			});
 			return Ok(None);
 		}
@@ -7431,7 +7435,7 @@ impl<SP: Deref> Channel<SP> where
 			source,
 			blinding_point,
 			skimmed_fee_msat,
-			amount_rgb,
+			rgb_payment,
 		});
 
 		let res = msgs::UpdateAddHTLC {
@@ -7443,7 +7447,7 @@ impl<SP: Deref> Channel<SP> where
 			onion_routing_packet,
 			skimmed_fee_msat,
 			blinding_point,
-			amount_rgb,
+			rgb_payment,
 		};
 		self.context.next_holder_htlc_id += 1;
 
@@ -7464,7 +7468,7 @@ impl<SP: Deref> Channel<SP> where
 				log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", &htlc.payment_hash);
 				htlc.state = state;
 
-				if let Some(amount_rgb) = htlc.amount_rgb {
+				if let Some((_, amount_rgb)) = htlc.rgb_payment {
 					rgb_received_htlc += amount_rgb;
 				}
 			}
@@ -7622,12 +7626,12 @@ impl<SP: Deref> Channel<SP> where
 	pub fn send_htlc_and_commit<F: Deref, L: Deref>(
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32,
 		source: HTLCSource, onion_routing_packet: msgs::OnionPacket, skimmed_fee_msat: Option<u64>,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, amount_rgb: Option<u64>
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, rgb_payment: Option<(ContractId, u64)>
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError>
 	where F::Target: FeeEstimator, L::Target: Logger
 	{
 		let send_res = self.send_htlc(amount_msat, payment_hash, cltv_expiry, source,
-			onion_routing_packet, false, skimmed_fee_msat, None, fee_estimator, logger, amount_rgb);
+			onion_routing_packet, false, skimmed_fee_msat, None, fee_estimator, logger, rgb_payment);
 		if let Err(e) = &send_res { if let ChannelError::Ignore(_) = e {} else { debug_assert!(false, "Sending cannot trigger channel failure"); } }
 		match send_res? {
 			Some(_) => {
@@ -8928,7 +8932,7 @@ impl<SP: Deref> Writeable for Channel<SP> where SP::Target: SignerProvider {
 			match update {
 				&HTLCUpdateAwaitingACK::AddHTLC {
 					ref amount_msat, ref cltv_expiry, ref payment_hash, ref source, ref onion_routing_packet,
-					blinding_point, skimmed_fee_msat, amount_rgb,
+					blinding_point, skimmed_fee_msat, rgb_payment,
 				} => {
 					0u8.write(writer)?;
 					amount_msat.write(writer)?;
@@ -8940,7 +8944,7 @@ impl<SP: Deref> Writeable for Channel<SP> where SP::Target: SignerProvider {
 					holding_cell_skimmed_fees.push(skimmed_fee_msat);
 					holding_cell_blinding_points.push(blinding_point);
 
-					amount_rgb.write(writer)?;
+					rgb_payment.write(writer)?;
 				},
 				&HTLCUpdateAwaitingACK::ClaimHTLC { ref payment_preimage, ref htlc_id } => {
 					1u8.write(writer)?;
@@ -9238,7 +9242,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 					4 => InboundHTLCState::LocalRemoved(Readable::read(reader)?),
 					_ => return Err(DecodeError::InvalidValue),
 				},
-				amount_rgb: Readable::read(reader)?,
+				rgb_payment: Readable::read(reader)?,
 			});
 		}
 
@@ -9270,7 +9274,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 				},
 				skimmed_fee_msat: None,
 				blinding_point: None,
-				amount_rgb: Readable::read(reader)?,
+				rgb_payment: Readable::read(reader)?,
 			});
 		}
 
@@ -9286,7 +9290,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 					onion_routing_packet: Readable::read(reader)?,
 					skimmed_fee_msat: None,
 					blinding_point: None,
-					amount_rgb: Readable::read(reader)?,
+					rgb_payment: Readable::read(reader)?,
 				},
 				1 => HTLCUpdateAwaitingACK::ClaimHTLC {
 					payment_preimage: Readable::read(reader)?,

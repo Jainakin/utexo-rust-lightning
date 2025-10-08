@@ -701,8 +701,8 @@ pub struct UpdateAddHTLC {
 	/// Provided if we are relaying or receiving a payment within a blinded path, to decrypt the onion
 	/// routing packet and the recipient-provided encrypted payload within.
 	pub blinding_point: Option<PublicKey>,
-	/// The RGB amount allocated to the HTLC
-	pub amount_rgb: Option<u64>,
+	/// The RGB payment allocated to the HTLC
+	pub rgb_payment: Option<(ContractId, u64)>,
 }
 
  /// An onion message to be sent to or received from a peer.
@@ -1742,6 +1742,7 @@ pub struct FinalOnionHopData {
 
 mod fuzzy_internal_msgs {
 	use bitcoin::secp256k1::PublicKey;
+	use rgb_lib::ContractId;
 	use crate::blinded_path::payment::{PaymentConstraints, PaymentContext, PaymentRelay};
 	use crate::ln::types::{PaymentPreimage, PaymentSecret};
 	use crate::ln::features::BlindedHopFeatures;
@@ -1759,7 +1760,7 @@ mod fuzzy_internal_msgs {
 			/// The value, in msat, of the payment after this hop's fee is deducted.
 			amt_to_forward: u64,
 			outgoing_cltv_value: u32,
-			rgb_amount_to_forward: Option<u64>,
+			rgb_payment_to_forward: Option<(ContractId, u64)>,
 		},
 		Receive {
 			payment_data: Option<FinalOnionHopData>,
@@ -1768,7 +1769,7 @@ mod fuzzy_internal_msgs {
 			custom_tlvs: Vec<(u64, Vec<u8>)>,
 			sender_intended_htlc_amt_msat: u64,
 			cltv_expiry_height: u32,
-			rgb_amount_to_forward: Option<u64>,
+			rgb_payment_to_forward: Option<(ContractId, u64)>,
 		},
 		BlindedForward {
 			short_channel_id: u64,
@@ -1777,7 +1778,7 @@ mod fuzzy_internal_msgs {
 			features: BlindedHopFeatures,
 			intro_node_blinding_point: Option<PublicKey>,
 			next_blinding_override: Option<PublicKey>,
-			rgb_amount_to_forward: Option<u64>,
+			rgb_payment_to_forward: Option<(ContractId, u64)>,
 		},
 		BlindedReceive {
 			sender_intended_htlc_amt_msat: u64,
@@ -1789,7 +1790,7 @@ mod fuzzy_internal_msgs {
 			intro_node_blinding_point: Option<PublicKey>,
 			keysend_preimage: Option<PaymentPreimage>,
 			custom_tlvs: Vec<(u64, Vec<u8>)>,
-			rgb_amount_to_forward: Option<u64>,
+			rgb_payment_to_forward: Option<(ContractId, u64)>,
 		}
 	}
 
@@ -1800,7 +1801,7 @@ mod fuzzy_internal_msgs {
 			/// The value, in msat, of the payment after this hop's fee is deducted.
 			amt_to_forward: u64,
 			outgoing_cltv_value: u32,
-			rgb_amount_to_forward: Option<u64>,
+			rgb_payment_to_forward: Option<(ContractId, u64)>,
 		},
 		#[allow(unused)]
 		TrampolineEntrypoint {
@@ -1816,12 +1817,12 @@ mod fuzzy_internal_msgs {
 			custom_tlvs: &'a Vec<(u64, Vec<u8>)>,
 			sender_intended_htlc_amt_msat: u64,
 			cltv_expiry_height: u32,
-			rgb_amount_to_forward: Option<u64>,
+			rgb_payment_to_forward: Option<(ContractId, u64)>,
 		},
 		BlindedForward {
 			encrypted_tlvs: &'a Vec<u8>,
 			intro_node_blinding_point: Option<PublicKey>,
-			rgb_amount_to_forward: Option<u64>,
+			rgb_payment_to_forward: Option<(ContractId, u64)>,
 		},
 		BlindedReceive {
 			sender_intended_htlc_amt_msat: u64,
@@ -1831,7 +1832,7 @@ mod fuzzy_internal_msgs {
 			intro_node_blinding_point: Option<PublicKey>, // Set if the introduction node of the blinded path is the final node
 			keysend_preimage: Option<PaymentPreimage>,
 			custom_tlvs: &'a Vec<(u64, Vec<u8>)>,
-			rgb_amount_to_forward: Option<u64>,
+			rgb_payment_to_forward: Option<(ContractId, u64)>,
 		}
 	}
 
@@ -2678,7 +2679,7 @@ impl_writeable_msg!(UpdateAddHTLC, {
 	payment_hash,
 	cltv_expiry,
 	onion_routing_packet,
-	amount_rgb
+	rgb_payment
 }, {
 	(0, blinding_point, option),
 	(65537, skimmed_fee_msat, option)
@@ -2726,12 +2727,12 @@ impl Readable for FinalOnionHopData {
 impl<'a> Writeable for OutboundOnionPayload<'a> {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		match self {
-			Self::Forward { short_channel_id, amt_to_forward, outgoing_cltv_value, rgb_amount_to_forward } => {
+			Self::Forward { short_channel_id, amt_to_forward, outgoing_cltv_value, rgb_payment_to_forward } => {
 				_encode_varint_length_prefixed_tlv!(w, {
 					(2, HighZeroBytesDroppedBigSize(*amt_to_forward), required),
 					(4, HighZeroBytesDroppedBigSize(*outgoing_cltv_value), required),
 					(6, short_channel_id, required),
-					(20, rgb_amount_to_forward, option)
+					(20, rgb_payment_to_forward, option)
 				});
 			},
 			Self::TrampolineEntrypoint {
@@ -2747,7 +2748,7 @@ impl<'a> Writeable for OutboundOnionPayload<'a> {
 			},
 			Self::Receive {
 				ref payment_data, ref payment_metadata, ref keysend_preimage, sender_intended_htlc_amt_msat,
-				cltv_expiry_height, ref custom_tlvs, rgb_amount_to_forward,
+				cltv_expiry_height, ref custom_tlvs, rgb_payment_to_forward,
 			} => {
 				// We need to update [`ln::outbound_payment::RecipientOnionFields::with_custom_tlvs`]
 				// to reject any reserved types in the experimental range if new ones are ever
@@ -2760,19 +2761,19 @@ impl<'a> Writeable for OutboundOnionPayload<'a> {
 					(4, HighZeroBytesDroppedBigSize(*cltv_expiry_height), required),
 					(8, payment_data, option),
 					(16, payment_metadata.map(|m| WithoutLength(m)), option),
-					(20, rgb_amount_to_forward, option)
+					(20, rgb_payment_to_forward, option)
 				}, custom_tlvs.iter());
 			},
-			Self::BlindedForward { encrypted_tlvs, intro_node_blinding_point, rgb_amount_to_forward } => {
+			Self::BlindedForward { encrypted_tlvs, intro_node_blinding_point, rgb_payment_to_forward } => {
 				_encode_varint_length_prefixed_tlv!(w, {
 					(10, **encrypted_tlvs, required_vec),
 					(12, intro_node_blinding_point, option),
-					(20, rgb_amount_to_forward, option)
+					(20, rgb_payment_to_forward, option)
 				});
 			},
 			Self::BlindedReceive {
 				sender_intended_htlc_amt_msat, total_msat, cltv_expiry_height, encrypted_tlvs,
-				intro_node_blinding_point, keysend_preimage, ref custom_tlvs, rgb_amount_to_forward,
+				intro_node_blinding_point, keysend_preimage, ref custom_tlvs, rgb_payment_to_forward,
 			} => {
 				// We need to update [`ln::outbound_payment::RecipientOnionFields::with_custom_tlvs`]
 				// to reject any reserved types in the experimental range if new ones are ever
@@ -2786,7 +2787,7 @@ impl<'a> Writeable for OutboundOnionPayload<'a> {
 					(10, **encrypted_tlvs, required_vec),
 					(12, intro_node_blinding_point, option),
 					(18, HighZeroBytesDroppedBigSize(*total_msat), required),
-					(20, rgb_amount_to_forward, option)
+					(20, rgb_payment_to_forward, option)
 				}, custom_tlvs.iter());
 			},
 		}
@@ -2823,7 +2824,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 		let mut payment_metadata: Option<WithoutLength<Vec<u8>>> = None;
 		let mut total_msat = None;
 		let mut keysend_preimage: Option<PaymentPreimage> = None;
-		let mut rgb_amount_to_forward: Option<u64> = None;
+		let mut rgb_payment_to_forward: Option<(ContractId, u64)> = None;
 		let mut custom_tlvs = Vec::new();
 
 		let tlv_len = BigSize::read(r)?;
@@ -2837,7 +2838,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 			(12, intro_node_blinding_point, option),
 			(16, payment_metadata, option),
 			(18, total_msat, (option, encoding: (u64, HighZeroBytesDroppedBigSize))),
-			(20, rgb_amount_to_forward, option),
+			(20, rgb_payment_to_forward, option),
 			// See https://github.com/lightning/blips/blob/master/blip-0003.md
 			(5482373484, keysend_preimage, option)
 		}, |msg_type: u64, msg_reader: &mut FixedLengthReader<_>| -> Result<bool, DecodeError> {
@@ -2879,7 +2880,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 						features,
 						intro_node_blinding_point,
 						next_blinding_override,
-						rgb_amount_to_forward,
+						rgb_payment_to_forward,
 					})
 				},
 				ChaChaPolyReadAdapter { readable: BlindedPaymentTlvs::Receive(ReceiveTlvs {
@@ -2896,7 +2897,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 						intro_node_blinding_point,
 						keysend_preimage,
 						custom_tlvs,
-						rgb_amount_to_forward,
+						rgb_payment_to_forward,
 					})
 				},
 			}
@@ -2908,7 +2909,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 				short_channel_id,
 				amt_to_forward: amt.ok_or(DecodeError::InvalidValue)?,
 				outgoing_cltv_value: cltv_value.ok_or(DecodeError::InvalidValue)?,
-				rgb_amount_to_forward,
+				rgb_payment_to_forward,
 			})
 		} else {
 			if encrypted_tlvs_opt.is_some() || total_msat.is_some() {
@@ -2926,7 +2927,7 @@ impl<NS: Deref> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload wh
 				sender_intended_htlc_amt_msat: amt.ok_or(DecodeError::InvalidValue)?,
 				cltv_expiry_height: cltv_value.ok_or(DecodeError::InvalidValue)?,
 				custom_tlvs,
-				rgb_amount_to_forward,
+				rgb_payment_to_forward,
 			})
 		}
 	}
