@@ -28,33 +28,17 @@
 //!
 //! * `std`
 //! * `grind_signatures`
-//! * `no-std ` - exposes write trait implementations from the `core2` crate (at least one of `no-std` or `std` are required)
-//! * Skip logging of messages at levels below the given log level:
-//!     * `max_level_off`
-//!     * `max_level_error`
-//!     * `max_level_warn`
-//!     * `max_level_info`
-//!     * `max_level_debug`
-//!     * `max_level_trace`
 
 #![cfg_attr(not(any(test, fuzzing, feature = "_test_utils")), deny(missing_docs))]
-#![cfg_attr(not(any(test, feature = "_test_utils")), forbid(unsafe_code))]
-
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::private_intra_doc_links)]
-
 // In general, rust is absolutely horrid at supporting users doing things like,
 // for example, compiling Rust code for real environments. Disable useless lints
 // that don't do anything but annoy us and cant actually ever be resolved.
 #![allow(bare_trait_objects)]
 #![allow(ellipsis_inclusive_range_patterns)]
-
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
-
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
-
-#[cfg(not(any(feature = "std", feature = "no-std")))]
-compile_error!("at least one of the `std` or `no-std` features must be enabled");
 
 #[cfg(all(fuzzing, test))]
 compile_error!("Tests will always fail with cfg=fuzzing");
@@ -65,25 +49,35 @@ extern crate alloc;
 pub extern crate lightning_types as types;
 
 pub extern crate bitcoin;
+
+pub extern crate lightning_invoice as bolt11_invoice;
+
 #[cfg(any(test, feature = "std"))]
 extern crate core;
 
-#[cfg(any(test, feature = "_test_utils"))] extern crate regex;
+#[cfg(any(test, feature = "_test_utils"))]
+extern crate regex;
 
-#[cfg(not(feature = "std"))] extern crate libm;
+#[cfg(not(feature = "std"))]
+extern crate libm;
 
-#[cfg(ldk_bench)] extern crate criterion;
+#[cfg(ldk_bench)]
+extern crate criterion;
+
+#[cfg(all(feature = "std", test))]
+extern crate parking_lot;
 
 #[macro_use]
 pub mod util;
+
+pub mod blinded_path;
 pub mod chain;
+pub mod events;
 pub mod ln;
 pub mod offers;
+pub mod onion_message;
 pub mod routing;
 pub mod sign;
-pub mod onion_message;
-pub mod blinded_path;
-pub mod events;
 
 pub(crate) mod crypto;
 
@@ -101,7 +95,7 @@ pub mod io_extras {
 	pub use bitcoin::io::sink;
 
 	pub fn copy<R: ?Sized, W: ?Sized>(reader: &mut R, writer: &mut W) -> Result<u64, io::Error>
-		where
+	where
 		R: Read,
 		W: Write,
 	{
@@ -111,7 +105,10 @@ pub mod io_extras {
 		loop {
 			match reader.read(&mut buf) {
 				Ok(0) => break,
-				Ok(n) => { writer.write_all(&buf[0..n])?; count += n as u64; },
+				Ok(n) => {
+					writer.write_all(&buf[0..n])?;
+					count += n as u64;
+				},
 				Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {},
 				Err(e) => return Err(e.into()),
 			};
@@ -137,7 +134,7 @@ pub mod io_extras {
 mod prelude {
 	#![allow(unused_imports)]
 
-	pub use alloc::{vec, vec::Vec, string::String, collections::VecDeque, boxed::Box};
+	pub use alloc::{boxed::Box, collections::VecDeque, string::String, vec, vec::Vec};
 
 	pub use alloc::borrow::ToOwned;
 	pub use alloc::string::ToString;
@@ -155,3 +152,6 @@ extern crate backtrace;
 mod sync;
 
 pub mod rgb_utils;
+
+#[cfg(feature = "_externalize_tests")]
+lightning_macros::xtest_inventory!();

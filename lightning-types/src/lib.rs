@@ -14,11 +14,11 @@
 //! See the `lightning` crate for usage of these.
 
 #![cfg_attr(not(test), no_std)]
-#![deny(missing_docs)]
+#![cfg_attr(not(fuzzing), deny(missing_docs))]
 #![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::private_intra_doc_links)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 extern crate alloc;
 extern crate core;

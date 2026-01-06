@@ -14,9 +14,11 @@ GEN_TEST invoice_deser
 GEN_TEST invoice_request_deser
 GEN_TEST offer_deser
 GEN_TEST bolt11_deser
+GEN_TEST static_invoice_deser
 GEN_TEST onion_message
 GEN_TEST peer_crypt
 GEN_TEST process_network_graph
+GEN_TEST process_onion_failure
 GEN_TEST refund_deser
 GEN_TEST router
 GEN_TEST zbase32
@@ -24,11 +26,16 @@ GEN_TEST indexedmap
 GEN_TEST onion_hop_data
 GEN_TEST base32
 GEN_TEST fromstr_to_netaddress
+GEN_TEST feature_flags
+GEN_TEST lsps_message
+GEN_TEST fs_store
 
 GEN_TEST msg_accept_channel msg_targets::
 GEN_TEST msg_announcement_signatures msg_targets::
 GEN_TEST msg_channel_reestablish msg_targets::
 GEN_TEST msg_closing_signed msg_targets::
+GEN_TEST msg_closing_complete msg_targets::
+GEN_TEST msg_closing_sig msg_targets::
 GEN_TEST msg_commitment_signed msg_targets::
 GEN_TEST msg_decoded_onion_error_packet msg_targets::
 GEN_TEST msg_funding_created msg_targets::
@@ -77,3 +84,5 @@ GEN_TEST msg_stfu msg_targets::
 GEN_TEST msg_splice_init msg_targets::
 GEN_TEST msg_splice_ack msg_targets::
 GEN_TEST msg_splice_locked msg_targets::
+
+GEN_TEST msg_blinded_message_path msg_targets::

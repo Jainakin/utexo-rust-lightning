@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 
+# When the workspace members change, make sure to update the list here as well
+# as in `ci/ci-tests.sh`.
 members = [
     "lightning",
     "lightning-types",
@@ -11,11 +13,16 @@ members = [
     "lightning-background-processor",
     "lightning-rapid-gossip-sync",
     "lightning-custom-message",
-    "lightning-transaction-sync",
+    "lightning-macros",
+    "lightning-dns-resolver",
+    "lightning-liquidity",
     "possiblyrandom",
 ]
 
 exclude = [
+    "lightning-transaction-sync",
+    "lightning-tests",
+    "ext-functional-test-demo",
     "no-std-check",
     "msrv-no-dev-deps-check",
     "bench",
@@ -41,5 +48,24 @@ opt-level = 3
 lto = true
 panic = "abort"
 
-[workspace.lints.rust]
-warnings = "allow"
+[workspace.lints.rust.unexpected_cfgs]
+level = "forbid"
+# When adding a new cfg attribute, ensure that it is added to this list.
+#
+# Note that Cargo automatically declares corresponding cfgs for every feature
+# defined in the member-level [features] tables as "expected".
+check-cfg = [
+    "cfg(fuzzing)",
+    "cfg(secp256k1_fuzz)",
+    "cfg(hashes_fuzz)",
+    "cfg(test)",
+    "cfg(debug_assertions)",
+    "cfg(c_bindings)",
+    "cfg(ldk_bench)",
+    "cfg(ldk_test_vectors)",
+    "cfg(taproot)",
+    "cfg(require_route_graph_test)",
+    "cfg(simple_close)",
+    "cfg(peer_storage)",
+    "cfg(dual_funding)",
+]

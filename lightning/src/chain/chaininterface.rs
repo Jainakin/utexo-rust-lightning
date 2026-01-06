@@ -36,9 +36,12 @@ pub trait BroadcasterInterface {
 	/// In some cases LDK may attempt to broadcast a transaction which double-spends another
 	/// and this isn't a bug and can be safely ignored.
 	///
-	/// If more than one transaction is given, these transactions should be considered to be a
-	/// package and broadcast together. Some of the transactions may or may not depend on each other,
-	/// be sure to manage both cases correctly.
+	/// If more than one transaction is given, these transactions MUST be a
+	/// single child and its parents and be broadcast together as a package
+	/// (see the [`submitpackage`](https://bitcoincore.org/en/doc/30.0.0/rpc/rawtransactions/submitpackage)
+	/// Bitcoin Core RPC).
+	///
+	/// Implementations MUST NOT assume any topological order on the transactions.
 	///
 	/// Bitcoin transaction packages are defined in BIP 331 and here:
 	/// <https://github.com/bitcoin/bitcoin/blob/master/doc/policy/packages.md>
@@ -49,11 +52,14 @@ pub trait BroadcasterInterface {
 /// estimation.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum ConfirmationTarget {
-	/// The most aggressive (i.e. highest) feerate estimate available.
+	/// The most aggressive feerate estimate which we think is reasonable.
 	///
 	/// This is used to sanity-check our counterparty's feerates and should be as conservative as
 	/// possible to ensure that we don't confuse a peer using a very conservative estimator for one
-	/// trying to burn channel balance to dust.
+	/// trying to burn channel balance to dust. To ensure that this is never lower than an honest
+	/// counterparty's feerate estimate you may wish to use a value which is higher than your
+	/// maximum feerate estimate, for example by adding a constant few-hundred or few-thousand
+	/// sats-per-kW.
 	MaximumFeeEstimate,
 	/// We have some funds available on chain which we need to spend prior to some expiry time at
 	/// which point our counterparty may be able to steal them.
@@ -176,7 +182,7 @@ pub trait FeeEstimator {
 }
 
 /// Minimum relay fee as required by bitcoin network mempool policy.
-pub const MIN_RELAY_FEE_SAT_PER_1000_WEIGHT: u64 = 4000;
+pub const INCREMENTAL_RELAY_FEE_SAT_PER_1000_WEIGHT: u64 = 253;
 /// Minimum feerate that takes a sane approach to bitcoind weight-to-vbytes rounding.
 /// See the following Core Lightning commit for an explanation:
 /// <https://github.com/ElementsProject/lightning/commit/2e687b9b352c9092b5e8bd4a688916ac50b44af0>
@@ -187,25 +193,29 @@ pub const FEERATE_FLOOR_SATS_PER_KW: u32 = 253;
 ///
 /// Note that this does *not* implement [`FeeEstimator`] to make it harder to accidentally mix the
 /// two.
-pub(crate) struct LowerBoundedFeeEstimator<F: Deref>(pub F) where F::Target: FeeEstimator;
+pub(crate) struct LowerBoundedFeeEstimator<F: Deref>(pub F)
+where
+	F::Target: FeeEstimator;
 
-impl<F: Deref> LowerBoundedFeeEstimator<F> where F::Target: FeeEstimator {
+impl<F: Deref> LowerBoundedFeeEstimator<F>
+where
+	F::Target: FeeEstimator,
+{
 	/// Creates a new `LowerBoundedFeeEstimator` which wraps the provided fee_estimator
 	pub fn new(fee_estimator: F) -> Self {
 		LowerBoundedFeeEstimator(fee_estimator)
 	}
 
 	pub fn bounded_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u32 {
-		cmp::max(
-			self.0.get_est_sat_per_1000_weight(confirmation_target),
-			FEERATE_FLOOR_SATS_PER_KW,
-		)
+		cmp::max(self.0.get_est_sat_per_1000_weight(confirmation_target), FEERATE_FLOOR_SATS_PER_KW)
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{FEERATE_FLOOR_SATS_PER_KW, LowerBoundedFeeEstimator, ConfirmationTarget, FeeEstimator};
+	use super::{
+		ConfirmationTarget, FeeEstimator, LowerBoundedFeeEstimator, FEERATE_FLOOR_SATS_PER_KW,
+	};
 
 	struct TestFeeEstimator {
 		sat_per_kw: u32,
@@ -223,7 +233,10 @@ mod tests {
 		let test_fee_estimator = &TestFeeEstimator { sat_per_kw };
 		let fee_estimator = LowerBoundedFeeEstimator::new(test_fee_estimator);
 
-		assert_eq!(fee_estimator.bounded_sat_per_1000_weight(ConfirmationTarget::AnchorChannelFee), FEERATE_FLOOR_SATS_PER_KW);
+		assert_eq!(
+			fee_estimator.bounded_sat_per_1000_weight(ConfirmationTarget::AnchorChannelFee),
+			FEERATE_FLOOR_SATS_PER_KW
+		);
 	}
 
 	#[test]
@@ -232,6 +245,9 @@ mod tests {
 		let test_fee_estimator = &TestFeeEstimator { sat_per_kw };
 		let fee_estimator = LowerBoundedFeeEstimator::new(test_fee_estimator);
 
-		assert_eq!(fee_estimator.bounded_sat_per_1000_weight(ConfirmationTarget::AnchorChannelFee), sat_per_kw);
+		assert_eq!(
+			fee_estimator.bounded_sat_per_1000_weight(ConfirmationTarget::AnchorChannelFee),
+			sat_per_kw
+		);
 	}
 }

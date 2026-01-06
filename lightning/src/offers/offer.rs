@@ -77,38 +77,40 @@
 //! [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 //! [`ChannelManager::create_offer_builder`]: crate::ln::channelmanager::ChannelManager::create_offer_builder
 
+use crate::blinded_path::message::BlindedMessagePath;
+use crate::io;
+use crate::ln::channelmanager::PaymentId;
+use crate::ln::inbound_payment::{ExpandedKey, IV_LEN};
+use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
+use crate::offers::merkle::{TaggedHash, TlvRecord, TlvStream};
+use crate::offers::nonce::Nonce;
+use crate::offers::parse::{Bech32Encode, Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
+use crate::offers::signer::{self, Metadata, MetadataMaterial};
+use crate::onion_message::dns_resolution::HumanReadableName;
+use crate::types::features::OfferFeatures;
+use crate::types::string::PrintableString;
+use crate::util::ser::{
+	CursorReadable, HighZeroBytesDroppedBigSize, LengthLimitedRead, LengthReadable, Readable,
+	WithoutLength, Writeable, Writer,
+};
 use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
-use bitcoin::secp256k1::{Keypair, PublicKey, Secp256k1, self};
+use bitcoin::secp256k1::{self, Keypair, PublicKey, Secp256k1};
+use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 use core::num::NonZeroU64;
 use core::str::FromStr;
 use core::time::Duration;
-use crate::io;
-use crate::blinded_path::message::BlindedMessagePath;
-use crate::ln::channelmanager::PaymentId;
-use crate::ln::features::OfferFeatures;
-use crate::ln::inbound_payment::{ExpandedKey, IV_LEN};
-use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
-use crate::offers::merkle::{TaggedHash, TlvStream};
-use crate::offers::nonce::Nonce;
-use crate::offers::parse::{Bech32Encode, Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
-use crate::offers::signer::{Metadata, MetadataMaterial, self};
-use crate::util::ser::{HighZeroBytesDroppedBigSize, Readable, WithoutLength, Writeable, Writer};
-use crate::util::string::PrintableString;
 
 #[cfg(not(c_bindings))]
-use {
-	crate::offers::invoice_request::{DerivedPayerId, ExplicitPayerId, InvoiceRequestBuilder},
-};
+use crate::offers::invoice_request::InvoiceRequestBuilder;
 #[cfg(c_bindings)]
-use {
-	crate::offers::invoice_request::{InvoiceRequestWithDerivedPayerIdBuilder, InvoiceRequestWithExplicitPayerIdBuilder},
-};
+use crate::offers::invoice_request::InvoiceRequestWithDerivedPayerSigningPubkeyBuilder;
 
 #[allow(unused_imports)]
 use crate::prelude::*;
 
+use bitcoin::hex::impl_fmt_traits;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
@@ -116,7 +118,7 @@ pub(super) const IV_BYTES_WITH_METADATA: &[u8; IV_LEN] = b"LDK Offer ~~~~~~";
 pub(super) const IV_BYTES_WITHOUT_METADATA: &[u8; IV_LEN] = b"LDK Offer v2~~~~";
 
 /// An identifier for an [`Offer`] built using [`DerivedMetadata`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct OfferId(pub [u8; 32]);
 
 impl OfferId {
@@ -127,10 +129,22 @@ impl OfferId {
 		Self(tagged_hash.to_bytes())
 	}
 
-	fn from_valid_invreq_tlv_stream(bytes: &[u8]) -> Self {
-		let tlv_stream = TlvStream::new(bytes).range(OFFER_TYPES);
+	pub(super) fn from_valid_bolt12_tlv_stream(bytes: &[u8]) -> Self {
+		let tlv_stream = Offer::tlv_stream_iter(bytes);
 		let tagged_hash = TaggedHash::from_tlv_stream(Self::ID_TAG, tlv_stream);
 		Self(tagged_hash.to_bytes())
+	}
+}
+
+impl Borrow<[u8]> for OfferId {
+	fn borrow(&self) -> &[u8] {
+		&self.0[..]
+	}
+}
+
+impl_fmt_traits! {
+	impl fmt_traits for OfferId {
+		const LENGTH: usize = 32;
 	}
 }
 
@@ -204,74 +218,98 @@ impl MetadataStrategy for ExplicitMetadata {}
 
 impl MetadataStrategy for DerivedMetadata {}
 
-macro_rules! offer_explicit_metadata_builder_methods { (
+macro_rules! offer_explicit_metadata_builder_methods {
+	(
 	$self: ident, $self_type: ty, $return_type: ty, $return_value: expr
 ) => {
-	/// Creates a new builder for an offer using the [`Offer::signing_pubkey`] for signing invoices.
-	/// The associated secret key must be remembered while the offer is valid.
-	///
-	/// Use a different pubkey per offer to avoid correlating offers.
-	///
-	/// # Note
-	///
-	/// If constructing an [`Offer`] for use with a [`ChannelManager`], use
-	/// [`ChannelManager::create_offer_builder`] instead of [`OfferBuilder::new`].
-	///
-	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
-	/// [`ChannelManager::create_offer_builder`]: crate::ln::channelmanager::ChannelManager::create_offer_builder
-	pub fn new(signing_pubkey: PublicKey) -> Self {
-		Self {
-			offer: OfferContents {
-				chains: None, metadata: None, amount: None, description: None,
-				features: OfferFeatures::empty(), absolute_expiry: None, issuer: None, paths: None,
-				supported_quantity: Quantity::One, signing_pubkey: Some(signing_pubkey),
-			},
-			metadata_strategy: core::marker::PhantomData,
-			secp_ctx: None,
+		/// Creates a new builder for an offer using the `signing_pubkey` for signing invoices. The
+		/// associated secret key must be remembered while the offer is valid.
+		///
+		/// Use a different pubkey per offer to avoid correlating offers.
+		///
+		/// # Note
+		///
+		/// If constructing an [`Offer`] for use with a [`ChannelManager`], use
+		/// [`ChannelManager::create_offer_builder`] instead of [`OfferBuilder::new`].
+		///
+		/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
+		/// [`ChannelManager::create_offer_builder`]: crate::ln::channelmanager::ChannelManager::create_offer_builder
+		pub fn new(signing_pubkey: PublicKey) -> Self {
+			Self {
+				offer: OfferContents {
+					chains: None,
+					metadata: None,
+					amount: None,
+					description: None,
+					features: OfferFeatures::empty(),
+					absolute_expiry: None,
+					issuer: None,
+					paths: None,
+					supported_quantity: Quantity::One,
+					issuer_signing_pubkey: Some(signing_pubkey),
+					#[cfg(test)]
+					experimental_foo: None,
+				},
+				metadata_strategy: core::marker::PhantomData,
+				secp_ctx: None,
+			}
 		}
-	}
 
-	/// Sets the [`Offer::metadata`] to the given bytes.
-	///
-	/// Successive calls to this method will override the previous setting.
-	pub fn metadata(mut $self: $self_type, metadata: Vec<u8>) -> Result<$return_type, Bolt12SemanticError> {
-		$self.offer.metadata = Some(Metadata::Bytes(metadata));
-		Ok($return_value)
-	}
-} }
-
-macro_rules! offer_derived_metadata_builder_methods { ($secp_context: ty) => {
-	/// Similar to [`OfferBuilder::new`] except, if [`OfferBuilder::path`] is called, the signing
-	/// pubkey is derived from the given [`ExpandedKey`] and [`Nonce`]. This provides recipient
-	/// privacy by using a different signing pubkey for each offer. Otherwise, the provided
-	/// `node_id` is used for the signing pubkey.
-	///
-	/// Also, sets the metadata when [`OfferBuilder::build`] is called such that it can be used by
-	/// [`InvoiceRequest::verify_using_metadata`] to determine if the request was produced for the
-	/// offer given an [`ExpandedKey`]. However, if [`OfferBuilder::path`] is called, then the
-	/// metadata will not be set and must be included in each [`BlindedMessagePath`] instead. In this case,
-	/// use [`InvoiceRequest::verify_using_recipient_data`].
-	///
-	/// [`InvoiceRequest::verify_using_metadata`]: crate::offers::invoice_request::InvoiceRequest::verify_using_metadata
-	/// [`InvoiceRequest::verify_using_recipient_data`]: crate::offers::invoice_request::InvoiceRequest::verify_using_recipient_data
-	/// [`ExpandedKey`]: crate::ln::inbound_payment::ExpandedKey
-	pub fn deriving_signing_pubkey(
-		node_id: PublicKey, expanded_key: &ExpandedKey, nonce: Nonce,
-		secp_ctx: &'a Secp256k1<$secp_context>
-	) -> Self {
-		let derivation_material = MetadataMaterial::new(nonce, expanded_key, None);
-		let metadata = Metadata::DerivedSigningPubkey(derivation_material);
-		Self {
-			offer: OfferContents {
-				chains: None, metadata: Some(metadata), amount: None, description: None,
-				features: OfferFeatures::empty(), absolute_expiry: None, issuer: None, paths: None,
-				supported_quantity: Quantity::One, signing_pubkey: Some(node_id),
-			},
-			metadata_strategy: core::marker::PhantomData,
-			secp_ctx: Some(secp_ctx),
+		/// Sets the [`Offer::metadata`] to the given bytes.
+		///
+		/// Successive calls to this method will override the previous setting.
+		pub fn metadata(
+			mut $self: $self_type, metadata: Vec<u8>,
+		) -> Result<$return_type, Bolt12SemanticError> {
+			$self.offer.metadata = Some(Metadata::Bytes(metadata));
+			Ok($return_value)
 		}
-	}
-} }
+	};
+}
+
+macro_rules! offer_derived_metadata_builder_methods {
+	($secp_context: ty) => {
+		/// Similar to [`OfferBuilder::new`] except, if [`OfferBuilder::path`] is called, the signing
+		/// pubkey is derived from the given [`ExpandedKey`] and [`Nonce`]. This provides recipient
+		/// privacy by using a different signing pubkey for each offer. Otherwise, the provided
+		/// `node_id` is used for [`Offer::issuer_signing_pubkey`].
+		///
+		/// Also, sets the metadata when [`OfferBuilder::build`] is called such that it can be used by
+		/// [`InvoiceRequest::verify_using_metadata`] to determine if the request was produced for the
+		/// offer given an [`ExpandedKey`]. However, if [`OfferBuilder::path`] is called, then the
+		/// metadata will not be set and must be included in each [`BlindedMessagePath`] instead. In this case,
+		/// use [`InvoiceRequest::verify_using_recipient_data`].
+		///
+		/// [`InvoiceRequest::verify_using_metadata`]: crate::offers::invoice_request::InvoiceRequest::verify_using_metadata
+		/// [`InvoiceRequest::verify_using_recipient_data`]: crate::offers::invoice_request::InvoiceRequest::verify_using_recipient_data
+		/// [`ExpandedKey`]: crate::ln::inbound_payment::ExpandedKey
+		pub fn deriving_signing_pubkey(
+			node_id: PublicKey, expanded_key: &ExpandedKey, nonce: Nonce,
+			secp_ctx: &'a Secp256k1<$secp_context>,
+		) -> Self {
+			let derivation_material = MetadataMaterial::new(nonce, expanded_key, None);
+			let metadata = Metadata::DerivedSigningPubkey(derivation_material);
+			Self {
+				offer: OfferContents {
+					chains: None,
+					metadata: Some(metadata),
+					amount: None,
+					description: None,
+					features: OfferFeatures::empty(),
+					absolute_expiry: None,
+					issuer: None,
+					paths: None,
+					supported_quantity: Quantity::One,
+					issuer_signing_pubkey: Some(node_id),
+					#[cfg(test)]
+					experimental_foo: None,
+				},
+				metadata_strategy: core::marker::PhantomData,
+				secp_ctx: Some(secp_ctx),
+			}
+		}
+	};
+}
 
 macro_rules! offer_builder_methods { (
 	$self: ident, $self_type: ty, $return_type: ty, $return_value: expr $(, $self_mut: tt)?
@@ -316,8 +354,8 @@ macro_rules! offer_builder_methods { (
 		$return_value
 	}
 
-	/// Sets the [`Offer::absolute_expiry`] as seconds since the Unix epoch. Any expiry that has
-	/// already passed is valid and can be checked for using [`Offer::is_expired`].
+	/// Sets the [`Offer::absolute_expiry`] as seconds since the Unix epoch.
+	#[cfg_attr(feature = "std", doc = "Any expiry that has already passed is valid and can be checked for using [`Offer::is_expired`].")]
 	///
 	/// Successive calls to this method will override the previous setting.
 	pub fn absolute_expiry($($self_mut)* $self: $self_type, absolute_expiry: Duration) -> $return_type {
@@ -342,7 +380,7 @@ macro_rules! offer_builder_methods { (
 	}
 
 	/// Adds a blinded path to [`Offer::paths`]. Must include at least one path if only connected by
-	/// private channels or if [`Offer::signing_pubkey`] is not a public node id.
+	/// private channels or if [`Offer::issuer_signing_pubkey`] is not a public node id.
 	///
 	/// Successive calls to this method will add another blinded path. Caller is responsible for not
 	/// adding duplicate paths.
@@ -400,10 +438,10 @@ macro_rules! offer_builder_methods { (
 				};
 
 				let mut tlv_stream = $self.offer.as_tlv_stream();
-				debug_assert_eq!(tlv_stream.metadata, None);
-				tlv_stream.metadata = None;
+				debug_assert_eq!(tlv_stream.0.metadata, None);
+				tlv_stream.0.metadata = None;
 				if metadata.derives_recipient_keys() {
-					tlv_stream.node_id = None;
+					tlv_stream.0.issuer_id = None;
 				}
 
 				// Either replace the signing pubkey with the derived pubkey or include the metadata
@@ -412,7 +450,7 @@ macro_rules! offer_builder_methods { (
 				let (derived_metadata, keys) =
 					metadata.derive_from(iv_bytes, tlv_stream, $self.secp_ctx);
 				match keys {
-					Some(keys) => $self.offer.signing_pubkey = Some(keys.public_key()),
+					Some(keys) => $self.offer.issuer_signing_pubkey = Some(keys.public_key()),
 					None => $self.offer.metadata = Some(derived_metadata),
 				}
 			} else {
@@ -420,7 +458,8 @@ macro_rules! offer_builder_methods { (
 			}
 		}
 
-		let mut bytes = Vec::new();
+		const OFFER_ALLOCATION_SIZE: usize = 512;
+		let mut bytes = Vec::with_capacity(OFFER_ALLOCATION_SIZE);
 		$self.offer.write(&mut bytes).unwrap();
 
 		let id = OfferId::from_valid_offer_tlv_stream(&bytes);
@@ -459,8 +498,14 @@ macro_rules! offer_builder_test_methods { (
 	}
 
 	#[cfg_attr(c_bindings, allow(dead_code))]
-	pub(crate) fn clear_signing_pubkey($($self_mut)* $self: $self_type) -> $return_type {
-		$self.offer.signing_pubkey = None;
+	pub(crate) fn clear_issuer_signing_pubkey($($self_mut)* $self: $self_type) -> $return_type {
+		$self.offer.issuer_signing_pubkey = None;
+		$return_value
+	}
+
+	#[cfg_attr(c_bindings, allow(dead_code))]
+	pub(super) fn experimental_foo($($self_mut)* $self: $self_type, experimental_foo: u64) -> $return_type {
+		$self.offer.experimental_foo = Some(experimental_foo);
 		$return_value
 	}
 
@@ -513,7 +558,8 @@ impl<'a> OfferWithDerivedMetadataBuilder<'a> {
 
 #[cfg(c_bindings)]
 impl<'a> From<OfferBuilder<'a, DerivedMetadata, secp256k1::All>>
-for OfferWithDerivedMetadataBuilder<'a> {
+	for OfferWithDerivedMetadataBuilder<'a>
+{
 	fn from(builder: OfferBuilder<'a, DerivedMetadata, secp256k1::All>) -> Self {
 		let OfferBuilder { offer, metadata_strategy, secp_ctx } = builder;
 
@@ -523,12 +569,27 @@ for OfferWithDerivedMetadataBuilder<'a> {
 
 #[cfg(c_bindings)]
 impl<'a> From<OfferWithDerivedMetadataBuilder<'a>>
-for OfferBuilder<'a, DerivedMetadata, secp256k1::All> {
+	for OfferBuilder<'a, DerivedMetadata, secp256k1::All>
+{
 	fn from(builder: OfferWithDerivedMetadataBuilder<'a>) -> Self {
 		let OfferWithDerivedMetadataBuilder { offer, metadata_strategy, secp_ctx } = builder;
 
 		Self { offer, metadata_strategy, secp_ctx }
 	}
+}
+
+/// An [`Offer`] which was fetched from a human readable name, ie through BIP 353.
+pub struct OfferFromHrn {
+	/// The offer itself.
+	///
+	/// When you resolve this into an [`InvoiceRequestBuilder`] you *must* call
+	/// [`InvoiceRequestBuilder::sourced_from_human_readable_name`].
+	///
+	/// If you call [`Self::request_invoice`] rather than [`Offer::request_invoice`] this will be
+	/// handled for you.
+	pub offer: Offer,
+	/// The human readable name which was resolved to fetch the [`Self::offer`].
+	pub hrn: HumanReadableName,
 }
 
 /// An `Offer` is a potentially long-lived proposal for payment of a good or service.
@@ -570,7 +631,9 @@ pub(super) struct OfferContents {
 	issuer: Option<String>,
 	paths: Option<Vec<BlindedMessagePath>>,
 	supported_quantity: Quantity,
-	signing_pubkey: Option<PublicKey>,
+	issuer_signing_pubkey: Option<PublicKey>,
+	#[cfg(test)]
+	experimental_foo: Option<u64>,
 }
 
 macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
@@ -598,12 +661,12 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 
 	/// A complete description of the purpose of the payment. Intended to be displayed to the user
 	/// but with the caveat that it has not been verified in any way.
-	pub fn description(&$self) -> Option<$crate::util::string::PrintableString> {
+	pub fn description(&$self) -> Option<$crate::types::string::PrintableString<'_>> {
 		$contents.description()
 	}
 
 	/// Features pertaining to the offer.
-	pub fn offer_features(&$self) -> &$crate::ln::features::OfferFeatures {
+	pub fn offer_features(&$self) -> &$crate::types::features::OfferFeatures {
 		&$contents.features()
 	}
 
@@ -616,7 +679,7 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 
 	/// The issuer of the offer, possibly beginning with `user@domain` or `domain`. Intended to be
 	/// displayed to the user but with the caveat that it has not been verified in any way.
-	pub fn issuer(&$self) -> Option<$crate::util::string::PrintableString> {
+	pub fn issuer(&$self) -> Option<$crate::types::string::PrintableString<'_>> {
 		$contents.issuer()
 	}
 
@@ -631,9 +694,19 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 		$contents.supported_quantity()
 	}
 
-	/// The public key used by the recipient to sign invoices.
-	pub fn signing_pubkey(&$self) -> Option<bitcoin::secp256k1::PublicKey> {
-		$contents.signing_pubkey()
+	/// The public key corresponding to the key used by the recipient to sign invoices.
+	/// - If [`Offer::paths`] is empty, MUST be `Some` and contain the recipient's node id for
+	///   sending an [`InvoiceRequest`].
+	/// - If [`Offer::paths`] is not empty, MAY be `Some` and contain a transient id.
+	/// - If `None`, the signing pubkey will be the final blinded node id from the
+	///   [`BlindedMessagePath`] in [`Offer::paths`] used to send the [`InvoiceRequest`].
+	///
+	/// See also [`Bolt12Invoice::signing_pubkey`].
+	///
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	/// [`Bolt12Invoice::signing_pubkey`]: crate::offers::invoice::Bolt12Invoice::signing_pubkey
+	pub fn issuer_signing_pubkey(&$self) -> Option<bitcoin::secp256k1::PublicKey> {
+		$contents.issuer_signing_pubkey()
 	}
 } }
 
@@ -677,32 +750,39 @@ impl Offer {
 		self.contents.expects_quantity()
 	}
 
-	#[cfg(async_payments)]
+	pub(super) fn tlv_stream_iter<'a>(
+		bytes: &'a [u8],
+	) -> impl core::iter::Iterator<Item = TlvRecord<'a>> {
+		TlvStream::new(bytes)
+			.range(OFFER_TYPES)
+			.chain(TlvStream::new(bytes).range(EXPERIMENTAL_OFFER_TYPES))
+	}
+
 	pub(super) fn verify<T: secp256k1::Signing>(
-		&self, nonce: Nonce, key: &ExpandedKey, secp_ctx: &Secp256k1<T>
+		&self, nonce: Nonce, key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
 		self.contents.verify_using_recipient_data(&self.bytes, nonce, key, secp_ctx)
 	}
 }
 
-macro_rules! request_invoice_derived_payer_id { ($self: ident, $builder: ty) => {
-	/// Similar to [`Offer::request_invoice`] except it:
-	/// - derives the [`InvoiceRequest::payer_id`] such that a different key can be used for each
-	///   request,
-	/// - sets [`InvoiceRequest::payer_metadata`] when [`InvoiceRequestBuilder::build`] is called
-	///   such that it can be used by [`Bolt12Invoice::verify_using_metadata`] to determine if the
-	///   invoice was requested using a base [`ExpandedKey`] from which the payer id was derived,
-	///   and
+macro_rules! request_invoice_derived_signing_pubkey { ($self: ident, $offer: expr, $builder: ty, $hrn: expr) => {
+	/// Creates an [`InvoiceRequestBuilder`] for the offer, which
+	/// - derives the [`InvoiceRequest::payer_signing_pubkey`] such that a different key can be used
+	///   for each request in order to protect the sender's privacy,
+	/// - sets [`InvoiceRequest::payer_metadata`] when [`InvoiceRequestBuilder::build_and_sign`] is
+	///   called such that it can be used by [`Bolt12Invoice::verify_using_metadata`] to determine
+	///   if the invoice was requested using a base [`ExpandedKey`] from which the payer id was
+	///   derived, and
 	/// - includes the [`PaymentId`] encrypted in [`InvoiceRequest::payer_metadata`] so that it can
 	///   be used when sending the payment for the requested invoice.
 	///
-	/// Useful to protect the sender's privacy.
+	/// Errors if the offer contains unknown required features.
 	///
-	/// [`InvoiceRequest::payer_id`]: crate::offers::invoice_request::InvoiceRequest::payer_id
+	/// [`InvoiceRequest::payer_signing_pubkey`]: crate::offers::invoice_request::InvoiceRequest::payer_signing_pubkey
 	/// [`InvoiceRequest::payer_metadata`]: crate::offers::invoice_request::InvoiceRequest::payer_metadata
 	/// [`Bolt12Invoice::verify_using_metadata`]: crate::offers::invoice::Bolt12Invoice::verify_using_metadata
 	/// [`ExpandedKey`]: crate::ln::inbound_payment::ExpandedKey
-	pub fn request_invoice_deriving_payer_id<
+	pub fn request_invoice<
 		'a, 'b,
 		#[cfg(not(c_bindings))]
 		T: secp256k1::Signing
@@ -714,71 +794,63 @@ macro_rules! request_invoice_derived_payer_id { ($self: ident, $builder: ty) => 
 		secp_ctx: &'b Secp256k1<secp256k1::All>,
 		payment_id: PaymentId
 	) -> Result<$builder, Bolt12SemanticError> {
-		if $self.offer_features().requires_unknown_bits() {
+		if $offer.offer_features().requires_unknown_bits() {
 			return Err(Bolt12SemanticError::UnknownRequiredFeatures);
 		}
 
-		Ok(<$builder>::deriving_payer_id($self, expanded_key, nonce, secp_ctx, payment_id))
-	}
-} }
-
-macro_rules! request_invoice_explicit_payer_id { ($self: ident, $builder: ty) => {
-	/// Similar to [`Offer::request_invoice_deriving_payer_id`] except uses `payer_id` for the
-	/// [`InvoiceRequest::payer_id`] instead of deriving a different key for each request.
-	///
-	/// Useful for recurring payments using the same `payer_id` with different invoices.
-	///
-	/// [`InvoiceRequest::payer_id`]: crate::offers::invoice_request::InvoiceRequest::payer_id
-	pub fn request_invoice_deriving_metadata(
-		&$self, payer_id: PublicKey, expanded_key: &ExpandedKey, nonce: Nonce,
-		payment_id: PaymentId
-	) -> Result<$builder, Bolt12SemanticError> {
-		if $self.offer_features().requires_unknown_bits() {
-			return Err(Bolt12SemanticError::UnknownRequiredFeatures);
+		let mut builder = <$builder>::deriving_signing_pubkey(&$offer, expanded_key, nonce, secp_ctx, payment_id);
+		if let Some(hrn) = $hrn {
+			#[cfg(c_bindings)]
+			{
+				builder.sourced_from_human_readable_name(hrn);
+			}
+			#[cfg(not(c_bindings))]
+			{
+				builder = builder.sourced_from_human_readable_name(hrn);
+			}
 		}
-
-		Ok(<$builder>::deriving_metadata($self, payer_id, expanded_key, nonce, payment_id))
-	}
-
-	/// Creates an [`InvoiceRequestBuilder`] for the offer with the given `metadata` and `payer_id`,
-	/// which will be reflected in the `Bolt12Invoice` response.
-	///
-	/// The `metadata` is useful for including information about the derivation of `payer_id` such
-	/// that invoice response handling can be stateless. Also serves as payer-provided entropy while
-	/// hashing in the signature calculation.
-	///
-	/// This should not leak any information such as by using a simple BIP-32 derivation path.
-	/// Otherwise, payments may be correlated.
-	///
-	/// Errors if the offer contains unknown required features.
-	///
-	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
-	pub fn request_invoice(
-		&$self, metadata: Vec<u8>, payer_id: PublicKey
-	) -> Result<$builder, Bolt12SemanticError> {
-		if $self.offer_features().requires_unknown_bits() {
-			return Err(Bolt12SemanticError::UnknownRequiredFeatures);
-		}
-
-		Ok(<$builder>::new($self, metadata, payer_id))
+		Ok(builder)
 	}
 } }
 
 #[cfg(not(c_bindings))]
 impl Offer {
-	request_invoice_derived_payer_id!(self, InvoiceRequestBuilder<'a, 'b, DerivedPayerId, T>);
-	request_invoice_explicit_payer_id!(self, InvoiceRequestBuilder<ExplicitPayerId, secp256k1::SignOnly>);
+	request_invoice_derived_signing_pubkey!(self, self, InvoiceRequestBuilder<'a, 'b, T>, None);
+}
+
+#[cfg(not(c_bindings))]
+impl OfferFromHrn {
+	request_invoice_derived_signing_pubkey!(
+		self,
+		self.offer,
+		InvoiceRequestBuilder<'a, 'b, T>,
+		Some(self.hrn)
+	);
 }
 
 #[cfg(c_bindings)]
 impl Offer {
-	request_invoice_derived_payer_id!(self, InvoiceRequestWithDerivedPayerIdBuilder<'a, 'b>);
-	request_invoice_explicit_payer_id!(self, InvoiceRequestWithExplicitPayerIdBuilder);
+	request_invoice_derived_signing_pubkey!(
+		self,
+		self,
+		InvoiceRequestWithDerivedPayerSigningPubkeyBuilder<'a, 'b>,
+		None
+	);
+}
+
+#[cfg(c_bindings)]
+impl OfferFromHrn {
+	request_invoice_derived_signing_pubkey!(
+		self,
+		self.offer,
+		InvoiceRequestWithDerivedPayerSigningPubkeyBuilder<'a, 'b>,
+		Some(self.hrn)
+	);
 }
 
 #[cfg(test)]
 impl Offer {
-	pub(super) fn as_tlv_stream(&self) -> OfferTlvStreamRef {
+	pub(super) fn as_tlv_stream(&self) -> FullOfferTlvStreamRef<'_> {
 		self.contents.as_tlv_stream()
 	}
 }
@@ -824,7 +896,7 @@ impl OfferContents {
 		self.amount
 	}
 
-	pub fn description(&self) -> Option<PrintableString> {
+	pub fn description(&self) -> Option<PrintableString<'_>> {
 		self.description.as_ref().map(|description| PrintableString(description))
 	}
 
@@ -850,7 +922,7 @@ impl OfferContents {
 			.unwrap_or(false)
 	}
 
-	pub fn issuer(&self) -> Option<PrintableString> {
+	pub fn issuer(&self) -> Option<PrintableString<'_>> {
 		self.issuer.as_ref().map(|issuer| PrintableString(issuer.as_str()))
 	}
 
@@ -859,7 +931,7 @@ impl OfferContents {
 	}
 
 	pub(super) fn check_amount_msats_for_quantity(
-		&self, amount_msats: Option<u64>, quantity: Option<u64>
+		&self, amount_msats: Option<u64>, quantity: Option<u64>,
 	) -> Result<(), Bolt12SemanticError> {
 		let offer_amount_msats = match self.amount {
 			None => 0,
@@ -868,7 +940,8 @@ impl OfferContents {
 		};
 
 		if !self.expects_quantity() || quantity.is_some() {
-			let expected_amount_msats = offer_amount_msats.checked_mul(quantity.unwrap_or(1))
+			let expected_amount_msats = offer_amount_msats
+				.checked_mul(quantity.unwrap_or(1))
 				.ok_or(Bolt12SemanticError::InvalidAmount)?;
 			let amount_msats = amount_msats.unwrap_or(expected_amount_msats);
 
@@ -916,18 +989,18 @@ impl OfferContents {
 		}
 	}
 
-	pub(super) fn signing_pubkey(&self) -> Option<PublicKey> {
-		self.signing_pubkey
+	pub(super) fn issuer_signing_pubkey(&self) -> Option<PublicKey> {
+		self.issuer_signing_pubkey
 	}
 
 	pub(super) fn verify_using_metadata<T: secp256k1::Signing>(
-		&self, bytes: &[u8], key: &ExpandedKey, secp_ctx: &Secp256k1<T>
+		&self, bytes: &[u8], key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
 		self.verify(bytes, self.metadata.as_ref(), key, IV_BYTES_WITH_METADATA, secp_ctx)
 	}
 
 	pub(super) fn verify_using_recipient_data<T: secp256k1::Signing>(
-		&self, bytes: &[u8], nonce: Nonce, key: &ExpandedKey, secp_ctx: &Secp256k1<T>
+		&self, bytes: &[u8], nonce: Nonce, key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
 		let metadata = Metadata::RecipientData(nonce);
 		self.verify(bytes, Some(&metadata), key, IV_BYTES_WITHOUT_METADATA, secp_ctx)
@@ -936,26 +1009,33 @@ impl OfferContents {
 	/// Verifies that the offer metadata was produced from the offer in the TLV stream.
 	fn verify<T: secp256k1::Signing>(
 		&self, bytes: &[u8], metadata: Option<&Metadata>, key: &ExpandedKey,
-		iv_bytes: &[u8; IV_LEN], secp_ctx: &Secp256k1<T>
+		iv_bytes: &[u8; IV_LEN], secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
 		match metadata {
 			Some(metadata) => {
-				let tlv_stream = TlvStream::new(bytes).range(OFFER_TYPES).filter(|record| {
-					match record.r#type {
+				let tlv_stream = TlvStream::new(bytes)
+					.range(OFFER_TYPES)
+					.filter(|record| match record.r#type {
 						OFFER_METADATA_TYPE => false,
-						OFFER_NODE_ID_TYPE => !metadata.derives_recipient_keys(),
+						OFFER_ISSUER_ID_TYPE => !metadata.derives_recipient_keys(),
 						_ => true,
-					}
-				});
-				let signing_pubkey = match self.signing_pubkey() {
+					})
+					.chain(TlvStream::new(bytes).range(EXPERIMENTAL_OFFER_TYPES));
+
+				let signing_pubkey = match self.issuer_signing_pubkey() {
 					Some(signing_pubkey) => signing_pubkey,
 					None => return Err(()),
 				};
 				let keys = signer::verify_recipient_metadata(
-					metadata.as_ref(), key, iv_bytes, signing_pubkey, tlv_stream, secp_ctx
+					metadata.as_ref(),
+					key,
+					iv_bytes,
+					signing_pubkey,
+					tlv_stream,
+					secp_ctx,
 				)?;
 
-				let offer_id = OfferId::from_valid_invreq_tlv_stream(bytes);
+				let offer_id = OfferId::from_valid_bolt12_tlv_stream(bytes);
 
 				Ok((offer_id, keys))
 			},
@@ -963,20 +1043,24 @@ impl OfferContents {
 		}
 	}
 
-	pub(super) fn as_tlv_stream(&self) -> OfferTlvStreamRef {
+	pub(super) fn as_tlv_stream(&self) -> FullOfferTlvStreamRef<'_> {
 		let (currency, amount) = match &self.amount {
 			None => (None, None),
 			Some(Amount::Bitcoin { amount_msats }) => (None, Some(*amount_msats)),
-			Some(Amount::Currency { iso4217_code, amount }) => (
-				Some(iso4217_code), Some(*amount)
-			),
+			Some(Amount::Currency { iso4217_code, amount }) => {
+				(Some(iso4217_code.as_bytes()), Some(*amount))
+			},
 		};
 
 		let features = {
-			if self.features == OfferFeatures::empty() { None } else { Some(&self.features) }
+			if self.features == OfferFeatures::empty() {
+				None
+			} else {
+				Some(&self.features)
+			}
 		};
 
-		OfferTlvStreamRef {
+		let offer = OfferTlvStreamRef {
 			chains: self.chains.as_ref(),
 			metadata: self.metadata(),
 			currency,
@@ -987,15 +1071,27 @@ impl OfferContents {
 			paths: self.paths.as_ref(),
 			issuer: self.issuer.as_ref(),
 			quantity_max: self.supported_quantity.to_tlv_record(),
-			node_id: self.signing_pubkey.as_ref(),
-		}
+			issuer_id: self.issuer_signing_pubkey.as_ref(),
+		};
+
+		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			#[cfg(test)]
+			experimental_foo: self.experimental_foo,
+		};
+
+		(offer, experimental_offer)
 	}
 }
 
-impl Readable for Offer {
-	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
-		let bytes: WithoutLength<Vec<u8>> = Readable::read(reader)?;
-		Self::try_from(bytes.0).map_err(|_| DecodeError::InvalidValue)
+impl LengthReadable for Offer {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(
+		reader: &mut R,
+	) -> Result<Self, DecodeError> {
+		let bytes: WithoutLength<Vec<u8>> = LengthReadable::read_from_fixed_length_buffer(reader)?;
+		Self::try_from(bytes.0).map_err(|e| match e {
+			Bolt12ParseError::Decode(e) => e,
+			_ => DecodeError::InvalidValue,
+		})
 	}
 }
 
@@ -1020,17 +1116,69 @@ pub enum Amount {
 		/// The amount in millisatoshi.
 		amount_msats: u64,
 	},
-	/// An amount of currency specified using ISO 4712.
+	/// An amount of currency specified using ISO 4217.
 	Currency {
 		/// The currency that the amount is denominated in.
 		iso4217_code: CurrencyCode,
-		/// The amount in the currency unit adjusted by the ISO 4712 exponent (e.g., USD cents).
+		/// The amount in the currency unit adjusted by the ISO 4217 exponent (e.g., USD cents).
 		amount: u64,
 	},
 }
 
-/// An ISO 4712 three-letter currency code (e.g., USD).
-pub type CurrencyCode = [u8; 3];
+/// An ISO 4217 three-letter currency code (e.g., USD).
+///
+/// Currency codes must be exactly 3 ASCII uppercase letters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CurrencyCode([u8; 3]);
+
+impl CurrencyCode {
+	/// Creates a new `CurrencyCode` from a 3-byte array.
+	///
+	/// Returns an error if the bytes are not valid UTF-8 or not all ASCII uppercase.
+	pub fn new(code: [u8; 3]) -> Result<Self, CurrencyCodeError> {
+		if !code.iter().all(|c| c.is_ascii_uppercase()) {
+			return Err(CurrencyCodeError);
+		}
+
+		Ok(Self(code))
+	}
+
+	/// Returns the currency code as a byte array.
+	pub fn as_bytes(&self) -> &[u8; 3] {
+		&self.0
+	}
+
+	/// Returns the currency code as a string slice.
+	pub fn as_str(&self) -> &str {
+		core::str::from_utf8(&self.0).expect("currency code is always valid UTF-8")
+	}
+}
+
+impl FromStr for CurrencyCode {
+	type Err = CurrencyCodeError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		if s.len() != 3 {
+			return Err(CurrencyCodeError);
+		}
+
+		let mut code = [0u8; 3];
+		code.copy_from_slice(s.as_bytes());
+		Self::new(code)
+	}
+}
+
+impl AsRef<[u8]> for CurrencyCode {
+	fn as_ref(&self) -> &[u8] {
+		&self.0
+	}
+}
+
+impl core::fmt::Display for CurrencyCode {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
 
 /// Quantity of items supported by an [`Offer`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1063,13 +1211,13 @@ pub(super) const OFFER_TYPES: core::ops::Range<u64> = 1..80;
 /// TLV record type for [`Offer::metadata`].
 const OFFER_METADATA_TYPE: u64 = 4;
 
-/// TLV record type for [`Offer::signing_pubkey`].
-const OFFER_NODE_ID_TYPE: u64 = 22;
+/// TLV record type for [`Offer::issuer_signing_pubkey`].
+const OFFER_ISSUER_ID_TYPE: u64 = 22;
 
-tlv_stream!(OfferTlvStream, OfferTlvStreamRef, OFFER_TYPES, {
+tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 	(2, chains: (Vec<ChainHash>, WithoutLength)),
 	(OFFER_METADATA_TYPE, metadata: (Vec<u8>, WithoutLength)),
-	(6, currency: CurrencyCode),
+	(6, currency: [u8; 3]),
 	(8, amount: (u64, HighZeroBytesDroppedBigSize)),
 	(10, description: (String, WithoutLength)),
 	(12, features: (OfferFeatures, WithoutLength)),
@@ -1077,8 +1225,33 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef, OFFER_TYPES, {
 	(16, paths: (Vec<BlindedMessagePath>, WithoutLength)),
 	(18, issuer: (String, WithoutLength)),
 	(20, quantity_max: (u64, HighZeroBytesDroppedBigSize)),
-	(OFFER_NODE_ID_TYPE, node_id: PublicKey),
+	(OFFER_ISSUER_ID_TYPE, issuer_id: PublicKey),
 });
+
+/// Valid type range for experimental offer TLV records.
+pub(super) const EXPERIMENTAL_OFFER_TYPES: core::ops::Range<u64> = 1_000_000_000..2_000_000_000;
+
+#[cfg(not(test))]
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+});
+
+#[cfg(test)]
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+	(1_999_999_999, experimental_foo: (u64, HighZeroBytesDroppedBigSize)),
+});
+
+type FullOfferTlvStream = (OfferTlvStream, ExperimentalOfferTlvStream);
+
+type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef);
+
+impl CursorReadable for FullOfferTlvStream {
+	fn read<R: AsRef<[u8]>>(r: &mut io::Cursor<R>) -> Result<Self, DecodeError> {
+		let offer = CursorReadable::read(r)?;
+		let experimental_offer = CursorReadable::read(r)?;
+
+		Ok((offer, experimental_offer))
+	}
+}
 
 impl Bech32Encode for Offer {
 	const BECH32_HRP: &'static str = "lno";
@@ -1096,7 +1269,7 @@ impl TryFrom<Vec<u8>> for Offer {
 	type Error = Bolt12ParseError;
 
 	fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
-		let offer = ParsedMessage::<OfferTlvStream>::try_from(bytes)?;
+		let offer = ParsedMessage::<FullOfferTlvStream>::try_from(bytes)?;
 		let ParsedMessage { bytes, tlv_stream } = offer;
 		let contents = OfferContents::try_from(tlv_stream)?;
 		let id = OfferId::from_valid_offer_tlv_stream(&bytes);
@@ -1105,14 +1278,29 @@ impl TryFrom<Vec<u8>> for Offer {
 	}
 }
 
-impl TryFrom<OfferTlvStream> for OfferContents {
+impl TryFrom<FullOfferTlvStream> for OfferContents {
 	type Error = Bolt12SemanticError;
 
-	fn try_from(tlv_stream: OfferTlvStream) -> Result<Self, Self::Error> {
-		let OfferTlvStream {
-			chains, metadata, currency, amount, description, features, absolute_expiry, paths,
-			issuer, quantity_max, node_id,
-		} = tlv_stream;
+	fn try_from(tlv_stream: FullOfferTlvStream) -> Result<Self, Self::Error> {
+		let (
+			OfferTlvStream {
+				chains,
+				metadata,
+				currency,
+				amount,
+				description,
+				features,
+				absolute_expiry,
+				paths,
+				issuer,
+				quantity_max,
+				issuer_id,
+			},
+			ExperimentalOfferTlvStream {
+				#[cfg(test)]
+				experimental_foo,
+			},
+		) = tlv_stream;
 
 		let metadata = metadata.map(|metadata| Metadata::Bytes(metadata));
 
@@ -1123,7 +1311,11 @@ impl TryFrom<OfferTlvStream> for OfferContents {
 			},
 			(None, Some(amount_msats)) => Some(Amount::Bitcoin { amount_msats }),
 			(Some(_), None) => return Err(Bolt12SemanticError::MissingAmount),
-			(Some(iso4217_code), Some(amount)) => Some(Amount::Currency { iso4217_code, amount }),
+			(Some(currency_bytes), Some(amount)) => {
+				let iso4217_code = CurrencyCode::new(currency_bytes)
+					.map_err(|_| Bolt12SemanticError::InvalidCurrencyCode)?;
+				Some(Amount::Currency { iso4217_code, amount })
+			},
 		};
 
 		if amount.is_some() && description.is_none() {
@@ -1132,8 +1324,8 @@ impl TryFrom<OfferTlvStream> for OfferContents {
 
 		let features = features.unwrap_or_else(OfferFeatures::empty);
 
-		let absolute_expiry = absolute_expiry
-			.map(|seconds_from_epoch| Duration::from_secs(seconds_from_epoch));
+		let absolute_expiry =
+			absolute_expiry.map(|seconds_from_epoch| Duration::from_secs(seconds_from_epoch));
 
 		let supported_quantity = match quantity_max {
 			None => Quantity::One,
@@ -1141,15 +1333,27 @@ impl TryFrom<OfferTlvStream> for OfferContents {
 			Some(n) => Quantity::Bounded(NonZeroU64::new(n).unwrap()),
 		};
 
-		let (signing_pubkey, paths) = match (node_id, paths) {
-			(None, None) => return Err(Bolt12SemanticError::MissingSigningPubkey),
-			(_, Some(paths)) if paths.is_empty() => return Err(Bolt12SemanticError::MissingPaths),
-			(node_id, paths) => (node_id, paths),
+		let (issuer_signing_pubkey, paths) = match (issuer_id, paths) {
+			(None, None) => return Err(Bolt12SemanticError::MissingIssuerSigningPubkey),
+			(None, Some(paths)) if paths.is_empty() => {
+				return Err(Bolt12SemanticError::MissingPaths)
+			},
+			(issuer_id, paths) => (issuer_id, paths),
 		};
 
 		Ok(OfferContents {
-			chains, metadata, amount, description, features, absolute_expiry, issuer, paths,
-			supported_quantity, signing_pubkey,
+			chains,
+			metadata,
+			amount,
+			description,
+			features,
+			absolute_expiry,
+			issuer,
+			paths,
+			supported_quantity,
+			issuer_signing_pubkey,
+			#[cfg(test)]
+			experimental_foo,
 		})
 	}
 }
@@ -1160,34 +1364,48 @@ impl core::fmt::Display for Offer {
 	}
 }
 
+/// An error indicating that a currency code is invalid.
+///
+/// A valid currency code must follow the ISO 4217 standard:
+/// - Exactly 3 characters in length.
+/// - Consist only of uppercase ASCII letters (A–Z).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrencyCodeError;
+
+impl core::fmt::Display for CurrencyCodeError {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		write!(f, "invalid currency code: must be 3 uppercase ASCII letters (ISO 4217)")
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::{Amount, Offer, OfferTlvStreamRef, Quantity};
 	#[cfg(not(c_bindings))]
-	use {
-		super::OfferBuilder,
-	};
+	use super::OfferBuilder;
 	#[cfg(c_bindings)]
-	use {
-		super::OfferWithExplicitMetadataBuilder as OfferBuilder,
+	use super::OfferWithExplicitMetadataBuilder as OfferBuilder;
+	use super::{
+		Amount, ExperimentalOfferTlvStreamRef, Offer, OfferTlvStreamRef, Quantity,
+		EXPERIMENTAL_OFFER_TYPES, OFFER_TYPES,
 	};
 
+	use crate::blinded_path::message::BlindedMessagePath;
+	use crate::blinded_path::BlindedHop;
+	use crate::ln::channelmanager::PaymentId;
+	use crate::ln::inbound_payment::ExpandedKey;
+	use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
+	use crate::offers::nonce::Nonce;
+	use crate::offers::offer::CurrencyCode;
+	use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError};
+	use crate::offers::test_utils::*;
+	use crate::types::features::OfferFeatures;
+	use crate::types::string::PrintableString;
+	use crate::util::ser::{BigSize, Writeable};
 	use bitcoin::constants::ChainHash;
 	use bitcoin::network::Network;
 	use bitcoin::secp256k1::Secp256k1;
 	use core::num::NonZeroU64;
 	use core::time::Duration;
-	use crate::blinded_path::BlindedHop;
-	use crate::blinded_path::message::BlindedMessagePath;
-	use crate::sign::KeyMaterial;
-	use crate::ln::features::OfferFeatures;
-	use crate::ln::inbound_payment::ExpandedKey;
-	use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
-	use crate::offers::nonce::Nonce;
-	use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError};
-	use crate::offers::test_utils::*;
-	use crate::util::ser::{BigSize, Writeable};
-	use crate::util::string::PrintableString;
 
 	#[test]
 	fn builds_offer_with_defaults() {
@@ -1210,23 +1428,26 @@ mod tests {
 		assert_eq!(offer.issuer(), None);
 		assert_eq!(offer.supported_quantity(), Quantity::One);
 		assert!(!offer.expects_quantity());
-		assert_eq!(offer.signing_pubkey(), Some(pubkey(42)));
+		assert_eq!(offer.issuer_signing_pubkey(), Some(pubkey(42)));
 
 		assert_eq!(
 			offer.as_tlv_stream(),
-			OfferTlvStreamRef {
-				chains: None,
-				metadata: None,
-				currency: None,
-				amount: None,
-				description: None,
-				features: None,
-				absolute_expiry: None,
-				paths: None,
-				issuer: None,
-				quantity_max: None,
-				node_id: Some(&pubkey(42)),
-			},
+			(
+				OfferTlvStreamRef {
+					chains: None,
+					metadata: None,
+					currency: None,
+					amount: None,
+					description: None,
+					features: None,
+					absolute_expiry: None,
+					paths: None,
+					issuer: None,
+					quantity_max: None,
+					issuer_id: Some(&pubkey(42)),
+				},
+				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+			),
 		);
 
 		if let Err(e) = Offer::try_from(buffer) {
@@ -1239,30 +1460,24 @@ mod tests {
 		let mainnet = ChainHash::using_genesis_block(Network::Bitcoin);
 		let testnet = ChainHash::using_genesis_block(Network::Testnet);
 
-		let offer = OfferBuilder::new(pubkey(42))
-			.chain(Network::Bitcoin)
-			.build()
-			.unwrap();
+		let offer = OfferBuilder::new(pubkey(42)).chain(Network::Bitcoin).build().unwrap();
 		assert!(offer.supports_chain(mainnet));
 		assert_eq!(offer.chains(), vec![mainnet]);
-		assert_eq!(offer.as_tlv_stream().chains, None);
+		assert_eq!(offer.as_tlv_stream().0.chains, None);
+
+		let offer = OfferBuilder::new(pubkey(42)).chain(Network::Testnet).build().unwrap();
+		assert!(offer.supports_chain(testnet));
+		assert_eq!(offer.chains(), vec![testnet]);
+		assert_eq!(offer.as_tlv_stream().0.chains, Some(&vec![testnet]));
 
 		let offer = OfferBuilder::new(pubkey(42))
+			.chain(Network::Testnet)
 			.chain(Network::Testnet)
 			.build()
 			.unwrap();
 		assert!(offer.supports_chain(testnet));
 		assert_eq!(offer.chains(), vec![testnet]);
-		assert_eq!(offer.as_tlv_stream().chains, Some(&vec![testnet]));
-
-		let offer = OfferBuilder::new(pubkey(42))
-			.chain(Network::Testnet)
-			.chain(Network::Testnet)
-			.build()
-			.unwrap();
-		assert!(offer.supports_chain(testnet));
-		assert_eq!(offer.chains(), vec![testnet]);
-		assert_eq!(offer.as_tlv_stream().chains, Some(&vec![testnet]));
+		assert_eq!(offer.as_tlv_stream().0.chains, Some(&vec![testnet]));
 
 		let offer = OfferBuilder::new(pubkey(42))
 			.chain(Network::Bitcoin)
@@ -1272,101 +1487,113 @@ mod tests {
 		assert!(offer.supports_chain(mainnet));
 		assert!(offer.supports_chain(testnet));
 		assert_eq!(offer.chains(), vec![mainnet, testnet]);
-		assert_eq!(offer.as_tlv_stream().chains, Some(&vec![mainnet, testnet]));
+		assert_eq!(offer.as_tlv_stream().0.chains, Some(&vec![mainnet, testnet]));
 	}
 
 	#[test]
 	fn builds_offer_with_metadata() {
-		let offer = OfferBuilder::new(pubkey(42))
-			.metadata(vec![42; 32]).unwrap()
-			.build()
-			.unwrap();
+		let offer = OfferBuilder::new(pubkey(42)).metadata(vec![42; 32]).unwrap().build().unwrap();
 		assert_eq!(offer.metadata(), Some(&vec![42; 32]));
-		assert_eq!(offer.as_tlv_stream().metadata, Some(&vec![42; 32]));
+		assert_eq!(offer.as_tlv_stream().0.metadata, Some(&vec![42; 32]));
 
 		let offer = OfferBuilder::new(pubkey(42))
-			.metadata(vec![42; 32]).unwrap()
-			.metadata(vec![43; 32]).unwrap()
+			.metadata(vec![42; 32])
+			.unwrap()
+			.metadata(vec![43; 32])
+			.unwrap()
 			.build()
 			.unwrap();
 		assert_eq!(offer.metadata(), Some(&vec![43; 32]));
-		assert_eq!(offer.as_tlv_stream().metadata, Some(&vec![43; 32]));
+		assert_eq!(offer.as_tlv_stream().0.metadata, Some(&vec![43; 32]));
 	}
 
 	#[test]
 	fn builds_offer_with_metadata_derived() {
 		let node_id = recipient_pubkey();
-		let expanded_key = ExpandedKey::new(&KeyMaterial([42; 32]));
+		let expanded_key = ExpandedKey::new([42; 32]);
 		let entropy = FixedEntropy {};
 		let nonce = Nonce::from_entropy_source(&entropy);
 		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
 
 		#[cfg(c_bindings)]
 		use super::OfferWithDerivedMetadataBuilder as OfferBuilder;
 		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
 			.amount_msats(1000)
-			.build().unwrap();
+			.experimental_foo(42)
+			.build()
+			.unwrap();
 		assert!(offer.metadata().is_some());
-		assert_eq!(offer.signing_pubkey(), Some(node_id));
+		assert_eq!(offer.issuer_signing_pubkey(), Some(node_id));
 
-		let invoice_request = offer.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap()
-			.sign(payer_sign).unwrap();
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
 		match invoice_request.verify_using_metadata(&expanded_key, &secp_ctx) {
 			Ok(invoice_request) => assert_eq!(invoice_request.offer_id, offer.id()),
 			Err(_) => panic!("unexpected error"),
 		}
 
 		// Fails verification when using the wrong method
-		let invoice_request = offer.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap()
-			.sign(payer_sign).unwrap();
-		assert!(
-			invoice_request.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx).is_err()
-		);
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		assert!(invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.is_err());
 
 		// Fails verification with altered offer field
 		let mut tlv_stream = offer.as_tlv_stream();
-		tlv_stream.amount = Some(100);
+		tlv_stream.0.amount = Some(100);
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
 
-		let invoice_request = Offer::try_from(encoded_offer).unwrap()
-			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap()
-			.sign(payer_sign).unwrap();
+		let invoice_request = Offer::try_from(encoded_offer)
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
 		assert!(invoice_request.verify_using_metadata(&expanded_key, &secp_ctx).is_err());
 
 		// Fails verification with altered metadata
 		let mut tlv_stream = offer.as_tlv_stream();
-		let metadata = tlv_stream.metadata.unwrap().iter().copied().rev().collect();
-		tlv_stream.metadata = Some(&metadata);
+		let metadata = tlv_stream.0.metadata.unwrap().iter().copied().rev().collect();
+		tlv_stream.0.metadata = Some(&metadata);
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
 
-		let invoice_request = Offer::try_from(encoded_offer).unwrap()
-			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap()
-			.sign(payer_sign).unwrap();
+		let invoice_request = Offer::try_from(encoded_offer)
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
 		assert!(invoice_request.verify_using_metadata(&expanded_key, &secp_ctx).is_err());
 	}
 
 	#[test]
 	fn builds_offer_with_derived_signing_pubkey() {
 		let node_id = recipient_pubkey();
-		let expanded_key = ExpandedKey::new(&KeyMaterial([42; 32]));
+		let expanded_key = ExpandedKey::new([42; 32]);
 		let entropy = FixedEntropy {};
 		let nonce = Nonce::from_entropy_source(&entropy);
 		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
 
-		let blinded_path = BlindedMessagePath::from_raw(
-			pubkey(40), pubkey(41),
+		let blinded_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
 			vec![
 				BlindedHop { blinded_node_id: pubkey(42), encrypted_payload: vec![0; 43] },
 				BlindedHop { blinded_node_id: node_id, encrypted_payload: vec![0; 44] },
-			]
+			],
 		);
 
 		#[cfg(c_bindings)]
@@ -1374,81 +1601,88 @@ mod tests {
 		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
 			.amount_msats(1000)
 			.path(blinded_path)
-			.build().unwrap();
+			.experimental_foo(42)
+			.build()
+			.unwrap();
 		assert!(offer.metadata().is_none());
-		assert_ne!(offer.signing_pubkey(), Some(node_id));
+		assert_ne!(offer.issuer_signing_pubkey(), Some(node_id));
 
-		let invoice_request = offer.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap()
-			.sign(payer_sign).unwrap();
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
 		match invoice_request.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx) {
 			Ok(invoice_request) => assert_eq!(invoice_request.offer_id, offer.id()),
 			Err(_) => panic!("unexpected error"),
 		}
 
 		// Fails verification when using the wrong method
-		let invoice_request = offer.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap()
-			.sign(payer_sign).unwrap();
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
 		assert!(invoice_request.verify_using_metadata(&expanded_key, &secp_ctx).is_err());
 
 		// Fails verification with altered offer field
 		let mut tlv_stream = offer.as_tlv_stream();
-		tlv_stream.amount = Some(100);
+		tlv_stream.0.amount = Some(100);
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
 
-		let invoice_request = Offer::try_from(encoded_offer).unwrap()
-			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap()
-			.sign(payer_sign).unwrap();
-		assert!(
-			invoice_request.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx).is_err()
-		);
+		let invoice_request = Offer::try_from(encoded_offer)
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		assert!(invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.is_err());
 
 		// Fails verification with altered signing pubkey
 		let mut tlv_stream = offer.as_tlv_stream();
-		let signing_pubkey = pubkey(1);
-		tlv_stream.node_id = Some(&signing_pubkey);
+		let issuer_id = pubkey(1);
+		tlv_stream.0.issuer_id = Some(&issuer_id);
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
 
-		let invoice_request = Offer::try_from(encoded_offer).unwrap()
-			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap()
-			.sign(payer_sign).unwrap();
-		assert!(
-			invoice_request.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx).is_err()
-		);
+		let invoice_request = Offer::try_from(encoded_offer)
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		assert!(invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.is_err());
 	}
 
 	#[test]
 	fn builds_offer_with_amount() {
 		let bitcoin_amount = Amount::Bitcoin { amount_msats: 1000 };
-		let currency_amount = Amount::Currency { iso4217_code: *b"USD", amount: 10 };
+		let currency_amount =
+			Amount::Currency { iso4217_code: CurrencyCode::new(*b"USD").unwrap(), amount: 10 };
 
-		let offer = OfferBuilder::new(pubkey(42))
-			.amount_msats(1000)
-			.build()
-			.unwrap();
+		let offer = OfferBuilder::new(pubkey(42)).amount_msats(1000).build().unwrap();
 		let tlv_stream = offer.as_tlv_stream();
 		assert_eq!(offer.amount(), Some(bitcoin_amount));
-		assert_eq!(tlv_stream.amount, Some(1000));
-		assert_eq!(tlv_stream.currency, None);
+		assert_eq!(tlv_stream.0.amount, Some(1000));
+		assert_eq!(tlv_stream.0.currency, None);
 
 		#[cfg(not(c_bindings))]
-		let builder = OfferBuilder::new(pubkey(42))
-			.amount(currency_amount.clone());
+		let builder = OfferBuilder::new(pubkey(42)).amount(currency_amount.clone());
 		#[cfg(c_bindings)]
 		let mut builder = OfferBuilder::new(pubkey(42));
 		#[cfg(c_bindings)]
 		builder.amount(currency_amount.clone());
 		let tlv_stream = builder.offer.as_tlv_stream();
 		assert_eq!(builder.offer.amount, Some(currency_amount.clone()));
-		assert_eq!(tlv_stream.amount, Some(10));
-		assert_eq!(tlv_stream.currency, Some(b"USD"));
+		assert_eq!(tlv_stream.0.amount, Some(10));
+		assert_eq!(tlv_stream.0.currency, Some(b"USD"));
 		match builder.build() {
 			Ok(_) => panic!("expected error"),
 			Err(e) => assert_eq!(e, Bolt12SemanticError::UnsupportedCurrency),
@@ -1460,8 +1694,8 @@ mod tests {
 			.build()
 			.unwrap();
 		let tlv_stream = offer.as_tlv_stream();
-		assert_eq!(tlv_stream.amount, Some(1000));
-		assert_eq!(tlv_stream.currency, None);
+		assert_eq!(tlv_stream.0.amount, Some(1000));
+		assert_eq!(tlv_stream.0.currency, None);
 
 		let invalid_amount = Amount::Bitcoin { amount_msats: MAX_VALUE_MSAT + 1 };
 		match OfferBuilder::new(pubkey(42)).amount(invalid_amount).build() {
@@ -1472,12 +1706,9 @@ mod tests {
 
 	#[test]
 	fn builds_offer_with_description() {
-		let offer = OfferBuilder::new(pubkey(42))
-			.description("foo".into())
-			.build()
-			.unwrap();
+		let offer = OfferBuilder::new(pubkey(42)).description("foo".into()).build().unwrap();
 		assert_eq!(offer.description(), Some(PrintableString("foo")));
-		assert_eq!(offer.as_tlv_stream().description, Some(&String::from("foo")));
+		assert_eq!(offer.as_tlv_stream().0.description, Some(&String::from("foo")));
 
 		let offer = OfferBuilder::new(pubkey(42))
 			.description("foo".into())
@@ -1485,14 +1716,11 @@ mod tests {
 			.build()
 			.unwrap();
 		assert_eq!(offer.description(), Some(PrintableString("bar")));
-		assert_eq!(offer.as_tlv_stream().description, Some(&String::from("bar")));
+		assert_eq!(offer.as_tlv_stream().0.description, Some(&String::from("bar")));
 
-		let offer = OfferBuilder::new(pubkey(42))
-			.amount_msats(1000)
-			.build()
-			.unwrap();
+		let offer = OfferBuilder::new(pubkey(42)).amount_msats(1000).build().unwrap();
 		assert_eq!(offer.description(), Some(PrintableString("")));
-		assert_eq!(offer.as_tlv_stream().description, Some(&String::from("")));
+		assert_eq!(offer.as_tlv_stream().0.description, Some(&String::from("")));
 	}
 
 	#[test]
@@ -1502,7 +1730,7 @@ mod tests {
 			.build()
 			.unwrap();
 		assert_eq!(offer.offer_features(), &OfferFeatures::unknown());
-		assert_eq!(offer.as_tlv_stream().features, Some(&OfferFeatures::unknown()));
+		assert_eq!(offer.as_tlv_stream().0.features, Some(&OfferFeatures::unknown()));
 
 		let offer = OfferBuilder::new(pubkey(42))
 			.features_unchecked(OfferFeatures::unknown())
@@ -1510,7 +1738,7 @@ mod tests {
 			.build()
 			.unwrap();
 		assert_eq!(offer.offer_features(), &OfferFeatures::empty());
-		assert_eq!(offer.as_tlv_stream().features, None);
+		assert_eq!(offer.as_tlv_stream().0.features, None);
 	}
 
 	#[test]
@@ -1519,15 +1747,12 @@ mod tests {
 		let past_expiry = Duration::from_secs(0);
 		let now = future_expiry - Duration::from_secs(1_000);
 
-		let offer = OfferBuilder::new(pubkey(42))
-			.absolute_expiry(future_expiry)
-			.build()
-			.unwrap();
+		let offer = OfferBuilder::new(pubkey(42)).absolute_expiry(future_expiry).build().unwrap();
 		#[cfg(feature = "std")]
 		assert!(!offer.is_expired());
 		assert!(!offer.is_expired_no_std(now));
 		assert_eq!(offer.absolute_expiry(), Some(future_expiry));
-		assert_eq!(offer.as_tlv_stream().absolute_expiry, Some(future_expiry.as_secs()));
+		assert_eq!(offer.as_tlv_stream().0.absolute_expiry, Some(future_expiry.as_secs()));
 
 		let offer = OfferBuilder::new(pubkey(42))
 			.absolute_expiry(future_expiry)
@@ -1538,25 +1763,27 @@ mod tests {
 		assert!(offer.is_expired());
 		assert!(offer.is_expired_no_std(now));
 		assert_eq!(offer.absolute_expiry(), Some(past_expiry));
-		assert_eq!(offer.as_tlv_stream().absolute_expiry, Some(past_expiry.as_secs()));
+		assert_eq!(offer.as_tlv_stream().0.absolute_expiry, Some(past_expiry.as_secs()));
 	}
 
 	#[test]
 	fn builds_offer_with_paths() {
 		let paths = vec![
-			BlindedMessagePath::from_raw(
-				pubkey(40), pubkey(41),
+			BlindedMessagePath::from_blinded_path(
+				pubkey(40),
+				pubkey(41),
 				vec![
 					BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
 					BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] },
-				]
+				],
 			),
-			BlindedMessagePath::from_raw(
-				pubkey(40), pubkey(41),
+			BlindedMessagePath::from_blinded_path(
+				pubkey(40),
+				pubkey(41),
 				vec![
 					BlindedHop { blinded_node_id: pubkey(45), encrypted_payload: vec![0; 45] },
 					BlindedHop { blinded_node_id: pubkey(46), encrypted_payload: vec![0; 46] },
-				]
+				],
 			),
 		];
 
@@ -1567,20 +1794,17 @@ mod tests {
 			.unwrap();
 		let tlv_stream = offer.as_tlv_stream();
 		assert_eq!(offer.paths(), paths.as_slice());
-		assert_eq!(offer.signing_pubkey(), Some(pubkey(42)));
+		assert_eq!(offer.issuer_signing_pubkey(), Some(pubkey(42)));
 		assert_ne!(pubkey(42), pubkey(44));
-		assert_eq!(tlv_stream.paths, Some(&paths));
-		assert_eq!(tlv_stream.node_id, Some(&pubkey(42)));
+		assert_eq!(tlv_stream.0.paths, Some(&paths));
+		assert_eq!(tlv_stream.0.issuer_id, Some(&pubkey(42)));
 	}
 
 	#[test]
 	fn builds_offer_with_issuer() {
-		let offer = OfferBuilder::new(pubkey(42))
-			.issuer("foo".into())
-			.build()
-			.unwrap();
+		let offer = OfferBuilder::new(pubkey(42)).issuer("foo".into()).build().unwrap();
 		assert_eq!(offer.issuer(), Some(PrintableString("foo")));
-		assert_eq!(offer.as_tlv_stream().issuer, Some(&String::from("foo")));
+		assert_eq!(offer.as_tlv_stream().0.issuer, Some(&String::from("foo")));
 
 		let offer = OfferBuilder::new(pubkey(42))
 			.issuer("foo".into())
@@ -1588,7 +1812,7 @@ mod tests {
 			.build()
 			.unwrap();
 		assert_eq!(offer.issuer(), Some(PrintableString("bar")));
-		assert_eq!(offer.as_tlv_stream().issuer, Some(&String::from("bar")));
+		assert_eq!(offer.as_tlv_stream().0.issuer, Some(&String::from("bar")));
 	}
 
 	#[test]
@@ -1596,23 +1820,19 @@ mod tests {
 		let one = NonZeroU64::new(1).unwrap();
 		let ten = NonZeroU64::new(10).unwrap();
 
-		let offer = OfferBuilder::new(pubkey(42))
-			.supported_quantity(Quantity::One)
-			.build()
-			.unwrap();
+		let offer =
+			OfferBuilder::new(pubkey(42)).supported_quantity(Quantity::One).build().unwrap();
 		let tlv_stream = offer.as_tlv_stream();
 		assert!(!offer.expects_quantity());
 		assert_eq!(offer.supported_quantity(), Quantity::One);
-		assert_eq!(tlv_stream.quantity_max, None);
+		assert_eq!(tlv_stream.0.quantity_max, None);
 
-		let offer = OfferBuilder::new(pubkey(42))
-			.supported_quantity(Quantity::Unbounded)
-			.build()
-			.unwrap();
+		let offer =
+			OfferBuilder::new(pubkey(42)).supported_quantity(Quantity::Unbounded).build().unwrap();
 		let tlv_stream = offer.as_tlv_stream();
 		assert!(offer.expects_quantity());
 		assert_eq!(offer.supported_quantity(), Quantity::Unbounded);
-		assert_eq!(tlv_stream.quantity_max, Some(0));
+		assert_eq!(tlv_stream.0.quantity_max, Some(0));
 
 		let offer = OfferBuilder::new(pubkey(42))
 			.supported_quantity(Quantity::Bounded(ten))
@@ -1621,7 +1841,7 @@ mod tests {
 		let tlv_stream = offer.as_tlv_stream();
 		assert!(offer.expects_quantity());
 		assert_eq!(offer.supported_quantity(), Quantity::Bounded(ten));
-		assert_eq!(tlv_stream.quantity_max, Some(10));
+		assert_eq!(tlv_stream.0.quantity_max, Some(10));
 
 		let offer = OfferBuilder::new(pubkey(42))
 			.supported_quantity(Quantity::Bounded(one))
@@ -1630,7 +1850,7 @@ mod tests {
 		let tlv_stream = offer.as_tlv_stream();
 		assert!(offer.expects_quantity());
 		assert_eq!(offer.supported_quantity(), Quantity::Bounded(one));
-		assert_eq!(tlv_stream.quantity_max, Some(1));
+		assert_eq!(tlv_stream.0.quantity_max, Some(1));
 
 		let offer = OfferBuilder::new(pubkey(42))
 			.supported_quantity(Quantity::Bounded(ten))
@@ -1640,15 +1860,22 @@ mod tests {
 		let tlv_stream = offer.as_tlv_stream();
 		assert!(!offer.expects_quantity());
 		assert_eq!(offer.supported_quantity(), Quantity::One);
-		assert_eq!(tlv_stream.quantity_max, None);
+		assert_eq!(tlv_stream.0.quantity_max, None);
 	}
 
 	#[test]
 	fn fails_requesting_invoice_with_unknown_required_features() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
 		match OfferBuilder::new(pubkey(42))
 			.features_unchecked(OfferFeatures::unknown())
-			.build().unwrap()
-			.request_invoice(vec![1; 32], pubkey(43))
+			.build()
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
 		{
 			Ok(_) => panic!("expected error"),
 			Err(e) => assert_eq!(e, Bolt12SemanticError::UnknownRequiredFeatures),
@@ -1678,8 +1905,8 @@ mod tests {
 		}
 
 		let mut tlv_stream = offer.as_tlv_stream();
-		tlv_stream.amount = Some(1000);
-		tlv_stream.currency = Some(b"USD");
+		tlv_stream.0.amount = Some(1000);
+		tlv_stream.0.currency = Some(b"USD");
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
@@ -1689,27 +1916,63 @@ mod tests {
 		}
 
 		let mut tlv_stream = offer.as_tlv_stream();
-		tlv_stream.amount = None;
-		tlv_stream.currency = Some(b"USD");
+		tlv_stream.0.amount = None;
+		tlv_stream.0.currency = Some(b"USD");
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
 
 		match Offer::try_from(encoded_offer) {
 			Ok(_) => panic!("expected error"),
-			Err(e) => assert_eq!(e, Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingAmount)),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingAmount)
+			),
 		}
 
 		let mut tlv_stream = offer.as_tlv_stream();
-		tlv_stream.amount = Some(MAX_VALUE_MSAT + 1);
-		tlv_stream.currency = None;
+		tlv_stream.0.amount = Some(MAX_VALUE_MSAT + 1);
+		tlv_stream.0.currency = None;
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
 
 		match Offer::try_from(encoded_offer) {
 			Ok(_) => panic!("expected error"),
-			Err(e) => assert_eq!(e, Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidAmount)),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidAmount)
+			),
+		}
+
+		let mut tlv_stream = offer.as_tlv_stream();
+		tlv_stream.0.amount = Some(1000);
+		tlv_stream.0.currency = Some(b"\xFF\xFE\xFD"); // invalid UTF-8 bytes
+
+		let mut encoded_offer = Vec::new();
+		tlv_stream.write(&mut encoded_offer).unwrap();
+
+		match Offer::try_from(encoded_offer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidCurrencyCode)
+			),
+		}
+
+		let mut tlv_stream = offer.as_tlv_stream();
+		tlv_stream.0.amount = Some(1000);
+		tlv_stream.0.currency = Some(b"usd"); // invalid ISO 4217 code
+
+		let mut encoded_offer = Vec::new();
+		tlv_stream.write(&mut encoded_offer).unwrap();
+
+		match Offer::try_from(encoded_offer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidCurrencyCode)
+			),
 		}
 	}
 
@@ -1723,13 +1986,14 @@ mod tests {
 		let offer = OfferBuilder::new(pubkey(42))
 			.description("foo".to_string())
 			.amount_msats(1000)
-			.build().unwrap();
+			.build()
+			.unwrap();
 		if let Err(e) = offer.to_string().parse::<Offer>() {
 			panic!("error parsing offer: {:?}", e);
 		}
 
 		let mut tlv_stream = offer.as_tlv_stream();
-		tlv_stream.description = None;
+		tlv_stream.0.description = None;
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
@@ -1737,7 +2001,10 @@ mod tests {
 		match Offer::try_from(encoded_offer) {
 			Ok(_) => panic!("expected error"),
 			Err(e) => {
-				assert_eq!(e, Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingDescription));
+				assert_eq!(
+					e,
+					Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingDescription)
+				);
 			},
 		}
 	}
@@ -1745,19 +2012,21 @@ mod tests {
 	#[test]
 	fn parses_offer_with_paths() {
 		let offer = OfferBuilder::new(pubkey(42))
-			.path(BlindedMessagePath::from_raw(
-				pubkey(40), pubkey(41),
+			.path(BlindedMessagePath::from_blinded_path(
+				pubkey(40),
+				pubkey(41),
 				vec![
 					BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
 					BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] },
-				]
+				],
 			))
-			.path(BlindedMessagePath::from_raw(
-					pubkey(40), pubkey(41),
-					vec![
-						BlindedHop { blinded_node_id: pubkey(45), encrypted_payload: vec![0; 45] },
-						BlindedHop { blinded_node_id: pubkey(46), encrypted_payload: vec![0; 46] },
-					]
+			.path(BlindedMessagePath::from_blinded_path(
+				pubkey(40),
+				pubkey(41),
+				vec![
+					BlindedHop { blinded_node_id: pubkey(45), encrypted_payload: vec![0; 45] },
+					BlindedHop { blinded_node_id: pubkey(46), encrypted_payload: vec![0; 46] },
+				],
 			))
 			.build()
 			.unwrap();
@@ -1766,14 +2035,15 @@ mod tests {
 		}
 
 		let offer = OfferBuilder::new(pubkey(42))
-			.path(BlindedMessagePath::from_raw(
-					pubkey(40), pubkey(41),
-					vec![
-						BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
-						BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] },
-					]
+			.path(BlindedMessagePath::from_blinded_path(
+				pubkey(40),
+				pubkey(41),
+				vec![
+					BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
+					BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] },
+				],
 			))
-			.clear_signing_pubkey()
+			.clear_issuer_signing_pubkey()
 			.build()
 			.unwrap();
 		if let Err(e) = offer.to_string().parse::<Offer>() {
@@ -1781,31 +2051,31 @@ mod tests {
 		}
 
 		let mut builder = OfferBuilder::new(pubkey(42));
+		builder.offer.issuer_signing_pubkey = None;
 		builder.offer.paths = Some(vec![]);
 
 		let offer = builder.build().unwrap();
 		match offer.to_string().parse::<Offer>() {
 			Ok(_) => panic!("expected error"),
 			Err(e) => {
-				assert_eq!(e, Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingPaths));
+				assert_eq!(
+					e,
+					Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingPaths)
+				);
 			},
 		}
 	}
 
 	#[test]
 	fn parses_offer_with_quantity() {
-		let offer = OfferBuilder::new(pubkey(42))
-			.supported_quantity(Quantity::One)
-			.build()
-			.unwrap();
+		let offer =
+			OfferBuilder::new(pubkey(42)).supported_quantity(Quantity::One).build().unwrap();
 		if let Err(e) = offer.to_string().parse::<Offer>() {
 			panic!("error parsing offer: {:?}", e);
 		}
 
-		let offer = OfferBuilder::new(pubkey(42))
-			.supported_quantity(Quantity::Unbounded)
-			.build()
-			.unwrap();
+		let offer =
+			OfferBuilder::new(pubkey(42)).supported_quantity(Quantity::Unbounded).build().unwrap();
 		if let Err(e) = offer.to_string().parse::<Offer>() {
 			panic!("error parsing offer: {:?}", e);
 		}
@@ -1828,14 +2098,14 @@ mod tests {
 	}
 
 	#[test]
-	fn parses_offer_with_node_id() {
+	fn parses_offer_with_issuer_id() {
 		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
 		if let Err(e) = offer.to_string().parse::<Offer>() {
 			panic!("error parsing offer: {:?}", e);
 		}
 
 		let mut tlv_stream = offer.as_tlv_stream();
-		tlv_stream.node_id = None;
+		tlv_stream.0.issuer_id = None;
 
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
@@ -1843,24 +2113,161 @@ mod tests {
 		match Offer::try_from(encoded_offer) {
 			Ok(_) => panic!("expected error"),
 			Err(e) => {
-				assert_eq!(e, Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingSigningPubkey));
+				assert_eq!(
+					e,
+					Bolt12ParseError::InvalidSemantics(
+						Bolt12SemanticError::MissingIssuerSigningPubkey
+					)
+				);
 			},
 		}
 	}
 
 	#[test]
-	fn fails_parsing_offer_with_extra_tlv_records() {
+	fn parses_offer_with_unknown_tlv_records() {
+		const UNKNOWN_ODD_TYPE: u64 = OFFER_TYPES.end - 1;
+		assert!(UNKNOWN_ODD_TYPE % 2 == 1);
+
 		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
 
 		let mut encoded_offer = Vec::new();
 		offer.write(&mut encoded_offer).unwrap();
-		BigSize(80).write(&mut encoded_offer).unwrap();
+		BigSize(UNKNOWN_ODD_TYPE).write(&mut encoded_offer).unwrap();
+		BigSize(32).write(&mut encoded_offer).unwrap();
+		[42u8; 32].write(&mut encoded_offer).unwrap();
+
+		match Offer::try_from(encoded_offer.clone()) {
+			Ok(offer) => assert_eq!(offer.bytes, encoded_offer),
+			Err(e) => panic!("error parsing offer: {:?}", e),
+		}
+
+		const UNKNOWN_EVEN_TYPE: u64 = OFFER_TYPES.end - 2;
+		assert!(UNKNOWN_EVEN_TYPE % 2 == 0);
+
+		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
+
+		let mut encoded_offer = Vec::new();
+		offer.write(&mut encoded_offer).unwrap();
+		BigSize(UNKNOWN_EVEN_TYPE).write(&mut encoded_offer).unwrap();
+		BigSize(32).write(&mut encoded_offer).unwrap();
+		[42u8; 32].write(&mut encoded_offer).unwrap();
+
+		match Offer::try_from(encoded_offer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, Bolt12ParseError::Decode(DecodeError::UnknownRequiredFeature)),
+		}
+	}
+
+	#[test]
+	fn parses_offer_with_experimental_tlv_records() {
+		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
+
+		let mut encoded_offer = Vec::new();
+		offer.write(&mut encoded_offer).unwrap();
+		BigSize(EXPERIMENTAL_OFFER_TYPES.start + 1).write(&mut encoded_offer).unwrap();
+		BigSize(32).write(&mut encoded_offer).unwrap();
+		[42u8; 32].write(&mut encoded_offer).unwrap();
+
+		match Offer::try_from(encoded_offer.clone()) {
+			Ok(offer) => assert_eq!(offer.bytes, encoded_offer),
+			Err(e) => panic!("error parsing offer: {:?}", e),
+		}
+
+		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
+
+		let mut encoded_offer = Vec::new();
+		offer.write(&mut encoded_offer).unwrap();
+		BigSize(EXPERIMENTAL_OFFER_TYPES.start).write(&mut encoded_offer).unwrap();
+		BigSize(32).write(&mut encoded_offer).unwrap();
+		[42u8; 32].write(&mut encoded_offer).unwrap();
+
+		match Offer::try_from(encoded_offer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, Bolt12ParseError::Decode(DecodeError::UnknownRequiredFeature)),
+		}
+	}
+
+	#[test]
+	fn fails_parsing_offer_with_out_of_range_tlv_records() {
+		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
+
+		let mut encoded_offer = Vec::new();
+		offer.write(&mut encoded_offer).unwrap();
+		BigSize(OFFER_TYPES.end).write(&mut encoded_offer).unwrap();
 		BigSize(32).write(&mut encoded_offer).unwrap();
 		[42u8; 32].write(&mut encoded_offer).unwrap();
 
 		match Offer::try_from(encoded_offer) {
 			Ok(_) => panic!("expected error"),
 			Err(e) => assert_eq!(e, Bolt12ParseError::Decode(DecodeError::InvalidValue)),
+		}
+
+		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
+
+		let mut encoded_offer = Vec::new();
+		offer.write(&mut encoded_offer).unwrap();
+		BigSize(EXPERIMENTAL_OFFER_TYPES.end).write(&mut encoded_offer).unwrap();
+		BigSize(32).write(&mut encoded_offer).unwrap();
+		[42u8; 32].write(&mut encoded_offer).unwrap();
+
+		match Offer::try_from(encoded_offer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, Bolt12ParseError::Decode(DecodeError::InvalidValue)),
+		}
+	}
+}
+
+#[cfg(test)]
+mod currency_code_tests {
+	use super::CurrencyCode;
+
+	#[test]
+	fn creates_valid_currency_codes() {
+		let usd = CurrencyCode::new(*b"USD").unwrap();
+		assert_eq!(usd.as_str(), "USD");
+		assert_eq!(usd.as_bytes(), b"USD");
+
+		let eur = CurrencyCode::new(*b"EUR").unwrap();
+		assert_eq!(eur.as_str(), "EUR");
+		assert_eq!(eur.as_bytes(), b"EUR");
+	}
+
+	#[test]
+	fn rejects_invalid_utf8() {
+		let invalid_utf8 = [0xFF, 0xFE, 0xFD];
+		assert!(CurrencyCode::new(invalid_utf8).is_err());
+	}
+
+	#[test]
+	fn rejects_lowercase_letters() {
+		assert!(CurrencyCode::new(*b"usd").is_err());
+		assert!(CurrencyCode::new(*b"Eur").is_err());
+	}
+
+	#[test]
+	fn rejects_non_letters() {
+		assert!(CurrencyCode::new(*b"US1").is_err());
+		assert!(CurrencyCode::new(*b"U$D").is_err());
+	}
+
+	#[test]
+	fn from_str_validates_length() {
+		assert!("US".parse::<CurrencyCode>().is_err());
+		assert!("USDA".parse::<CurrencyCode>().is_err());
+
+		assert!("USD".parse::<CurrencyCode>().is_ok());
+	}
+
+	#[test]
+	fn works_with_real_currency_codes() {
+		let codes = ["USD", "EUR", "GBP", "JPY", "CNY"];
+
+		for code_str in &codes {
+			let code1 = CurrencyCode::new(code_str.as_bytes().try_into().unwrap()).unwrap();
+			let code2 = code_str.parse::<CurrencyCode>().unwrap();
+
+			assert_eq!(code1, code2);
+			assert_eq!(code1.as_str(), *code_str);
 		}
 	}
 }
@@ -1874,6 +2281,8 @@ mod bolt12_tests {
 	fn parses_bech32_encoded_offers() {
 		let offers = [
 			// Minimal bolt12 offer
+			"lno1zcss9mk8y3wkklfvevcrszlmu23kfrxh49px20665dqwmn4p72pksese",
+			// with description (but no amount)
 			"lno1pgx9getnwss8vetrw3hhyuckyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxg",
 
 			// for testnet
@@ -1918,11 +2327,17 @@ mod bolt12_tests {
 			// ... and with sciddir introduction node
 			"lno1pgx9getnwss8vetrw3hhyucs3yqqqqqqqqqqqqp2qgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqqyqqqqqqqqqqqqqqqqqqqqqqqqqqqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqqgzyg3zyg3zyg3z93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj",
 
-			// ... and with second blinded path via Carol (0x434343...), blinding 020202...
-			"lno1pgx9getnwss8vetrw3hhyucsl5q5yqeyv5l2cs6y3qqzesrth7mlzrlp3xg7xhulusczm04x6g6nms9trspqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqqsqqqqqqqqqqqqqqqqqqqqqqqqqqpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsqpqg3zyg3zyg3zygz0uc7h32x9s0aecdhxlk075kn046aafpuuyw8f5j652t3vha2yqrsyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsqzqqqqqqqqqqqqqqqqqqqqqqqqqqqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqqyzyg3zyg3zyg3zzcss9mk8y3wkklfvevcrszlmu23kfrxh49px20665dqwmn4p72pksese",
+			// with no issuer_id and blinded path via Bob (0x424242...), blinding 020202...
+			"lno1pgx9getnwss8vetrw3hhyucs5ypjgef743p5fzqq9nqxh0ah7y87rzv3ud0eleps9kl2d5348hq2k8qzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgqpqqqqqqqqqqqqqqqqqqqqqqqqqqqzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqqzq3zyg3zyg3zygs",
+
+			//... and with second blinded path via 1x2x3 (direction 1), blinding 020202...
+			"lno1pgx9getnwss8vetrw3hhyucsl5qj5qeyv5l2cs6y3qqzesrth7mlzrlp3xg7xhulusczm04x6g6nms9trspqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqqsqqqqqqqqqqqqqqqqqqqqqqqqqqpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsqpqg3zyg3zyg3zygpqqqqzqqqqgqqxqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqqgqqqqqqqqqqqqqqqqqqqqqqqqqqqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgqqsg3zyg3zyg3zygtzzqhwcuj966ma9n9nqwqtl032xeyv6755yeflt235pmww58egx6rxry",
 
 			// unknown odd field
 			"lno1pgx9getnwss8vetrw3hhyuckyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxfppf5x2mrvdamk7unvvs",
+
+			// unknown odd experimental field
+			"lno1pgx9getnwss8vetrw3hhyuckyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvx078wdv5gg2dpjkcmr0wahhymry",
 		];
 		for encoded_offer in &offers {
 			if let Err(e) = encoded_offer.parse::<Offer>() {
@@ -1935,7 +2350,8 @@ mod bolt12_tests {
 	fn fails_parsing_bech32_encoded_offers() {
 		// Malformed: fields out of order
 		assert_eq!(
-			"lno1zcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszpgz5znzfgdzs".parse::<Offer>(),
+			"lno1zcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszpgz5znzfgdzs"
+				.parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
 		);
 
@@ -1948,7 +2364,9 @@ mod bolt12_tests {
 		// Malformed: empty
 		assert_eq!(
 			"lno1".parse::<Offer>(),
-			Err(Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingSigningPubkey)),
+			Err(Bolt12ParseError::InvalidSemantics(
+				Bolt12SemanticError::MissingIssuerSigningPubkey
+			)),
 		);
 
 		// Malformed: truncated at type
@@ -1977,19 +2395,22 @@ mod bolt12_tests {
 
 		// Malformed: invalid offer_chains length
 		assert_eq!(
-			"lno1qgqszzs9g9xyjs69zcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz".parse::<Offer>(),
+			"lno1qgqszzs9g9xyjs69zcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz"
+				.parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::ShortRead)),
 		);
 
 		// Malformed: truncated currency UTF-8
 		assert_eq!(
-			"lno1qcqcqzs9g9xyjs69zcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz".parse::<Offer>(),
+			"lno1qcqcqzs9g9xyjs69zcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz"
+				.parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::ShortRead)),
 		);
 
 		// Malformed: invalid currency UTF-8
 		assert_eq!(
-			"lno1qcpgqsg2q4q5cj2rg5tzzqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqg".parse::<Offer>(),
+			"lno1qcpgqsg2q4q5cj2rg5tzzqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqg"
+				.parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::ShortRead)),
 		);
 
@@ -2007,7 +2428,8 @@ mod bolt12_tests {
 
 		// Malformed: truncated offer_paths
 		assert_eq!(
-			"lno1pgz5znzfgdz3qqgpzcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz".parse::<Offer>(),
+			"lno1pgz5znzfgdz3qqgpzcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz"
+				.parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::ShortRead)),
 		);
 
@@ -2043,25 +2465,40 @@ mod bolt12_tests {
 
 		// Malformed: truncated issuer UTF-8
 		assert_eq!(
-			"lno1pgz5znzfgdz3yqvqzcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz".parse::<Offer>(),
+			"lno1pgz5znzfgdz3yqvqzcssyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz"
+				.parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
 		);
 
 		// Malformed: invalid issuer UTF-8
 		assert_eq!(
-			"lno1pgz5znzfgdz3yq5qgytzzqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqg".parse::<Offer>(),
+			"lno1pgz5znzfgdz3yq5qgytzzqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqg"
+				.parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
 		);
 
-		// Malformed: invalid offer_node_id
+		// Malformed: invalid offer_issuer_id
 		assert_eq!(
-			"lno1pgz5znzfgdz3vggzqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvps".parse::<Offer>(),
+			"lno1pgz5znzfgdz3vggzqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvps"
+				.parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
 		);
 
 		// Contains type >= 80
 		assert_eq!(
 			"lno1pgz5znzfgdz3vggzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgp9qgr0u2xq4dh3kdevrf4zg6hx8a60jv0gxe0ptgyfc6xkryqqqqqqqq".parse::<Offer>(),
+			Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
+		);
+
+		// Contains type > 1999999999
+		assert_eq!(
+			"lno1pgz5znzfgdz3vggzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgp06ae4jsq9qgr0u2xq4dh3kdevrf4zg6hx8a60jv0gxe0ptgyfc6xkryqqqqqqqq".parse::<Offer>(),
+			Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
+		);
+
+		// Contains unknown even type (1000000002)
+		assert_eq!(
+			"lno1pgz5znzfgdz3vggzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgp06wu6egp9qgr0u2xq4dh3kdevrf4zg6hx8a60jv0gxe0ptgyfc6xkryqqqqqqqq".parse::<Offer>(),
 			Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
 		);
 
@@ -2078,10 +2515,18 @@ mod bolt12_tests {
 			Err(Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingDescription)),
 		);
 
-		// Missing offer_node_id"
+		// Missing offer_issuer_id
 		assert_eq!(
 			"lno1pgx9getnwss8vetrw3hhyuc".parse::<Offer>(),
-			Err(Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingSigningPubkey)),
+			Err(Bolt12ParseError::InvalidSemantics(
+				Bolt12SemanticError::MissingIssuerSigningPubkey
+			)),
+		);
+
+		// Second offer_path is empty
+		assert_eq!(
+			"lno1pgx9getnwss8vetrw3hhyucsespjgef743p5fzqq9nqxh0ah7y87rzv3ud0eleps9kl2d5348hq2k8qzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgqpqqqqqqqqqqqqqqqqqqqqqqqqqqqzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqqzq3zyg3zyg3zygszqqqqyqqqqsqqvpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsq".parse::<Offer>(),
+			Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
 		);
 	}
 }

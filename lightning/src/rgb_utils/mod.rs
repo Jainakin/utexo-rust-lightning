@@ -1,16 +1,16 @@
 //! A module to provide RGB functionality
 
-use crate::chain::transaction::OutPoint;
 use crate::ln::chan_utils::{
-	get_counterparty_payment_script, BuiltCommitmentTransaction, ClosingTransaction,
+	get_countersigner_payment_script, BuiltCommitmentTransaction, ClosingTransaction,
 	CommitmentTransaction, HTLCOutputInCommitment,
 };
-use crate::ln::channel::{ChannelContext, ChannelError};
+use crate::ln::channel::{ChannelContext, ChannelError, FundingScope};
 use crate::ln::channel_state::ChannelDetails;
 use crate::ln::channelmanager::MsgHandleErrInternal;
-use crate::ln::features::ChannelTypeFeatures;
-use crate::ln::types::{ChannelId, PaymentHash};
+use crate::ln::types::ChannelId;
 use crate::sign::SignerProvider;
+use crate::types::features::ChannelTypeFeatures;
+use crate::types::payment::PaymentHash;
 
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::hex::DisplayHex;
@@ -21,7 +21,7 @@ use rgb_lib::{
 	bitcoin::psbt::Psbt as RgbLibPsbt,
 	wallet::{
 		rust_only::{AssetColoringInfo, ColoringInfo},
-		DatabaseType, Outpoint, WalletData,
+		DatabaseType, WalletData,
 	},
 	AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
 	FileContent, RgbTransfer, RgbTransport, RgbTxid, Wallet, WitnessOrd,
@@ -236,7 +236,7 @@ fn _counterparty_output_index(
 	outputs: &[TxOut], channel_type_features: &ChannelTypeFeatures, payment_key: &PublicKey,
 ) -> Option<usize> {
 	let counterparty_payment_script =
-		get_counterparty_payment_script(channel_type_features, payment_key);
+		get_countersigner_payment_script(channel_type_features, payment_key);
 	outputs
 		.iter()
 		.enumerate()
@@ -256,14 +256,13 @@ pub fn is_tx_colored(tx: &Transaction) -> bool {
 
 /// Color commitment transaction
 pub(crate) fn color_commitment<SP: Deref>(
-	channel_context: &ChannelContext<SP>, commitment_transaction: &mut CommitmentTransaction,
-	counterparty: bool,
+	channel_context: &ChannelContext<SP>, funding_scope: &FundingScope,
+	commitment_transaction: &mut CommitmentTransaction, counterparty: bool,
 ) -> Result<(), ChannelError>
 where
 	<SP as std::ops::Deref>::Target: SignerProvider,
 {
 	let channel_id = &channel_context.channel_id;
-	let funding_outpoint = channel_context.channel_transaction_parameters.funding_outpoint.unwrap();
 	let ldk_data_dir = channel_context.ldk_data_dir.as_path();
 
 	let commitment_tx = commitment_transaction.clone().built.transaction;
@@ -277,8 +276,8 @@ where
 	let mut last_rgb_payment_info = None;
 	let mut output_map = HashMap::new();
 
-	for htlc in commitment_transaction.htlcs() {
-		if htlc.rgb_payment.map_or(true, |(_, a)| a == 0) {
+	for htlc in commitment_transaction.nondust_htlcs() {
+		if htlc.rgb_payment.is_none_or(|(_, a)| a == 0) {
 			continue;
 		}
 		let (_, htlc_amount_rgb) = htlc.rgb_payment.expect("this HTLC has RGB assets");
@@ -355,14 +354,14 @@ where
 		if counterparty { (local_amt, remote_amt) } else { (remote_amt, local_amt) };
 
 	let payment_point = if counterparty {
-		channel_context.get_holder_pubkeys().payment_point
+		funding_scope.get_holder_pubkeys().payment_point
 	} else {
-		channel_context.get_counterparty_pubkeys().payment_point
+		funding_scope.get_counterparty_pubkeys().payment_point
 	};
 
 	if let Some(vout_p2wpkh) = _counterparty_output_index(
 		&commitment_tx.output,
-		&channel_context.channel_type,
+		funding_scope.get_channel_type(),
 		&payment_point,
 	) {
 		output_map.insert(vout_p2wpkh as u32, vout_p2wpkh_amt);
@@ -420,7 +419,7 @@ where
 pub(crate) fn color_htlc(
 	htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitment, ldk_data_dir: &Path,
 ) -> Result<(), ChannelError> {
-	if htlc.rgb_payment.map_or(true, |(_, a)| a == 0) {
+	if htlc.rgb_payment.is_none_or(|(_, a)| a == 0) {
 		return Ok(());
 	}
 	let (_, htlc_amount_rgb) = htlc.rgb_payment.expect("this HTLC has RGB assets");
@@ -473,8 +472,7 @@ pub(crate) fn color_htlc(
 
 /// Color closing transaction
 pub(crate) fn color_closing(
-	channel_id: &ChannelId, funding_outpoint: &OutPoint,
-	closing_transaction: &mut ClosingTransaction, ldk_data_dir: &Path,
+	channel_id: &ChannelId, closing_transaction: &mut ClosingTransaction, ldk_data_dir: &Path,
 ) -> Result<(), ChannelError> {
 	let closing_tx = closing_transaction.clone().built;
 

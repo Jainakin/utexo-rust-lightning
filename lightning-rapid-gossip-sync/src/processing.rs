@@ -3,7 +3,6 @@ use core::ops::Deref;
 use core::sync::atomic::Ordering;
 
 use bitcoin::constants::ChainHash;
-use bitcoin::secp256k1::PublicKey;
 
 use lightning::io;
 use lightning::ln::msgs::{
@@ -22,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(all(not(feature = "std"), not(test)))]
 use alloc::{borrow::ToOwned, vec::Vec};
-use lightning::ln::features::NodeFeatures;
+use lightning::types::features::NodeFeatures;
 
 /// The purpose of this prefix is to identify the serialization format, should other rapid gossip
 /// sync formats arise in the future.
@@ -117,7 +116,7 @@ where
 		};
 
 		let node_id_count: u32 = Readable::read(read_cursor)?;
-		let mut node_ids: Vec<PublicKey> = Vec::with_capacity(core::cmp::min(
+		let mut node_ids: Vec<NodeId> = Vec::with_capacity(core::cmp::min(
 			node_id_count,
 			MAX_INITIAL_NODE_ID_VECTOR_CAPACITY,
 		) as usize);
@@ -154,9 +153,8 @@ where
 				let key_parity = node_detail_flag & 0b_0000_0011;
 				pubkey_bytes[0] = key_parity;
 
-				let current_pubkey = PublicKey::from_slice(&pubkey_bytes)?;
-				let current_node_id = NodeId::from_pubkey(&current_pubkey);
-				node_ids.push(current_pubkey);
+				let current_node_id = NodeId::from_slice(&pubkey_bytes)?;
+				node_ids.push(current_node_id);
 
 				if is_reminder || has_address_details || feature_detail_marker > 0 {
 					let mut synthetic_node_announcement = UnsignedNodeAnnouncement {
@@ -269,8 +267,26 @@ where
 				latest_seen_timestamp
 			);
 
+			let mut funding_sats: Option<u64> = None;
+
+			if version >= 2 && has_additional_data {
+				// forwards compatibility
+				let additional_data: Vec<u8> = Readable::read(read_cursor)?;
+				let mut cursor = &additional_data[..];
+				let funding_sats_read: BigSize = Readable::read(&mut cursor)?;
+				funding_sats = Some(funding_sats_read.0);
+				if !cursor.is_empty() {
+					log_gossip!(
+						self.logger,
+						"Ignoring {} bytes of additional data in channel announcement",
+						cursor.len()
+					);
+				}
+			}
+
 			let announcement_result = network_graph.add_channel_from_partial_announcement(
 				short_channel_id,
+				funding_sats,
 				backdated_timestamp as u64,
 				features,
 				node_id_1,
@@ -287,16 +303,6 @@ where
 					);
 					return Err(lightning_error.into());
 				}
-			}
-
-			if version >= 2 && has_additional_data {
-				// forwards compatibility
-				let additional_data: Vec<u8> = Readable::read(read_cursor)?;
-				log_gossip!(
-					self.logger,
-					"Ignoring {} bytes of additional data in channel announcement",
-					additional_data.len()
-				);
 			}
 		}
 
@@ -506,7 +512,7 @@ mod tests {
 		let logger = TestLogger::new();
 		let network_graph = NetworkGraph::new(Network::Bitcoin, &logger);
 
-		let example_input = vec![
+		let example_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 227, 98, 218,
 			0, 0, 0, 4, 2, 22, 7, 207, 206, 25, 164, 197, 231, 230, 231, 56, 102, 61, 250, 251,
@@ -537,7 +543,7 @@ mod tests {
 		let logger = TestLogger::new();
 		let network_graph = NetworkGraph::new(Network::Bitcoin, &logger);
 
-		let example_input = vec![
+		let example_input = [
 			76, 68, 75, 2, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 102, 97, 206, 240,
 			0, 0, 0, 0, 2, 63, 27, 132, 197, 86, 123, 18, 100, 64, 153, 93, 62, 213, 170, 186, 5,
@@ -600,7 +606,7 @@ mod tests {
 		let network_graph = NetworkGraph::new(Network::Bitcoin, &logger);
 		let rapid_sync = RapidGossipSync::new(&network_graph, &logger);
 
-		let example_input = vec![
+		let example_input = [
 			76, 68, 75, 2, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 102, 105, 183,
 			240, 0, 0, 0, 0, 1, 63, 27, 132, 197, 86, 123, 18, 100, 64, 153, 93, 62, 213, 170, 186,
@@ -628,7 +634,7 @@ mod tests {
 		let network_graph = NetworkGraph::new(Network::Bitcoin, &logger);
 		let rapid_sync = RapidGossipSync::new(&network_graph, &logger);
 
-		let example_input = vec![
+		let example_input = [
 			76, 68, 75, 2, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 102, 106, 12, 80,
 			1, 0, 2, 23, 48, 0, 0, 0, 3, 143, 27, 132, 197, 86, 123, 18, 100, 64, 153, 93, 62, 213,
@@ -667,7 +673,7 @@ mod tests {
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-			0, 0, 0, 1, 0, 0, 1, 0, 255, 128, 0, 0, 0, 0, 0, 0, 1, 0, 147, 23, 23, 23, 23, 23, 23,
+			0, 0, 0, 1, 0, 0, 1, 0, 255, 128, 0, 0, 0, 0, 0, 0, 1, 0, 147, 42, 23, 23, 23, 23, 23,
 			23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
 			23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
 			23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
@@ -688,9 +694,11 @@ mod tests {
 			"Ignoring 255 bytes of additional data in node announcement",
 			3,
 		);
+		// Note that our extra data is 147 bytes long, but the first byte (42) is read as the
+		// channel's funding amount (as a BigSize).
 		logger.assert_log_contains(
 			"lightning_rapid_gossip_sync::processing",
-			"Ignoring 147 bytes of additional data in channel announcement",
+			"Ignoring 146 bytes of additional data in channel announcement",
 			1,
 		);
 		logger.assert_log_contains(
@@ -703,7 +711,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	fn incremental_only_update_ignores_missing_channel() {
-		let incremental_update_input = vec![
+		let incremental_update_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 229, 183, 167,
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -724,7 +732,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	fn incremental_only_update_fails_without_prior_updates() {
-		let announced_update_input = vec![
+		let announced_update_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 229, 183, 167,
 			0, 0, 0, 4, 2, 22, 7, 207, 206, 25, 164, 197, 231, 230, 231, 56, 102, 61, 250, 251,
@@ -752,7 +760,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	fn incremental_only_update_fails_without_prior_same_direction_updates() {
-		let initialization_input = vec![
+		let initialization_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 227, 98, 218,
 			0, 0, 0, 4, 2, 22, 7, 207, 206, 25, 164, 197, 231, 230, 231, 56, 102, 61, 250, 251,
@@ -792,7 +800,7 @@ mod tests {
 		assert!(initialized.contains("619737530008010752"));
 		assert!(initialized.contains("783241506229452801"));
 
-		let opposite_direction_incremental_update_input = vec![
+		let opposite_direction_incremental_update_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 229, 183, 167,
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -805,7 +813,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	fn incremental_update_succeeds_with_prior_announcements_and_full_updates() {
-		let initialization_input = vec![
+		let initialization_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 227, 98, 218,
 			0, 0, 0, 4, 2, 22, 7, 207, 206, 25, 164, 197, 231, 230, 231, 56, 102, 61, 250, 251,
@@ -832,7 +840,7 @@ mod tests {
 		let initialization_result = rapid_sync.update_network_graph(&initialization_input[..]);
 		assert!(initialization_result.is_ok());
 
-		let single_direction_incremental_update_input = vec![
+		let single_direction_incremental_update_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 229, 183, 167,
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -866,7 +874,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	fn update_succeeds_when_duplicate_gossip_is_applied() {
-		let initialization_input = vec![
+		let initialization_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 227, 98, 218,
 			0, 0, 0, 4, 2, 22, 7, 207, 206, 25, 164, 197, 231, 230, 231, 56, 102, 61, 250, 251,
@@ -893,7 +901,7 @@ mod tests {
 		let initialization_result = rapid_sync.update_network_graph(&initialization_input[..]);
 		assert!(initialization_result.is_ok());
 
-		let single_direction_incremental_update_input = vec![
+		let single_direction_incremental_update_input = [
 			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 229, 183, 167,
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1026,7 +1034,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	pub fn update_fails_with_unknown_version() {
-		let unknown_version_input = vec![
+		let unknown_version_input = [
 			76, 68, 75, 3, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
 			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 227, 98, 218,
 			0, 0, 0, 4, 2, 22, 7, 207, 206, 25, 164, 197, 231, 230, 231, 56, 102, 61, 250, 251,

@@ -15,14 +15,12 @@ use bitcoin::secp256k1::PublicKey;
 
 use crate::chain::chaininterface::{FeeEstimator, LowerBoundedFeeEstimator};
 use crate::chain::transaction::OutPoint;
-use crate::io;
-use crate::ln::channel::ChannelContext;
-use crate::ln::features::{ChannelTypeFeatures, InitFeatures};
-use crate::ln::msgs::DecodeError;
-use crate::ln::types::{ChannelId, PaymentHash};
+use crate::ln::channel::Channel;
+use crate::ln::types::ChannelId;
 use crate::sign::SignerProvider;
+use crate::types::features::{ChannelTypeFeatures, InitFeatures};
+use crate::types::payment::PaymentHash;
 use crate::util::config::ChannelConfig;
-use crate::util::ser::{Readable, Writeable, Writer};
 
 use core::ops::Deref;
 
@@ -277,14 +275,19 @@ impl_writeable_tlv_based!(ChannelCounterparty, {
 /// [`ChannelMonitor::get_claimable_balances`], calculated with respect to the corresponding on-chain
 /// transactions.
 ///
+/// When a channel is spliced, most fields continue to refer to the original pre-splice channel
+/// state until the splice transaction reaches sufficient confirmations to be locked (and we
+/// exchange `splice_locked` messages with our peer). See individual fields for details.
+///
 /// [`ChannelManager::list_channels`]: crate::ln::channelmanager::ChannelManager::list_channels
 /// [`ChannelManager::list_usable_channels`]: crate::ln::channelmanager::ChannelManager::list_usable_channels
 /// [`ChainMonitor::get_claimable_balances`]: crate::chain::chainmonitor::ChainMonitor::get_claimable_balances
 /// [`ChannelMonitor::get_claimable_balances`]: crate::chain::channelmonitor::ChannelMonitor::get_claimable_balances
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelDetails {
-	/// The channel's ID (prior to funding transaction generation, this is a random 32 bytes,
-	/// thereafter this is the txid of the funding transaction xor the funding transaction output).
+	/// The channel's ID (prior to initial channel setup this is a random 32 bytes, thereafter it is
+	/// derived from channel funding or key material).
+	///
 	/// Note that this means this value is *not* persistent - it can change once during the
 	/// lifetime of the channel.
 	pub channel_id: ChannelId,
@@ -292,10 +295,18 @@ pub struct ChannelDetails {
 	pub counterparty: ChannelCounterparty,
 	/// The Channel's funding transaction output, if we've negotiated the funding transaction with
 	/// our counterparty already.
+	///
+	/// When a channel is spliced, this continues to refer to the original pre-splice channel
+	/// state until the splice transaction reaches sufficient confirmations to be locked (and we
+	/// exchange `splice_locked` messages with our peer).
 	pub funding_txo: Option<OutPoint>,
 	/// The features which this channel operates with. See individual features for more info.
 	///
 	/// `None` until negotiation completes and the channel type is finalized.
+	///
+	/// When a channel is spliced, this continues to refer to the original pre-splice channel
+	/// state until the splice transaction reaches sufficient confirmations to be locked (and we
+	/// exchange `splice_locked` messages with our peer).
 	pub channel_type: Option<ChannelTypeFeatures>,
 	/// The position of the funding transaction in the chain. None if the funding transaction has
 	/// not yet been confirmed and the channel fully opened.
@@ -305,6 +316,10 @@ pub struct ChannelDetails {
 	///
 	/// For channels with [`confirmations_required`] set to `Some(0)`, [`outbound_scid_alias`] may
 	/// be used in place of this in outbound routes. See [`get_outbound_payment_scid`].
+	///
+	/// When a channel is spliced, this continues to refer to the original pre-splice channel
+	/// state until the splice transaction reaches sufficient confirmations to be locked (and we
+	/// exchange `splice_locked` messages with our peer).
 	///
 	/// [`inbound_scid_alias`]: Self::inbound_scid_alias
 	/// [`outbound_scid_alias`]: Self::outbound_scid_alias
@@ -318,6 +333,10 @@ pub struct ChannelDetails {
 	/// `Some(0)`).
 	///
 	/// This will be `None` as long as the channel is not available for routing outbound payments.
+	///
+	/// When a channel is spliced, this continues to refer to the original pre-splice channel
+	/// state until the splice transaction reaches sufficient confirmations to be locked (and we
+	/// exchange `splice_locked` messages with our peer).
 	///
 	/// [`short_channel_id`]: Self::short_channel_id
 	/// [`confirmations_required`]: Self::confirmations_required
@@ -333,6 +352,10 @@ pub struct ChannelDetails {
 	/// [`short_channel_id`]: Self::short_channel_id
 	pub inbound_scid_alias: Option<u64>,
 	/// The value, in satoshis, of this channel as appears in the funding output
+	///
+	/// When a channel is spliced, this continues to refer to the original pre-splice channel
+	/// state until the splice transaction reaches sufficient confirmations to be locked (and we
+	/// exchange `splice_locked` messages with our peer).
 	pub channel_value_satoshis: u64,
 	/// The value, in satoshis, that must always be held in the channel for us. This value ensures
 	/// that if we broadcast a revoked state, our counterparty can punish us by claiming at least
@@ -359,24 +382,10 @@ pub struct ChannelDetails {
 	///
 	/// This value will be `None` for objects serialized with LDK versions prior to 0.0.115.
 	pub feerate_sat_per_1000_weight: Option<u32>,
-	/// Our total balance.  This is the amount we would get if we close the channel.
-	/// This value is not exact. Due to various in-flight changes and feerate changes, exactly this
-	/// amount is not likely to be recoverable on close.
-	///
-	/// This does not include any pending HTLCs which are not yet fully resolved (and, thus, whose
-	/// balance is not available for inclusion in new outbound HTLCs). This further does not include
-	/// any pending outgoing HTLCs which are awaiting some other resolution to be sent.
-	/// This does not consider any on-chain fees.
-	///
-	/// See also [`ChannelDetails::outbound_capacity_msat`]
-	#[deprecated(since = "0.0.124", note = "use [`ChainMonitor::get_claimable_balances`] instead")]
-	pub balance_msat: u64,
 	/// The available outbound capacity for sending HTLCs to the remote peer. This does not include
 	/// any pending HTLCs which are not yet fully resolved (and, thus, whose balance is not
 	/// available for inclusion in new outbound HTLCs). This further does not include any pending
 	/// outgoing HTLCs which are awaiting some other resolution to be sent.
-	///
-	/// See also [`ChannelDetails::balance_msat`]
 	///
 	/// This value is not exact. Due to various in-flight changes, feerate changes, and our
 	/// conflict-avoidance policy, exactly this amount is not likely to be spendable. However, we
@@ -387,8 +396,8 @@ pub struct ChannelDetails {
 	/// the current state and per-HTLC limit(s). This is intended for use when routing, allowing us
 	/// to use a limit as close as possible to the HTLC limit we can currently send.
 	///
-	/// See also [`ChannelDetails::next_outbound_htlc_minimum_msat`],
-	/// [`ChannelDetails::balance_msat`], and [`ChannelDetails::outbound_capacity_msat`].
+	/// See also [`ChannelDetails::next_outbound_htlc_minimum_msat`] and
+	/// [`ChannelDetails::outbound_capacity_msat`].
 	pub next_outbound_htlc_limit_msat: u64,
 	/// The minimum value for sending a single HTLC to the remote peer. This is the equivalent of
 	/// [`ChannelDetails::next_outbound_htlc_limit_msat`] but represents a lower-bound, rather than
@@ -466,6 +475,15 @@ pub struct ChannelDetails {
 	///
 	/// This field is empty for objects serialized with LDK versions prior to 0.0.122.
 	pub pending_outbound_htlcs: Vec<OutboundHTLCDetails>,
+	/// The witness script that is used to lock the channel's funding output to commitment
+	/// transactions.
+	///
+	/// When a channel is spliced, this continues to refer to the original funding output (which
+	/// was spent by the splice transaction) until the splice transaction reached sufficient
+	/// confirmations to be locked (and we exchange `splice_locked` messages with our peer).
+	///
+	/// This field will be `None` for objects serialized with LDK versions prior to 0.2.0.
+	pub funding_redeem_script: Option<bitcoin::ScriptBuf>,
 
 	/// The available outbound RGB capacity for sending a single HTLC to the remote peer.
 	pub next_outbound_htlc_limit_rgb: u64,
@@ -497,17 +515,34 @@ impl ChannelDetails {
 		self.short_channel_id.or(self.outbound_scid_alias)
 	}
 
-	pub(super) fn from_channel_context<SP: Deref, F: Deref>(
-		context: &ChannelContext<SP>, best_block_height: u32, latest_features: InitFeatures,
+	/// Gets the funding output for this channel, if available.
+	///
+	/// When a channel is spliced, this continues to refer to the original funding output (which
+	/// was spent by the splice transaction) until the splice transaction reaches sufficient
+	/// confirmations to be locked (and we exchange `splice_locked` messages with our peer).
+	pub fn get_funding_output(&self) -> Option<bitcoin::TxOut> {
+		match self.funding_redeem_script.as_ref() {
+			None => None,
+			Some(redeem_script) => Some(bitcoin::TxOut {
+				value: bitcoin::Amount::from_sat(self.channel_value_satoshis),
+				script_pubkey: redeem_script.to_p2wsh(),
+			}),
+		}
+	}
+
+	pub(super) fn from_channel<SP: Deref, F: Deref>(
+		channel: &Channel<SP>, best_block_height: u32, latest_features: InitFeatures,
 		fee_estimator: &LowerBoundedFeeEstimator<F>,
 	) -> Self
 	where
 		SP::Target: SignerProvider,
 		F::Target: FeeEstimator,
 	{
-		let balance = context.get_available_balances(fee_estimator);
+		let context = channel.context();
+		let funding = channel.funding();
+		let balance = channel.get_available_balances(fee_estimator);
 		let (to_remote_reserve_satoshis, to_self_reserve_satoshis) =
-			context.get_holder_counterparty_selected_channel_reserve_satoshis();
+			funding.get_holder_counterparty_selected_channel_reserve_satoshis();
 		#[allow(deprecated)] // TODO: Remove once balance_msat is removed.
 		ChannelDetails {
 			channel_id: context.channel_id(),
@@ -526,177 +561,95 @@ impl ChannelDetails {
 				} else {
 					None
 				},
-				outbound_htlc_maximum_msat: context.get_counterparty_htlc_maximum_msat(),
+				outbound_htlc_maximum_msat: context.get_counterparty_htlc_maximum_msat(funding),
 			},
-			funding_txo: context.get_funding_txo(),
+			funding_txo: funding.get_funding_txo(),
+			funding_redeem_script: funding
+				.channel_transaction_parameters
+				.make_funding_redeemscript_opt(),
 			// Note that accept_channel (or open_channel) is always the first message, so
 			// `have_received_message` indicates that type negotiation has completed.
 			channel_type: if context.have_received_message() {
-				Some(context.get_channel_type().clone())
+				Some(funding.get_channel_type().clone())
 			} else {
 				None
 			},
-			short_channel_id: context.get_short_channel_id(),
+			short_channel_id: funding.get_short_channel_id(),
 			outbound_scid_alias: if context.is_usable() {
 				Some(context.outbound_scid_alias())
 			} else {
 				None
 			},
 			inbound_scid_alias: context.latest_inbound_scid_alias(),
-			channel_value_satoshis: context.get_value_satoshis(),
+			channel_value_satoshis: funding.get_value_satoshis(),
 			feerate_sat_per_1000_weight: Some(context.get_feerate_sat_per_1000_weight()),
 			unspendable_punishment_reserve: to_self_reserve_satoshis,
-			balance_msat: balance.balance_msat,
 			inbound_capacity_msat: balance.inbound_capacity_msat,
 			outbound_capacity_msat: balance.outbound_capacity_msat,
 			next_outbound_htlc_limit_msat: balance.next_outbound_htlc_limit_msat,
 			next_outbound_htlc_minimum_msat: balance.next_outbound_htlc_minimum_msat,
 			user_channel_id: context.get_user_id(),
-			confirmations_required: context.minimum_depth(),
-			confirmations: Some(context.get_funding_tx_confirmations(best_block_height)),
-			force_close_spend_delay: context.get_counterparty_selected_contest_delay(),
-			is_outbound: context.is_outbound(),
+			confirmations_required: channel.minimum_depth(),
+			confirmations: Some(funding.get_funding_tx_confirmations(best_block_height)),
+			force_close_spend_delay: funding.get_counterparty_selected_contest_delay(),
+			is_outbound: funding.is_outbound(),
 			is_channel_ready: context.is_usable(),
 			is_usable: context.is_live(),
 			is_announced: context.should_announce(),
 			inbound_htlc_minimum_msat: Some(context.get_holder_htlc_minimum_msat()),
-			inbound_htlc_maximum_msat: context.get_holder_htlc_maximum_msat(),
+			inbound_htlc_maximum_msat: context.get_holder_htlc_maximum_msat(funding),
 			config: Some(context.config()),
 			channel_shutdown_state: Some(context.shutdown_state()),
-			pending_inbound_htlcs: context.get_pending_inbound_htlc_details(),
-			pending_outbound_htlcs: context.get_pending_outbound_htlc_details(),
+			pending_inbound_htlcs: context.get_pending_inbound_htlc_details(funding),
+			pending_outbound_htlcs: context.get_pending_outbound_htlc_details(funding),
 			next_outbound_htlc_limit_rgb: context.get_local_rgb_amount(),
 			inbound_htlc_maximum_rgb: context.get_remote_rgb_amount(),
 		}
 	}
 }
 
-impl Writeable for ChannelDetails {
-	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
-		// `user_channel_id` used to be a single u64 value. In order to remain backwards compatible with
-		// versions prior to 0.0.113, the u128 is serialized as two separate u64 values.
-		let user_channel_id_low = self.user_channel_id as u64;
-		let user_channel_id_high_opt = Some((self.user_channel_id >> 64) as u64);
-		#[allow(deprecated)] // TODO: Remove once balance_msat is removed.
-		{
-			write_tlv_fields!(writer, {
-				(1, self.inbound_scid_alias, option),
-				(2, self.channel_id, required),
-				(3, self.channel_type, option),
-				(4, self.counterparty, required),
-				(5, self.outbound_scid_alias, option),
-				(6, self.funding_txo, option),
-				(7, self.config, option),
-				(8, self.short_channel_id, option),
-				(9, self.confirmations, option),
-				(10, self.channel_value_satoshis, required),
-				(12, self.unspendable_punishment_reserve, option),
-				(14, user_channel_id_low, required),
-				(16, self.balance_msat, required),
-				(18, self.outbound_capacity_msat, required),
-				(19, self.next_outbound_htlc_limit_msat, required),
-				(20, self.inbound_capacity_msat, required),
-				(21, self.next_outbound_htlc_minimum_msat, required),
-				(22, self.confirmations_required, option),
-				(24, self.force_close_spend_delay, option),
-				(26, self.is_outbound, required),
-				(28, self.is_channel_ready, required),
-				(30, self.is_usable, required),
-				(32, self.is_announced, required),
-				(33, self.inbound_htlc_minimum_msat, option),
-				(35, self.inbound_htlc_maximum_msat, option),
-				(37, user_channel_id_high_opt, option),
-				(39, self.feerate_sat_per_1000_weight, option),
-				(41, self.channel_shutdown_state, option),
-				(43, self.pending_inbound_htlcs, optional_vec),
-				(45, self.pending_outbound_htlcs, optional_vec),
-			});
-		}
-		Ok(())
-	}
-}
-
-impl Readable for ChannelDetails {
-	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
-		_init_and_read_len_prefixed_tlv_fields!(reader, {
-			(1, inbound_scid_alias, option),
-			(2, channel_id, required),
-			(3, channel_type, option),
-			(4, counterparty, required),
-			(5, outbound_scid_alias, option),
-			(6, funding_txo, option),
-			(7, config, option),
-			(8, short_channel_id, option),
-			(9, confirmations, option),
-			(10, channel_value_satoshis, required),
-			(12, unspendable_punishment_reserve, option),
-			(14, user_channel_id_low, required),
-			(16, balance_msat, required),
-			(18, outbound_capacity_msat, required),
-			// Note that by the time we get past the required read above, outbound_capacity_msat will be
-			// filled in, so we can safely unwrap it here.
-			(19, next_outbound_htlc_limit_msat, (default_value, outbound_capacity_msat.0.unwrap() as u64)),
-			(20, inbound_capacity_msat, required),
-			(21, next_outbound_htlc_minimum_msat, (default_value, 0)),
-			(22, confirmations_required, option),
-			(24, force_close_spend_delay, option),
-			(26, is_outbound, required),
-			(28, is_channel_ready, required),
-			(30, is_usable, required),
-			(32, is_announced, required),
-			(33, inbound_htlc_minimum_msat, option),
-			(35, inbound_htlc_maximum_msat, option),
-			(37, user_channel_id_high_opt, option),
-			(39, feerate_sat_per_1000_weight, option),
-			(41, channel_shutdown_state, option),
-			(43, pending_inbound_htlcs, optional_vec),
-			(45, pending_outbound_htlcs, optional_vec),
-			(46, next_outbound_htlc_limit_rgb, required),
-			(48, inbound_htlc_maximum_rgb, required),
-		});
-
-		// `user_channel_id` used to be a single u64 value. In order to remain backwards compatible with
-		// versions prior to 0.0.113, the u128 is serialized as two separate u64 values.
-		let user_channel_id_low: u64 = user_channel_id_low.0.unwrap();
-		let user_channel_id = user_channel_id_low as u128
-			+ ((user_channel_id_high_opt.unwrap_or(0 as u64) as u128) << 64);
-
-		#[allow(deprecated)] // TODO: Remove once balance_msat is removed.
-		Ok(Self {
-			inbound_scid_alias,
-			channel_id: channel_id.0.unwrap(),
-			channel_type,
-			counterparty: counterparty.0.unwrap(),
-			outbound_scid_alias,
-			funding_txo,
-			config,
-			short_channel_id,
-			channel_value_satoshis: channel_value_satoshis.0.unwrap(),
-			unspendable_punishment_reserve,
-			user_channel_id,
-			balance_msat: balance_msat.0.unwrap(),
-			outbound_capacity_msat: outbound_capacity_msat.0.unwrap(),
-			next_outbound_htlc_limit_msat: next_outbound_htlc_limit_msat.0.unwrap(),
-			next_outbound_htlc_minimum_msat: next_outbound_htlc_minimum_msat.0.unwrap(),
-			inbound_capacity_msat: inbound_capacity_msat.0.unwrap(),
-			confirmations_required,
-			confirmations,
-			force_close_spend_delay,
-			is_outbound: is_outbound.0.unwrap(),
-			is_channel_ready: is_channel_ready.0.unwrap(),
-			is_usable: is_usable.0.unwrap(),
-			is_announced: is_announced.0.unwrap(),
-			inbound_htlc_minimum_msat,
-			inbound_htlc_maximum_msat,
-			feerate_sat_per_1000_weight,
-			channel_shutdown_state,
-			pending_inbound_htlcs: pending_inbound_htlcs.unwrap_or(Vec::new()),
-			pending_outbound_htlcs: pending_outbound_htlcs.unwrap_or(Vec::new()),
-			next_outbound_htlc_limit_rgb: next_outbound_htlc_limit_rgb.0.unwrap(),
-			inbound_htlc_maximum_rgb: inbound_htlc_maximum_rgb.0.unwrap(),
-		})
-	}
-}
+impl_writeable_tlv_based!(ChannelDetails, {
+	(1, inbound_scid_alias, option),
+	(2, channel_id, required),
+	(3, channel_type, option),
+	(4, counterparty, required),
+	(5, outbound_scid_alias, option),
+	(6, funding_txo, option),
+	(7, config, option),
+	(8, short_channel_id, option),
+	(9, confirmations, option),
+	(10, channel_value_satoshis, required),
+	(12, unspendable_punishment_reserve, option),
+	// Note that _user_channel_id_low is used below, but rustc warns anyway
+	(14, _user_channel_id_low, (legacy, u64,
+		|us: &ChannelDetails| Some(us.user_channel_id as u64))),
+	(16, _balance_msat, (legacy, u64, |us: &ChannelDetails| Some(us.next_outbound_htlc_limit_msat))),
+	(18, outbound_capacity_msat, required),
+	(19, next_outbound_htlc_limit_msat, (default_value, outbound_capacity_msat)),
+	(20, inbound_capacity_msat, required),
+	(21, next_outbound_htlc_minimum_msat, (default_value, 0)),
+	(22, confirmations_required, option),
+	(24, force_close_spend_delay, option),
+	(26, is_outbound, required),
+	(28, is_channel_ready, required),
+	(30, is_usable, required),
+	(32, is_announced, required),
+	(33, inbound_htlc_minimum_msat, option),
+	(35, inbound_htlc_maximum_msat, option),
+	// Note that _user_channel_id_high is used below, but rustc warns anyway
+	(37, _user_channel_id_high, (legacy, u64,
+		|us: &ChannelDetails| Some((us.user_channel_id >> 64) as u64))),
+	(39, feerate_sat_per_1000_weight, option),
+	(41, channel_shutdown_state, option),
+	(43, pending_inbound_htlcs, optional_vec),
+	(45, pending_outbound_htlcs, optional_vec),
+	(47, funding_redeem_script, option),
+	(_unused, user_channel_id, (static_value,
+		_user_channel_id_low.unwrap_or(0) as u128 | ((_user_channel_id_high.unwrap_or(0) as u128) << 64)
+	)),
+	(48, next_outbound_htlc_limit_rgb, required),
+	(50, inbound_htlc_maximum_rgb, required),
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Further information on the details of the channel shutdown.
@@ -737,6 +690,7 @@ mod tests {
 	use crate::{
 		chain::transaction::OutPoint,
 		ln::{
+			chan_utils::make_funding_redeemscript,
 			channel_state::{
 				InboundHTLCDetails, InboundHTLCStateDetails, OutboundHTLCDetails,
 				OutboundHTLCStateDetails,
@@ -768,13 +722,16 @@ mod tests {
 				txid: bitcoin::Txid::from_slice(&[0; 32]).unwrap(),
 				index: 1,
 			}),
+			funding_redeem_script: Some(make_funding_redeemscript(
+				&PublicKey::from_slice(&[2; 33]).unwrap(),
+				&PublicKey::from_slice(&[2; 33]).unwrap(),
+			)),
 			channel_type: None,
 			short_channel_id: None,
 			outbound_scid_alias: None,
 			inbound_scid_alias: None,
 			channel_value_satoshis: 50_100,
 			user_channel_id: (u64::MAX as u128) + 1, // Gets us into the high bytes
-			balance_msat: 23_100,
 			outbound_capacity_msat: 24_300,
 			next_outbound_htlc_limit_msat: 20_000,
 			next_outbound_htlc_minimum_msat: 132,

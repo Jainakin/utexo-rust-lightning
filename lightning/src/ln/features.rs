@@ -7,31 +7,23 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-//! Feature flag definitions for the Lightning protocol according to [BOLT #9].
-//!
-//! See [`lightning_types::features`] for the list of features currently supported.
-//!
-//! Note that the use of types via this module is deprecated and will be removed in a future
-//! version. Instead, use feature objects via [`lightning::types::features`].
-//!
-//! [`lightning::types::features`]: crate::types::features
-//! [BOLT #9]: https://github.com/lightning/bolts/blob/master/09-features.md
+//! Implementations of extensions on features.
 
-pub use lightning_types::features::Features;
-pub use lightning_types::features::{InitFeatures, NodeFeatures, ChannelFeatures};
-pub use lightning_types::features::{Bolt11InvoiceFeatures, OfferFeatures, InvoiceRequestFeatures};
-pub use lightning_types::features::{Bolt12InvoiceFeatures, BlindedHopFeatures};
-pub use lightning_types::features::ChannelTypeFeatures;
+use lightning_types::features::ChannelTypeFeatures;
+use lightning_types::features::{BlindedHopFeatures, Bolt12InvoiceFeatures};
+use lightning_types::features::{Bolt11InvoiceFeatures, InvoiceRequestFeatures, OfferFeatures};
+use lightning_types::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 
 #[allow(unused_imports)]
 use crate::prelude::*;
 
-use crate::{io, io_extras};
 use crate::ln::msgs::DecodeError;
-use crate::util::ser::{Writer, Readable, Writeable, WithoutLength};
+use crate::util::ser::{Readable, WithoutLength, Writeable, Writer};
+use crate::{io, io_extras};
 
 fn write_be<W: Writer>(w: &mut W, le_flags: &[u8]) -> Result<(), io::Error> {
-	for f in le_flags.iter().rev() { // Swap back to big-endian
+	// Swap back to big-endian
+	for f in le_flags.iter().rev() {
 		f.write(w)?;
 	}
 	Ok(())
@@ -51,7 +43,7 @@ macro_rules! impl_feature_len_prefixed_write {
 				Ok(Self::from_be_bytes(Vec::<u8>::read(r)?))
 			}
 		}
-	}
+	};
 }
 impl_feature_len_prefixed_write!(InitFeatures);
 impl_feature_len_prefixed_write!(ChannelFeatures);
@@ -73,7 +65,7 @@ macro_rules! impl_feature_tlv_write {
 				Ok(WithoutLength::<Self>::read(r)?.0)
 			}
 		}
-	}
+	};
 }
 
 impl_feature_tlv_write!(ChannelTypeFeatures);
@@ -95,7 +87,7 @@ macro_rules! impl_feature_write_without_length {
 				Ok(WithoutLength($features::from_be_bytes(v)))
 			}
 		}
-	}
+	};
 }
 
 impl_feature_write_without_length!(Bolt12InvoiceFeatures);

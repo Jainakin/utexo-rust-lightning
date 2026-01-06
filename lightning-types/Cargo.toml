@@ -1,9 +1,10 @@
 [package]
 name = "lightning-types"
-version = "0.1.0"
+version = "0.3.0"
 authors = ["Matt Corallo"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lightningdevkit/rust-lightning/"
+readme = "../README.md"
 description = """
 Basic types which are used in the lightning network
 """
@@ -17,9 +18,6 @@ _test_utils = []
 
 [dependencies]
 bitcoin = { version = "0.32.2", default-features = false }
-# TODO: Once we switch to bitcoin 0.32 drop this explicit dep:
-hex-conservative = { version = "0.2", default-features = false }
-bech32 = { version = "0.9", default-features = false }
 
 [lints]
 workspace = true

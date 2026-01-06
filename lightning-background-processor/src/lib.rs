@@ -1,12 +1,19 @@
-//! Utilities that take care of tasks that (1) need to happen periodically to keep Rust-Lightning
-//! running properly, and (2) either can or should be run in the background. See docs for
-//! [`BackgroundProcessor`] for more details on the nitty-gritty.
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
+//! Utilities that take care of tasks that (1) need to happen periodically to keep Rust-Lightning
+//! running properly, and (2) either can or should be run in the background.
+#![cfg_attr(feature = "std", doc = "See docs for [`BackgroundProcessor`] for more details.")]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::private_intra_doc_links)]
 #![deny(missing_docs)]
-#![cfg_attr(not(feature = "futures"), deny(unsafe_code))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 
 #[cfg(any(test, feature = "std"))]
@@ -19,6 +26,10 @@ extern crate alloc;
 extern crate lightning;
 extern crate lightning_rapid_gossip_sync;
 
+mod fwd_batch;
+
+use fwd_batch::BatchDelay;
+
 use lightning::chain;
 use lightning::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use lightning::chain::chainmonitor::{ChainMonitor, Persist};
@@ -26,9 +37,9 @@ use lightning::chain::chainmonitor::{ChainMonitor, Persist};
 use lightning::events::EventHandler;
 #[cfg(feature = "std")]
 use lightning::events::EventsProvider;
-#[cfg(feature = "futures")]
 use lightning::events::ReplayEvent;
 use lightning::events::{Event, PathFailure};
+use lightning::util::ser::Writeable;
 
 use lightning::ln::channelmanager::AChannelManager;
 use lightning::ln::msgs::OnionMessageHandler;
@@ -37,11 +48,25 @@ use lightning::onion_message::messenger::AOnionMessenger;
 use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
 use lightning::routing::scoring::{ScoreUpdate, WriteableScore};
 use lightning::routing::utxo::UtxoLookup;
+use lightning::sign::{
+	ChangeDestinationSource, ChangeDestinationSourceSync, EntropySource, OutputSpender,
+};
 use lightning::util::logger::Logger;
-use lightning::util::persist::Persister;
+use lightning::util::persist::{
+	KVStore, KVStoreSync, KVStoreSyncWrapper, CHANNEL_MANAGER_PERSISTENCE_KEY,
+	CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+	NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE, SCORER_PERSISTENCE_KEY,
+	SCORER_PERSISTENCE_PRIMARY_NAMESPACE, SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+};
+use lightning::util::sweep::{OutputSweeper, OutputSweeperSync};
 #[cfg(feature = "std")]
 use lightning::util::wakers::Sleeper;
 use lightning_rapid_gossip_sync::RapidGossipSync;
+
+use lightning_liquidity::ALiquidityManager;
+#[cfg(feature = "std")]
+use lightning_liquidity::ALiquidityManagerSync;
 
 use core::ops::Deref;
 use core::time::Duration;
@@ -57,6 +82,8 @@ use std::time::Instant;
 
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
+#[cfg(all(not(c_bindings), not(feature = "std")))]
+use alloc::sync::Arc;
 
 /// `BackgroundProcessor` takes care of tasks that (1) need to happen periodically to keep
 /// Rust-Lightning running properly, and (2) either can or should be run in the background. Its
@@ -94,56 +121,59 @@ pub struct BackgroundProcessor {
 }
 
 #[cfg(not(test))]
-const FRESHNESS_TIMER: u64 = 60;
+const FRESHNESS_TIMER: Duration = Duration::from_secs(60);
 #[cfg(test)]
-const FRESHNESS_TIMER: u64 = 1;
+const FRESHNESS_TIMER: Duration = Duration::from_secs(1);
 
 #[cfg(all(not(test), not(debug_assertions)))]
-const PING_TIMER: u64 = 10;
+const PING_TIMER: Duration = Duration::from_secs(10);
 /// Signature operations take a lot longer without compiler optimisations.
 /// Increasing the ping timer allows for this but slower devices will be disconnected if the
 /// timeout is reached.
 #[cfg(all(not(test), debug_assertions))]
-const PING_TIMER: u64 = 30;
+const PING_TIMER: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const PING_TIMER: u64 = 1;
+const PING_TIMER: Duration = Duration::from_secs(1);
 
 #[cfg(not(test))]
-const ONION_MESSAGE_HANDLER_TIMER: u64 = 10;
+const ONION_MESSAGE_HANDLER_TIMER: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const ONION_MESSAGE_HANDLER_TIMER: u64 = 1;
+const ONION_MESSAGE_HANDLER_TIMER: Duration = Duration::from_secs(1);
 
 /// Prune the network graph of stale entries hourly.
-const NETWORK_PRUNE_TIMER: u64 = 60 * 60;
+const NETWORK_PRUNE_TIMER: Duration = Duration::from_secs(60 * 60);
 
 #[cfg(not(test))]
-const SCORER_PERSIST_TIMER: u64 = 60 * 5;
+const SCORER_PERSIST_TIMER: Duration = Duration::from_secs(60 * 5);
 #[cfg(test)]
-const SCORER_PERSIST_TIMER: u64 = 1;
+const SCORER_PERSIST_TIMER: Duration = Duration::from_secs(1);
 
 #[cfg(not(test))]
-const FIRST_NETWORK_PRUNE_TIMER: u64 = 60;
+const FIRST_NETWORK_PRUNE_TIMER: Duration = Duration::from_secs(60);
 #[cfg(test)]
-const FIRST_NETWORK_PRUNE_TIMER: u64 = 1;
+const FIRST_NETWORK_PRUNE_TIMER: Duration = Duration::from_secs(1);
 
 #[cfg(not(test))]
-const REBROADCAST_TIMER: u64 = 30;
+const REBROADCAST_TIMER: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const REBROADCAST_TIMER: u64 = 1;
+const REBROADCAST_TIMER: Duration = Duration::from_secs(1);
 
-#[cfg(feature = "futures")]
+#[cfg(not(test))]
+const SWEEPER_TIMER: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SWEEPER_TIMER: Duration = Duration::from_secs(1);
+
 /// core::cmp::min is not currently const, so we define a trivial (and equivalent) replacement
-const fn min_u64(a: u64, b: u64) -> u64 {
-	if a < b {
+const fn min_duration(a: Duration, b: Duration) -> Duration {
+	if a.as_nanos() < b.as_nanos() {
 		a
 	} else {
 		b
 	}
 }
-#[cfg(feature = "futures")]
-const FASTEST_TIMER: u64 = min_u64(
-	min_u64(FRESHNESS_TIMER, PING_TIMER),
-	min_u64(SCORER_PERSIST_TIMER, min_u64(FIRST_NETWORK_PRUNE_TIMER, REBROADCAST_TIMER)),
+const FASTEST_TIMER: Duration = min_duration(
+	min_duration(FRESHNESS_TIMER, PING_TIMER),
+	min_duration(SCORER_PERSIST_TIMER, min_duration(FIRST_NETWORK_PRUNE_TIMER, REBROADCAST_TIMER)),
 );
 
 /// Either [`P2PGossipSync`] or [`RapidGossipSync`].
@@ -270,7 +300,7 @@ where
 
 /// Updates scorer based on event and returns whether an update occurred so we can decide whether
 /// to persist.
-fn update_scorer<'a, S: 'static + Deref<Target = SC> + Send + Sync, SC: 'a + WriteableScore<'a>>(
+fn update_scorer<'a, S: Deref<Target = SC>, SC: 'a + WriteableScore<'a>>(
 	scorer: &'a S, event: &Event, duration_since_epoch: Duration,
 ) -> bool {
 	match event {
@@ -301,189 +331,145 @@ fn update_scorer<'a, S: 'static + Deref<Target = SC> + Send + Sync, SC: 'a + Wri
 	true
 }
 
-macro_rules! define_run_body {
-	(
-		$persister: ident, $chain_monitor: ident, $process_chain_monitor_events: expr,
-		$channel_manager: ident, $process_channel_manager_events: expr,
-		$onion_messenger: ident, $process_onion_message_handler_events: expr,
-		$peer_manager: ident, $gossip_sync: ident,
-		$logger: ident, $scorer: ident, $loop_exit_check: expr, $await: expr, $get_timer: expr,
-		$timer_elapsed: expr, $check_slow_await: expr, $time_fetch: expr,
-	) => { {
-		log_trace!($logger, "Calling ChannelManager's timer_tick_occurred on startup");
-		$channel_manager.get_cm().timer_tick_occurred();
-		log_trace!($logger, "Rebroadcasting monitor's pending claims on startup");
-		$chain_monitor.rebroadcast_pending_claims();
+#[cfg(all(not(c_bindings), feature = "std"))]
+type ScorerWrapper<T> = std::sync::RwLock<T>;
 
-		let mut last_freshness_call = $get_timer(FRESHNESS_TIMER);
-		let mut last_onion_message_handler_call = $get_timer(ONION_MESSAGE_HANDLER_TIMER);
-		let mut last_ping_call = $get_timer(PING_TIMER);
-		let mut last_prune_call = $get_timer(FIRST_NETWORK_PRUNE_TIMER);
-		let mut last_scorer_persist_call = $get_timer(SCORER_PERSIST_TIMER);
-		let mut last_rebroadcast_call = $get_timer(REBROADCAST_TIMER);
-		let mut have_pruned = false;
-		let mut have_decayed_scorer = false;
+#[cfg(all(not(c_bindings), not(feature = "std")))]
+type ScorerWrapper<T> = core::cell::RefCell<T>;
 
-		loop {
-			$process_channel_manager_events;
-			$process_chain_monitor_events;
-			$process_onion_message_handler_events;
+#[cfg(not(c_bindings))]
+type DynRouter = lightning::routing::router::DefaultRouter<
+	&'static NetworkGraph<&'static (dyn Logger + Send + Sync)>,
+	&'static (dyn Logger + Send + Sync),
+	&'static (dyn EntropySource + Send + Sync),
+	&'static ScorerWrapper<
+		lightning::routing::scoring::ProbabilisticScorer<
+			&'static NetworkGraph<&'static (dyn Logger + Send + Sync)>,
+			&'static (dyn Logger + Send + Sync),
+		>,
+	>,
+	lightning::routing::scoring::ProbabilisticScoringFeeParameters,
+	lightning::routing::scoring::ProbabilisticScorer<
+		&'static NetworkGraph<&'static (dyn Logger + Send + Sync)>,
+		&'static (dyn Logger + Send + Sync),
+	>,
+>;
 
-			// Note that the PeerManager::process_events may block on ChannelManager's locks,
-			// hence it comes last here. When the ChannelManager finishes whatever it's doing,
-			// we want to ensure we get into `persist_manager` as quickly as we can, especially
-			// without running the normal event processing above and handing events to users.
-			//
-			// Specifically, on an *extremely* slow machine, we may see ChannelManager start
-			// processing a message effectively at any point during this loop. In order to
-			// minimize the time between such processing completing and persisting the updated
-			// ChannelManager, we want to minimize methods blocking on a ChannelManager
-			// generally, and as a fallback place such blocking only immediately before
-			// persistence.
-			$peer_manager.as_ref().process_events();
+#[cfg(not(c_bindings))]
+type DynMessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
+	&'static NetworkGraph<&'static (dyn Logger + Send + Sync)>,
+	&'static (dyn Logger + Send + Sync),
+	&'static (dyn EntropySource + Send + Sync),
+>;
 
-			// Exit the loop if the background processor was requested to stop.
-			if $loop_exit_check {
-				log_trace!($logger, "Terminating background processor.");
-				break;
-			}
+#[cfg(all(not(c_bindings), not(taproot)))]
+type DynSignerProvider = dyn lightning::sign::SignerProvider<EcdsaSigner = lightning::sign::InMemorySigner>
+	+ Send
+	+ Sync;
 
-			// We wait up to 100ms, but track how long it takes to detect being put to sleep,
-			// see `await_start`'s use below.
-			let mut await_start = None;
-			if $check_slow_await { await_start = Some($get_timer(1)); }
-			$await;
-			let await_slow = if $check_slow_await { $timer_elapsed(&mut await_start.unwrap(), 1) } else { false };
+#[cfg(all(not(c_bindings), taproot))]
+type DynSignerProvider = (dyn lightning::sign::SignerProvider<
+	EcdsaSigner = lightning::sign::InMemorySigner,
+	TaprootSigner = lightning::sign::InMemorySigner,
+> + Send
+     + Sync);
 
-			// Exit the loop if the background processor was requested to stop.
-			if $loop_exit_check {
-				log_trace!($logger, "Terminating background processor.");
-				break;
-			}
+#[cfg(not(c_bindings))]
+type DynChannelManager = lightning::ln::channelmanager::ChannelManager<
+	&'static (dyn chain::Watch<lightning::sign::InMemorySigner> + Send + Sync),
+	&'static (dyn BroadcasterInterface + Send + Sync),
+	&'static (dyn EntropySource + Send + Sync),
+	&'static (dyn lightning::sign::NodeSigner + Send + Sync),
+	&'static DynSignerProvider,
+	&'static (dyn FeeEstimator + Send + Sync),
+	&'static DynRouter,
+	&'static DynMessageRouter,
+	&'static (dyn Logger + Send + Sync),
+>;
 
-			if $channel_manager.get_cm().get_and_clear_needs_persistence() {
-				log_trace!($logger, "Persisting ChannelManager...");
-				$persister.persist_manager(&$channel_manager)?;
-				log_trace!($logger, "Done persisting ChannelManager.");
-			}
-			if $timer_elapsed(&mut last_freshness_call, FRESHNESS_TIMER) {
-				log_trace!($logger, "Calling ChannelManager's timer_tick_occurred");
-				$channel_manager.get_cm().timer_tick_occurred();
-				last_freshness_call = $get_timer(FRESHNESS_TIMER);
-			}
-			if $timer_elapsed(&mut last_onion_message_handler_call, ONION_MESSAGE_HANDLER_TIMER) {
-				if let Some(om) = &$onion_messenger {
-					log_trace!($logger, "Calling OnionMessageHandler's timer_tick_occurred");
-					om.get_om().timer_tick_occurred();
-				}
-				last_onion_message_handler_call = $get_timer(ONION_MESSAGE_HANDLER_TIMER);
-			}
-			if await_slow {
-				// On various platforms, we may be starved of CPU cycles for several reasons.
-				// E.g. on iOS, if we've been in the background, we will be entirely paused.
-				// Similarly, if we're on a desktop platform and the device has been asleep, we
-				// may not get any cycles.
-				// We detect this by checking if our max-100ms-sleep, above, ran longer than a
-				// full second, at which point we assume sockets may have been killed (they
-				// appear to be at least on some platforms, even if it has only been a second).
-				// Note that we have to take care to not get here just because user event
-				// processing was slow at the top of the loop. For example, the sample client
-				// may call Bitcoin Core RPCs during event handling, which very often takes
-				// more than a handful of seconds to complete, and shouldn't disconnect all our
-				// peers.
-				log_trace!($logger, "100ms sleep took more than a second, disconnecting peers.");
-				$peer_manager.as_ref().disconnect_all_peers();
-				last_ping_call = $get_timer(PING_TIMER);
-			} else if $timer_elapsed(&mut last_ping_call, PING_TIMER) {
-				log_trace!($logger, "Calling PeerManager's timer_tick_occurred");
-				$peer_manager.as_ref().timer_tick_occurred();
-				last_ping_call = $get_timer(PING_TIMER);
-			}
+/// When initializing a background processor without an onion messenger, this can be used to avoid
+/// specifying a concrete `OnionMessenger` type.
+#[cfg(not(c_bindings))]
+pub const NO_ONION_MESSENGER: Option<
+	Arc<
+		dyn AOnionMessenger<
+				EntropySource = dyn EntropySource + Send + Sync,
+				ES = &(dyn EntropySource + Send + Sync),
+				NodeSigner = dyn lightning::sign::NodeSigner + Send + Sync,
+				NS = &(dyn lightning::sign::NodeSigner + Send + Sync),
+				Logger = dyn Logger + Send + Sync,
+				L = &'static (dyn Logger + Send + Sync),
+				NodeIdLookUp = DynChannelManager,
+				NL = &'static DynChannelManager,
+				MessageRouter = DynMessageRouter,
+				MR = &'static DynMessageRouter,
+				OffersMessageHandler = lightning::ln::peer_handler::IgnoringMessageHandler,
+				OMH = &'static lightning::ln::peer_handler::IgnoringMessageHandler,
+				AsyncPaymentsMessageHandler = lightning::ln::peer_handler::IgnoringMessageHandler,
+				APH = &'static lightning::ln::peer_handler::IgnoringMessageHandler,
+				DNSResolverMessageHandler = lightning::ln::peer_handler::IgnoringMessageHandler,
+				DRH = &'static lightning::ln::peer_handler::IgnoringMessageHandler,
+				CustomOnionMessageHandler = lightning::ln::peer_handler::IgnoringMessageHandler,
+				CMH = &'static lightning::ln::peer_handler::IgnoringMessageHandler,
+			> + Send
+			+ Sync,
+	>,
+> = None;
 
-			// Note that we want to run a graph prune once not long after startup before
-			// falling back to our usual hourly prunes. This avoids short-lived clients never
-			// pruning their network graph. We run once 60 seconds after startup before
-			// continuing our normal cadence. For RGS, since 60 seconds is likely too long,
-			// we prune after an initial sync completes.
-			let prune_timer = if have_pruned { NETWORK_PRUNE_TIMER } else { FIRST_NETWORK_PRUNE_TIMER };
-			let prune_timer_elapsed = $timer_elapsed(&mut last_prune_call, prune_timer);
-			let should_prune = match $gossip_sync {
-				GossipSync::Rapid(_) => !have_pruned || prune_timer_elapsed,
-				_ => prune_timer_elapsed,
-			};
-			if should_prune {
-				// The network graph must not be pruned while rapid sync completion is pending
-				if let Some(network_graph) = $gossip_sync.prunable_network_graph() {
-					if let Some(duration_since_epoch) = $time_fetch() {
-						log_trace!($logger, "Pruning and persisting network graph.");
-						network_graph.remove_stale_channels_and_tracking_with_time(duration_since_epoch.as_secs());
-					} else {
-						log_warn!($logger, "Not pruning network graph, consider enabling `std` or doing so manually with remove_stale_channels_and_tracking_with_time.");
-						log_trace!($logger, "Persisting network graph.");
-					}
+/// When initializing a background processor without a liquidity manager, this can be used to avoid
+/// specifying a concrete `LiquidityManager` type.
+#[cfg(not(c_bindings))]
+pub const NO_LIQUIDITY_MANAGER: Option<
+	Arc<
+		dyn ALiquidityManager<
+				EntropySource = dyn EntropySource + Send + Sync,
+				ES = &(dyn EntropySource + Send + Sync),
+				NodeSigner = dyn lightning::sign::NodeSigner + Send + Sync,
+				NS = &(dyn lightning::sign::NodeSigner + Send + Sync),
+				AChannelManager = DynChannelManager,
+				CM = &DynChannelManager,
+				Filter = dyn chain::Filter + Send + Sync,
+				C = &(dyn chain::Filter + Send + Sync),
+				KVStore = dyn lightning::util::persist::KVStore + Send + Sync,
+				K = &(dyn lightning::util::persist::KVStore + Send + Sync),
+				TimeProvider = dyn lightning_liquidity::utils::time::TimeProvider + Send + Sync,
+				TP = &(dyn lightning_liquidity::utils::time::TimeProvider + Send + Sync),
+				BroadcasterInterface = dyn lightning::chain::chaininterface::BroadcasterInterface
+				                           + Send
+				                           + Sync,
+				T = &(dyn BroadcasterInterface + Send + Sync),
+			> + Send
+			+ Sync,
+	>,
+> = None;
 
-					if let Err(e) = $persister.persist_graph(network_graph) {
-						log_error!($logger, "Error: Failed to persist network graph, check your disk and permissions {}", e)
-					}
+/// When initializing a background processor without a liquidity manager, this can be used to avoid
+/// specifying a concrete `LiquidityManagerSync` type.
+#[cfg(all(not(c_bindings), feature = "std"))]
+pub const NO_LIQUIDITY_MANAGER_SYNC: Option<
+	Arc<
+		dyn ALiquidityManagerSync<
+				EntropySource = dyn EntropySource + Send + Sync,
+				ES = &(dyn EntropySource + Send + Sync),
+				NodeSigner = dyn lightning::sign::NodeSigner + Send + Sync,
+				NS = &(dyn lightning::sign::NodeSigner + Send + Sync),
+				AChannelManager = DynChannelManager,
+				CM = &DynChannelManager,
+				Filter = dyn chain::Filter + Send + Sync,
+				C = &(dyn chain::Filter + Send + Sync),
+				KVStoreSync = dyn lightning::util::persist::KVStoreSync + Send + Sync,
+				KS = &(dyn lightning::util::persist::KVStoreSync + Send + Sync),
+				TimeProvider = dyn lightning_liquidity::utils::time::TimeProvider + Send + Sync,
+				TP = &(dyn lightning_liquidity::utils::time::TimeProvider + Send + Sync),
+				BroadcasterInterface = dyn lightning::chain::chaininterface::BroadcasterInterface
+				                           + Send
+				                           + Sync,
+				T = &(dyn BroadcasterInterface + Send + Sync),
+			> + Send
+			+ Sync,
+	>,
+> = None;
 
-					have_pruned = true;
-				}
-				let prune_timer = if have_pruned { NETWORK_PRUNE_TIMER } else { FIRST_NETWORK_PRUNE_TIMER };
-				last_prune_call = $get_timer(prune_timer);
-			}
-
-			if !have_decayed_scorer {
-				if let Some(ref scorer) = $scorer {
-					if let Some(duration_since_epoch) = $time_fetch() {
-						log_trace!($logger, "Calling time_passed on scorer at startup");
-						scorer.write_lock().time_passed(duration_since_epoch);
-					}
-				}
-				have_decayed_scorer = true;
-			}
-
-			if $timer_elapsed(&mut last_scorer_persist_call, SCORER_PERSIST_TIMER) {
-				if let Some(ref scorer) = $scorer {
-					if let Some(duration_since_epoch) = $time_fetch() {
-						log_trace!($logger, "Calling time_passed and persisting scorer");
-						scorer.write_lock().time_passed(duration_since_epoch);
-					} else {
-						log_trace!($logger, "Persisting scorer");
-					}
-					if let Err(e) = $persister.persist_scorer(&scorer) {
-						log_error!($logger, "Error: Failed to persist scorer, check your disk and permissions {}", e)
-					}
-				}
-				last_scorer_persist_call = $get_timer(SCORER_PERSIST_TIMER);
-			}
-
-			if $timer_elapsed(&mut last_rebroadcast_call, REBROADCAST_TIMER) {
-				log_trace!($logger, "Rebroadcasting monitor's pending claims");
-				$chain_monitor.rebroadcast_pending_claims();
-				last_rebroadcast_call = $get_timer(REBROADCAST_TIMER);
-			}
-		}
-
-		// After we exit, ensure we persist the ChannelManager one final time - this avoids
-		// some races where users quit while channel updates were in-flight, with
-		// ChannelMonitor update(s) persisted without a corresponding ChannelManager update.
-		$persister.persist_manager(&$channel_manager)?;
-
-		// Persist Scorer on exit
-		if let Some(ref scorer) = $scorer {
-			$persister.persist_scorer(&scorer)?;
-		}
-
-		// Persist NetworkGraph on exit
-		if let Some(network_graph) = $gossip_sync.network_graph() {
-			$persister.persist_graph(network_graph)?;
-		}
-
-		Ok(())
-	} }
-}
-
-#[cfg(feature = "futures")]
 pub(crate) mod futures_util {
 	use core::future::Future;
 	use core::marker::Unpin;
@@ -493,27 +479,31 @@ pub(crate) mod futures_util {
 		A: Future<Output = ()> + Unpin,
 		B: Future<Output = ()> + Unpin,
 		C: Future<Output = ()> + Unpin,
-		D: Future<Output = bool> + Unpin,
+		D: Future<Output = ()> + Unpin,
+		E: Future<Output = bool> + Unpin,
 	> {
 		pub a: A,
 		pub b: B,
 		pub c: C,
 		pub d: D,
+		pub e: E,
 	}
 
 	pub(crate) enum SelectorOutput {
 		A,
 		B,
 		C,
-		D(bool),
+		D,
+		E(bool),
 	}
 
 	impl<
 			A: Future<Output = ()> + Unpin,
 			B: Future<Output = ()> + Unpin,
 			C: Future<Output = ()> + Unpin,
-			D: Future<Output = bool> + Unpin,
-		> Future for Selector<A, B, C, D>
+			D: Future<Output = ()> + Unpin,
+			E: Future<Output = bool> + Unpin,
+		> Future for Selector<A, B, C, D, E>
 	{
 		type Output = SelectorOutput;
 		fn poll(
@@ -538,8 +528,14 @@ pub(crate) mod futures_util {
 				Poll::Pending => {},
 			}
 			match Pin::new(&mut self.d).poll(ctx) {
+				Poll::Ready(()) => {
+					return Poll::Ready(SelectorOutput::D);
+				},
+				Poll::Pending => {},
+			}
+			match Pin::new(&mut self.e).poll(ctx) {
 				Poll::Ready(res) => {
-					return Poll::Ready(SelectorOutput::D(res));
+					return Poll::Ready(SelectorOutput::E(res));
 				},
 				Poll::Pending => {},
 			}
@@ -586,11 +582,132 @@ pub(crate) mod futures_util {
 	pub(crate) fn dummy_waker() -> Waker {
 		unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &DUMMY_WAKER_VTABLE)) }
 	}
+
+	enum JoinerResult<ERR, F: Future<Output = Result<(), ERR>> + Unpin> {
+		Pending(Option<F>),
+		Ready(Result<(), ERR>),
+	}
+
+	pub(crate) struct Joiner<
+		ERR,
+		A: Future<Output = Result<(), ERR>> + Unpin,
+		B: Future<Output = Result<(), ERR>> + Unpin,
+		C: Future<Output = Result<(), ERR>> + Unpin,
+		D: Future<Output = Result<(), ERR>> + Unpin,
+		E: Future<Output = Result<(), ERR>> + Unpin,
+	> {
+		a: JoinerResult<ERR, A>,
+		b: JoinerResult<ERR, B>,
+		c: JoinerResult<ERR, C>,
+		d: JoinerResult<ERR, D>,
+		e: JoinerResult<ERR, E>,
+	}
+
+	impl<
+			ERR,
+			A: Future<Output = Result<(), ERR>> + Unpin,
+			B: Future<Output = Result<(), ERR>> + Unpin,
+			C: Future<Output = Result<(), ERR>> + Unpin,
+			D: Future<Output = Result<(), ERR>> + Unpin,
+			E: Future<Output = Result<(), ERR>> + Unpin,
+		> Joiner<ERR, A, B, C, D, E>
+	{
+		pub(crate) fn new() -> Self {
+			Self {
+				a: JoinerResult::Pending(None),
+				b: JoinerResult::Pending(None),
+				c: JoinerResult::Pending(None),
+				d: JoinerResult::Pending(None),
+				e: JoinerResult::Pending(None),
+			}
+		}
+
+		pub(crate) fn set_a(&mut self, fut: A) {
+			self.a = JoinerResult::Pending(Some(fut));
+		}
+		pub(crate) fn set_a_res(&mut self, res: Result<(), ERR>) {
+			self.a = JoinerResult::Ready(res);
+		}
+		pub(crate) fn set_b(&mut self, fut: B) {
+			self.b = JoinerResult::Pending(Some(fut));
+		}
+		pub(crate) fn set_c(&mut self, fut: C) {
+			self.c = JoinerResult::Pending(Some(fut));
+		}
+		pub(crate) fn set_d(&mut self, fut: D) {
+			self.d = JoinerResult::Pending(Some(fut));
+		}
+		pub(crate) fn set_e(&mut self, fut: E) {
+			self.e = JoinerResult::Pending(Some(fut));
+		}
+	}
+
+	impl<
+			ERR,
+			A: Future<Output = Result<(), ERR>> + Unpin,
+			B: Future<Output = Result<(), ERR>> + Unpin,
+			C: Future<Output = Result<(), ERR>> + Unpin,
+			D: Future<Output = Result<(), ERR>> + Unpin,
+			E: Future<Output = Result<(), ERR>> + Unpin,
+		> Future for Joiner<ERR, A, B, C, D, E>
+	where
+		Joiner<ERR, A, B, C, D, E>: Unpin,
+	{
+		type Output = [Result<(), ERR>; 5];
+		fn poll(mut self: Pin<&mut Self>, ctx: &mut core::task::Context<'_>) -> Poll<Self::Output> {
+			let mut all_complete = true;
+			macro_rules! handle {
+				($val: ident) => {
+					match &mut (self.$val) {
+						JoinerResult::Pending(None) => {
+							self.$val = JoinerResult::Ready(Ok(()));
+						},
+						JoinerResult::<ERR, _>::Pending(Some(ref mut val)) => {
+							match Pin::new(val).poll(ctx) {
+								Poll::Ready(res) => {
+									self.$val = JoinerResult::Ready(res);
+								},
+								Poll::Pending => {
+									all_complete = false;
+								},
+							}
+						},
+						JoinerResult::Ready(_) => {},
+					}
+				};
+			}
+			handle!(a);
+			handle!(b);
+			handle!(c);
+			handle!(d);
+			handle!(e);
+
+			if all_complete {
+				let mut res = [Ok(()), Ok(()), Ok(()), Ok(()), Ok(())];
+				if let JoinerResult::Ready(ref mut val) = &mut self.a {
+					core::mem::swap(&mut res[0], val);
+				}
+				if let JoinerResult::Ready(ref mut val) = &mut self.b {
+					core::mem::swap(&mut res[1], val);
+				}
+				if let JoinerResult::Ready(ref mut val) = &mut self.c {
+					core::mem::swap(&mut res[2], val);
+				}
+				if let JoinerResult::Ready(ref mut val) = &mut self.d {
+					core::mem::swap(&mut res[3], val);
+				}
+				if let JoinerResult::Ready(ref mut val) = &mut self.e {
+					core::mem::swap(&mut res[4], val);
+				}
+				Poll::Ready(res)
+			} else {
+				Poll::Pending
+			}
+		}
+	}
 }
-#[cfg(feature = "futures")]
 use core::task;
-#[cfg(feature = "futures")]
-use futures_util::{dummy_waker, OptionalSelector, Selector, SelectorOutput};
+use futures_util::{dummy_waker, Joiner, OptionalSelector, Selector, SelectorOutput};
 
 /// Processes background events in a future.
 ///
@@ -599,13 +716,10 @@ use futures_util::{dummy_waker, OptionalSelector, Selector, SelectorOutput};
 /// future which outputs `true`, the loop will exit and this function's future will complete.
 /// The `sleeper` future is free to return early after it has triggered the exit condition.
 ///
-/// See [`BackgroundProcessor::start`] for information on which actions this handles.
-///
-/// Requires the `futures` feature. Note that while this method is available without the `std`
-/// feature, doing so will skip calling [`NetworkGraph::remove_stale_channels_and_tracking`],
-/// you should call [`NetworkGraph::remove_stale_channels_and_tracking_with_time`] regularly
-/// manually instead.
-///
+#[cfg_attr(
+	feature = "std",
+	doc = " See [`BackgroundProcessor::start`] for information on which actions this handles.\n"
+)]
 /// The `mobile_interruptable_platform` flag should be set if we're currently running on a
 /// mobile device, where we may need to check for interruption of the application regularly. If you
 /// are unsure, you should set the flag, as the performance impact of it is minimal unless there
@@ -623,16 +737,35 @@ use futures_util::{dummy_waker, OptionalSelector, Selector, SelectorOutput};
 /// # use std::sync::atomic::{AtomicBool, Ordering};
 /// # use std::time::SystemTime;
 /// # use lightning_background_processor::{process_events_async, GossipSync};
+/// # use core::future::Future;
+/// # use core::pin::Pin;
+/// # use lightning_liquidity::utils::time::TimeProvider;
 /// # struct Logger {}
 /// # impl lightning::util::logger::Logger for Logger {
 /// #     fn log(&self, _record: lightning::util::logger::Record) {}
 /// # }
-/// # struct Store {}
-/// # impl lightning::util::persist::KVStore for Store {
+/// # struct StoreSync {}
+/// # impl lightning::util::persist::KVStoreSync for StoreSync {
 /// #     fn read(&self, primary_namespace: &str, secondary_namespace: &str, key: &str) -> io::Result<Vec<u8>> { Ok(Vec::new()) }
-/// #     fn write(&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: &[u8]) -> io::Result<()> { Ok(()) }
+/// #     fn write(&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>) -> io::Result<()> { Ok(()) }
 /// #     fn remove(&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool) -> io::Result<()> { Ok(()) }
 /// #     fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> { Ok(Vec::new()) }
+/// # }
+/// # struct Store {}
+/// # impl lightning::util::persist::KVStore for Store {
+/// #     fn read(&self, primary_namespace: &str, secondary_namespace: &str, key: &str) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, io::Error>> + 'static + Send>> { todo!() }
+/// #     fn write(&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + 'static + Send>> { todo!() }
+/// #     fn remove(&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + 'static + Send>> { todo!() }
+/// #     fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + 'static + Send>> { todo!() }
+/// # }
+/// # use core::time::Duration;
+/// # struct DefaultTimeProvider;
+/// #
+/// # impl TimeProvider for DefaultTimeProvider {
+/// #    fn duration_since_epoch(&self) -> Duration {
+/// #        use std::time::{SystemTime, UNIX_EPOCH};
+/// #        SystemTime::now().duration_since(UNIX_EPOCH).expect("system time before Unix epoch")
+/// #    }
 /// # }
 /// # struct EventHandler {}
 /// # impl EventHandler {
@@ -641,32 +774,38 @@ use futures_util::{dummy_waker, OptionalSelector, Selector, SelectorOutput};
 /// # #[derive(Eq, PartialEq, Clone, Hash)]
 /// # struct SocketDescriptor {}
 /// # impl lightning::ln::peer_handler::SocketDescriptor for SocketDescriptor {
-/// #     fn send_data(&mut self, _data: &[u8], _resume_read: bool) -> usize { 0 }
+/// #     fn send_data(&mut self, _data: &[u8], _continue_read: bool) -> usize { 0 }
 /// #     fn disconnect_socket(&mut self) {}
 /// # }
-/// # type ChainMonitor<B, F, FE> = lightning::chain::chainmonitor::ChainMonitor<lightning::sign::InMemorySigner, Arc<F>, Arc<B>, Arc<FE>, Arc<Logger>, Arc<Store>>;
+/// # type ChainMonitor<B, F, FE> = lightning::chain::chainmonitor::ChainMonitor<lightning::sign::InMemorySigner, Arc<F>, Arc<B>, Arc<FE>, Arc<Logger>, Arc<StoreSync>, Arc<lightning::sign::KeysManager>>;
 /// # type NetworkGraph = lightning::routing::gossip::NetworkGraph<Arc<Logger>>;
 /// # type P2PGossipSync<UL> = lightning::routing::gossip::P2PGossipSync<Arc<NetworkGraph>, Arc<UL>, Arc<Logger>>;
 /// # type ChannelManager<B, F, FE> = lightning::ln::channelmanager::SimpleArcChannelManager<ChainMonitor<B, F, FE>, B, FE, Logger>;
-/// # type OnionMessenger<B, F, FE> = lightning::onion_message::messenger::OnionMessenger<Arc<lightning::sign::KeysManager>, Arc<lightning::sign::KeysManager>, Arc<Logger>, Arc<ChannelManager<B, F, FE>>, Arc<lightning::onion_message::messenger::DefaultMessageRouter<Arc<NetworkGraph>, Arc<Logger>, Arc<lightning::sign::KeysManager>>>, Arc<ChannelManager<B, F, FE>>, lightning::ln::peer_handler::IgnoringMessageHandler, lightning::ln::peer_handler::IgnoringMessageHandler>;
+/// # type OnionMessenger<B, F, FE> = lightning::onion_message::messenger::OnionMessenger<Arc<lightning::sign::KeysManager>, Arc<lightning::sign::KeysManager>, Arc<Logger>, Arc<ChannelManager<B, F, FE>>, Arc<lightning::onion_message::messenger::DefaultMessageRouter<Arc<NetworkGraph>, Arc<Logger>, Arc<lightning::sign::KeysManager>>>, Arc<ChannelManager<B, F, FE>>, lightning::ln::peer_handler::IgnoringMessageHandler, lightning::ln::peer_handler::IgnoringMessageHandler, lightning::ln::peer_handler::IgnoringMessageHandler>;
+/// # type LiquidityManager<B, F, FE> = lightning_liquidity::LiquidityManager<Arc<lightning::sign::KeysManager>, Arc<lightning::sign::KeysManager>, Arc<ChannelManager<B, F, FE>>, Arc<F>, Arc<Store>, Arc<DefaultTimeProvider>, Arc<B>>;
 /// # type Scorer = RwLock<lightning::routing::scoring::ProbabilisticScorer<Arc<NetworkGraph>, Arc<Logger>>>;
-/// # type PeerManager<B, F, FE, UL> = lightning::ln::peer_handler::SimpleArcPeerManager<SocketDescriptor, ChainMonitor<B, F, FE>, B, FE, Arc<UL>, Logger>;
-/// #
+/// # type PeerManager<B, F, FE, UL> = lightning::ln::peer_handler::SimpleArcPeerManager<SocketDescriptor, ChainMonitor<B, F, FE>, B, FE, Arc<UL>, Logger, F, StoreSync>;
+/// # type OutputSweeper<B, D, FE, F, O> = lightning::util::sweep::OutputSweeper<Arc<B>, Arc<D>, Arc<FE>, Arc<F>, Arc<Store>, Arc<Logger>, Arc<O>>;
+///
 /// # struct Node<
 /// #     B: lightning::chain::chaininterface::BroadcasterInterface + Send + Sync + 'static,
 /// #     F: lightning::chain::Filter + Send + Sync + 'static,
 /// #     FE: lightning::chain::chaininterface::FeeEstimator + Send + Sync + 'static,
 /// #     UL: lightning::routing::utxo::UtxoLookup + Send + Sync + 'static,
+/// #     D: lightning::sign::ChangeDestinationSource + Send + Sync + 'static,
+/// #     O: lightning::sign::OutputSpender + Send + Sync + 'static,
 /// # > {
 /// #     peer_manager: Arc<PeerManager<B, F, FE, UL>>,
 /// #     event_handler: Arc<EventHandler>,
 /// #     channel_manager: Arc<ChannelManager<B, F, FE>>,
 /// #     onion_messenger: Arc<OnionMessenger<B, F, FE>>,
+/// #     liquidity_manager: Arc<LiquidityManager<B, F, FE>>,
 /// #     chain_monitor: Arc<ChainMonitor<B, F, FE>>,
 /// #     gossip_sync: Arc<P2PGossipSync<UL>>,
 /// #     persister: Arc<Store>,
 /// #     logger: Arc<Logger>,
 /// #     scorer: Arc<Scorer>,
+/// #     sweeper: Arc<OutputSweeper<B, D, FE, F, O>>,
 /// # }
 /// #
 /// # async fn setup_background_processing<
@@ -674,7 +813,9 @@ use futures_util::{dummy_waker, OptionalSelector, Selector, SelectorOutput};
 /// #     F: lightning::chain::Filter + Send + Sync + 'static,
 /// #     FE: lightning::chain::chaininterface::FeeEstimator + Send + Sync + 'static,
 /// #     UL: lightning::routing::utxo::UtxoLookup + Send + Sync + 'static,
-/// # >(node: Node<B, F, FE, UL>) {
+/// #     D: lightning::sign::ChangeDestinationSource + Send + Sync + 'static,
+/// #     O: lightning::sign::OutputSpender + Send + Sync + 'static,
+/// # >(node: Node<B, F, FE, UL, D, O>) {
 ///	let background_persister = Arc::clone(&node.persister);
 ///	let background_event_handler = Arc::clone(&node.event_handler);
 ///	let background_chain_mon = Arc::clone(&node.chain_monitor);
@@ -682,25 +823,34 @@ use futures_util::{dummy_waker, OptionalSelector, Selector, SelectorOutput};
 ///	let background_gossip_sync = GossipSync::p2p(Arc::clone(&node.gossip_sync));
 ///	let background_peer_man = Arc::clone(&node.peer_manager);
 ///	let background_onion_messenger = Arc::clone(&node.onion_messenger);
+///	let background_liquidity_manager = Arc::clone(&node.liquidity_manager);
 ///	let background_logger = Arc::clone(&node.logger);
 ///	let background_scorer = Arc::clone(&node.scorer);
-///
+///	let background_sweeper = Arc::clone(&node.sweeper);
 ///	// Setup the sleeper.
-///	let (stop_sender, stop_receiver) = tokio::sync::watch::channel(());
-///
+#[cfg_attr(
+	feature = "std",
+	doc = "	let (stop_sender, stop_receiver) = tokio::sync::watch::channel(());"
+)]
+#[cfg_attr(feature = "std", doc = "")]
 ///	let sleeper = move |d| {
-///		let mut receiver = stop_receiver.clone();
+#[cfg_attr(feature = "std", doc = "		let mut receiver = stop_receiver.clone();")]
 ///		Box::pin(async move {
 ///			tokio::select!{
 ///				_ = tokio::time::sleep(d) => false,
-///				_ = receiver.changed() => true,
+#[cfg_attr(feature = "std", doc = "				_ = receiver.changed() => true,")]
 ///			}
 ///		})
 ///	};
 ///
 ///	let mobile_interruptable_platform = false;
 ///
-///	let handle = tokio::spawn(async move {
+#[cfg_attr(feature = "std", doc = "	let handle = tokio::spawn(async move {")]
+#[cfg_attr(
+	not(feature = "std"),
+	doc = "	let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();"
+)]
+#[cfg_attr(not(feature = "std"), doc = "	rt.block_on(async move {")]
 ///		process_events_async(
 ///			background_persister,
 ///			|e| background_event_handler.handle_event(e),
@@ -709,6 +859,8 @@ use futures_util::{dummy_waker, OptionalSelector, Selector, SelectorOutput};
 ///			Some(background_onion_messenger),
 ///			background_gossip_sync,
 ///			background_peer_man,
+///			Some(background_liquidity_manager),
+///			Some(background_sweeper),
 ///			background_logger,
 ///			Some(background_scorer),
 ///			sleeper,
@@ -720,62 +872,66 @@ use futures_util::{dummy_waker, OptionalSelector, Selector, SelectorOutput};
 ///	});
 ///
 ///	// Stop the background processing.
-///	stop_sender.send(()).unwrap();
-///	handle.await.unwrap();
+#[cfg_attr(feature = "std", doc = "	stop_sender.send(()).unwrap();")]
+#[cfg_attr(feature = "std", doc = "	handle.await.unwrap()")]
 ///	# }
 ///```
-#[cfg(feature = "futures")]
 pub async fn process_events_async<
 	'a,
-	UL: 'static + Deref + Send + Sync,
-	CF: 'static + Deref + Send + Sync,
-	T: 'static + Deref + Send + Sync,
-	F: 'static + Deref + Send + Sync,
-	G: 'static + Deref<Target = NetworkGraph<L>> + Send + Sync,
-	L: 'static + Deref + Send + Sync,
-	P: 'static + Deref + Send + Sync,
+	UL: Deref,
+	CF: Deref,
+	T: Deref,
+	F: Deref,
+	G: Deref<Target = NetworkGraph<L>>,
+	L: Deref,
+	P: Deref,
 	EventHandlerFuture: core::future::Future<Output = Result<(), ReplayEvent>>,
 	EventHandler: Fn(Event) -> EventHandlerFuture,
-	PS: 'static + Deref + Send,
-	M: 'static
-		+ Deref<Target = ChainMonitor<<CM::Target as AChannelManager>::Signer, CF, T, F, L, P>>
-		+ Send
-		+ Sync,
-	CM: 'static + Deref + Send + Sync,
-	OM: 'static + Deref + Send + Sync,
-	PGS: 'static + Deref<Target = P2PGossipSync<G, UL, L>> + Send + Sync,
-	RGS: 'static + Deref<Target = RapidGossipSync<G, L>> + Send,
-	PM: 'static + Deref + Send + Sync,
-	S: 'static + Deref<Target = SC> + Send + Sync,
+	ES: Deref,
+	M: Deref<Target = ChainMonitor<<CM::Target as AChannelManager>::Signer, CF, T, F, L, P, ES>>,
+	CM: Deref,
+	OM: Deref,
+	PGS: Deref<Target = P2PGossipSync<G, UL, L>>,
+	RGS: Deref<Target = RapidGossipSync<G, L>>,
+	PM: Deref,
+	LM: Deref,
+	D: Deref,
+	O: Deref,
+	K: Deref,
+	OS: Deref<Target = OutputSweeper<T, D, F, CF, K, L, O>>,
+	S: Deref<Target = SC>,
 	SC: for<'b> WriteableScore<'b>,
 	SleepFuture: core::future::Future<Output = bool> + core::marker::Unpin,
 	Sleeper: Fn(Duration) -> SleepFuture,
 	FetchTime: Fn() -> Option<Duration>,
 >(
-	persister: PS, event_handler: EventHandler, chain_monitor: M, channel_manager: CM,
+	kv_store: K, event_handler: EventHandler, chain_monitor: M, channel_manager: CM,
 	onion_messenger: Option<OM>, gossip_sync: GossipSync<PGS, RGS, G, UL, L>, peer_manager: PM,
-	logger: L, scorer: Option<S>, sleeper: Sleeper, mobile_interruptable_platform: bool,
-	fetch_time: FetchTime,
+	liquidity_manager: Option<LM>, sweeper: Option<OS>, logger: L, scorer: Option<S>,
+	sleeper: Sleeper, mobile_interruptable_platform: bool, fetch_time: FetchTime,
 ) -> Result<(), lightning::io::Error>
 where
-	UL::Target: 'static + UtxoLookup,
-	CF::Target: 'static + chain::Filter,
-	T::Target: 'static + BroadcasterInterface,
-	F::Target: 'static + FeeEstimator,
-	L::Target: 'static + Logger,
-	P::Target: 'static + Persist<<CM::Target as AChannelManager>::Signer>,
-	PS::Target: 'static + Persister<'a, CM, L, S>,
-	CM::Target: AChannelManager + Send + Sync,
-	OM::Target: AOnionMessenger + Send + Sync,
-	PM::Target: APeerManager + Send + Sync,
+	UL::Target: UtxoLookup,
+	CF::Target: chain::Filter,
+	T::Target: BroadcasterInterface,
+	F::Target: FeeEstimator,
+	L::Target: Logger,
+	P::Target: Persist<<CM::Target as AChannelManager>::Signer>,
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	OM::Target: AOnionMessenger,
+	PM::Target: APeerManager,
+	LM::Target: ALiquidityManager,
+	O::Target: OutputSpender,
+	D::Target: ChangeDestinationSource,
+	K::Target: KVStore,
 {
-	let mut should_break = false;
 	let async_event_handler = |event| {
 		let network_graph = gossip_sync.network_graph();
 		let event_handler = &event_handler;
 		let scorer = &scorer;
 		let logger = &logger;
-		let persister = &persister;
+		let kv_store = &kv_store;
 		let fetch_time = &fetch_time;
 		// We should be able to drop the Box once our MSRV is 1.68
 		Box::pin(async move {
@@ -786,7 +942,15 @@ where
 				if let Some(duration_since_epoch) = fetch_time() {
 					if update_scorer(scorer, &event, duration_since_epoch) {
 						log_trace!(logger, "Persisting scorer after update");
-						if let Err(e) = persister.persist_scorer(&*scorer) {
+						if let Err(e) = kv_store
+							.write(
+								SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+								SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+								SCORER_PERSISTENCE_KEY,
+								scorer.encode(),
+							)
+							.await
+						{
 							log_error!(logger, "Error: Failed to persist scorer, check your disk and permissions {}", e);
 							// We opt not to abort early on persistence failure here as persisting
 							// the scorer is non-critical and we still hope that it will have
@@ -799,60 +963,458 @@ where
 			event_handler(event).await
 		})
 	};
-	define_run_body!(
-		persister,
-		chain_monitor,
-		chain_monitor.process_pending_events_async(async_event_handler).await,
-		channel_manager,
-		channel_manager.get_cm().process_pending_events_async(async_event_handler).await,
-		onion_messenger,
+	let mut batch_delay = BatchDelay::new();
+
+	log_trace!(logger, "Calling ChannelManager's timer_tick_occurred on startup");
+	channel_manager.get_cm().timer_tick_occurred();
+	log_trace!(logger, "Rebroadcasting monitor's pending claims on startup");
+	chain_monitor.rebroadcast_pending_claims();
+
+	let mut last_freshness_call = sleeper(FRESHNESS_TIMER);
+	let mut last_onion_message_handler_call = sleeper(ONION_MESSAGE_HANDLER_TIMER);
+	let mut last_ping_call = sleeper(PING_TIMER);
+	let mut last_prune_call = sleeper(FIRST_NETWORK_PRUNE_TIMER);
+	let mut last_scorer_persist_call = sleeper(SCORER_PERSIST_TIMER);
+	let mut last_rebroadcast_call = sleeper(REBROADCAST_TIMER);
+	let mut last_sweeper_call = sleeper(SWEEPER_TIMER);
+	let mut have_pruned = false;
+	let mut have_decayed_scorer = false;
+
+	let mut last_forwards_processing_call = sleeper(batch_delay.get());
+
+	loop {
+		channel_manager.get_cm().process_pending_events_async(async_event_handler).await;
+		chain_monitor.process_pending_events_async(async_event_handler).await;
 		if let Some(om) = &onion_messenger {
 			om.get_om().process_pending_events_async(async_event_handler).await
-		},
-		peer_manager,
-		gossip_sync,
-		logger,
-		scorer,
-		should_break,
-		{
-			let om_fut = if let Some(om) = onion_messenger.as_ref() {
-				let fut = om.get_om().get_update_future();
-				OptionalSelector { optional_future: Some(fut) }
-			} else {
-				OptionalSelector { optional_future: None }
-			};
-			let fut = Selector {
-				a: channel_manager.get_cm().get_event_or_persistence_needed_future(),
-				b: chain_monitor.get_update_future(),
-				c: om_fut,
-				d: sleeper(if mobile_interruptable_platform {
-					Duration::from_millis(100)
-				} else {
-					Duration::from_secs(FASTEST_TIMER)
-				}),
-			};
-			match fut.await {
-				SelectorOutput::A | SelectorOutput::B | SelectorOutput::C => {},
-				SelectorOutput::D(exit) => {
-					should_break = exit;
-				},
+		}
+
+		// Note that the PeerManager::process_events may block on ChannelManager's locks,
+		// hence it comes last here. When the ChannelManager finishes whatever it's doing,
+		// we want to ensure we get into `persist_manager` as quickly as we can, especially
+		// without running the normal event processing above and handing events to users.
+		//
+		// Specifically, on an *extremely* slow machine, we may see ChannelManager start
+		// processing a message effectively at any point during this loop. In order to
+		// minimize the time between such processing completing and persisting the updated
+		// ChannelManager, we want to minimize methods blocking on a ChannelManager
+		// generally, and as a fallback place such blocking only immediately before
+		// persistence.
+		peer_manager.as_ref().process_events();
+		match check_and_reset_sleeper(&mut last_forwards_processing_call, || {
+			sleeper(batch_delay.next())
+		}) {
+			Some(false) => {
+				channel_manager.get_cm().process_pending_htlc_forwards();
+			},
+			Some(true) => break,
+			None => {},
+		}
+
+		// We wait up to 100ms, but track how long it takes to detect being put to sleep,
+		// see `await_start`'s use below.
+		let mut await_start = None;
+		if mobile_interruptable_platform {
+			await_start = Some(sleeper(Duration::from_secs(1)));
+		}
+		let om_fut = if let Some(om) = onion_messenger.as_ref() {
+			let fut = om.get_om().get_update_future();
+			OptionalSelector { optional_future: Some(fut) }
+		} else {
+			OptionalSelector { optional_future: None }
+		};
+		let lm_fut = if let Some(lm) = liquidity_manager.as_ref() {
+			let fut = lm.get_lm().get_pending_msgs_or_needs_persist_future();
+			OptionalSelector { optional_future: Some(fut) }
+		} else {
+			OptionalSelector { optional_future: None }
+		};
+		let needs_processing = channel_manager.get_cm().needs_pending_htlc_processing();
+		let sleep_delay = match (needs_processing, mobile_interruptable_platform) {
+			(true, true) => batch_delay.get().min(Duration::from_millis(100)),
+			(true, false) => batch_delay.get().min(FASTEST_TIMER),
+			(false, true) => Duration::from_millis(100),
+			(false, false) => FASTEST_TIMER,
+		};
+		let fut = Selector {
+			a: channel_manager.get_cm().get_event_or_persistence_needed_future(),
+			b: chain_monitor.get_update_future(),
+			c: om_fut,
+			d: lm_fut,
+			e: sleeper(sleep_delay),
+		};
+		match fut.await {
+			SelectorOutput::A | SelectorOutput::B | SelectorOutput::C | SelectorOutput::D => {},
+			SelectorOutput::E(exit) => {
+				if exit {
+					break;
+				}
+			},
+		}
+
+		let await_slow = if mobile_interruptable_platform {
+			// Specify a zero new sleeper timeout because we won't use the new sleeper. It is re-initialized in the next
+			// loop iteration.
+			match check_and_reset_sleeper(&mut await_start.unwrap(), || sleeper(Duration::ZERO)) {
+				Some(true) => break,
+				Some(false) => true,
+				None => false,
 			}
-		},
-		|t| sleeper(Duration::from_secs(t)),
-		|fut: &mut SleepFuture, _| {
+		} else {
+			false
+		};
+		match check_and_reset_sleeper(&mut last_freshness_call, || sleeper(FRESHNESS_TIMER)) {
+			Some(false) => {
+				log_trace!(logger, "Calling ChannelManager's timer_tick_occurred");
+				channel_manager.get_cm().timer_tick_occurred();
+			},
+			Some(true) => break,
+			None => {},
+		}
+
+		let mut futures = Joiner::new();
+
+		if channel_manager.get_cm().get_and_clear_needs_persistence() {
+			log_trace!(logger, "Persisting ChannelManager...");
+
+			let fut = async {
+				kv_store
+					.write(
+						CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+						CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+						CHANNEL_MANAGER_PERSISTENCE_KEY,
+						channel_manager.get_cm().encode(),
+					)
+					.await
+			};
+			// TODO: Once our MSRV is 1.68 we should be able to drop the Box
+			let mut fut = Box::pin(fut);
+
+			// Because persisting the ChannelManager is important to avoid accidental
+			// force-closures, go ahead and poll the future once before we do slightly more
+			// CPU-intensive tasks in the form of NetworkGraph pruning or scorer time-stepping
+			// below. This will get it moving but won't block us for too long if the underlying
+			// future is actually async.
+			use core::future::Future;
 			let mut waker = dummy_waker();
 			let mut ctx = task::Context::from_waker(&mut waker);
-			match core::pin::Pin::new(fut).poll(&mut ctx) {
-				task::Poll::Ready(exit) => {
-					should_break = exit;
-					true
-				},
-				task::Poll::Pending => false,
+			match core::pin::Pin::new(&mut fut).poll(&mut ctx) {
+				task::Poll::Ready(res) => futures.set_a_res(res),
+				task::Poll::Pending => futures.set_a(fut),
 			}
+
+			log_trace!(logger, "Done persisting ChannelManager.");
+		}
+
+		// Note that we want to run a graph prune once not long after startup before
+		// falling back to our usual hourly prunes. This avoids short-lived clients never
+		// pruning their network graph. We run once 60 seconds after startup before
+		// continuing our normal cadence. For RGS, since 60 seconds is likely too long,
+		// we prune after an initial sync completes.
+		let prune_timer = if gossip_sync.prunable_network_graph().is_some() {
+			NETWORK_PRUNE_TIMER
+		} else {
+			FIRST_NETWORK_PRUNE_TIMER
+		};
+		let prune_timer_elapsed = {
+			match check_and_reset_sleeper(&mut last_prune_call, || sleeper(prune_timer)) {
+				Some(false) => true,
+				Some(true) => break,
+				None => false,
+			}
+		};
+
+		let should_prune = match gossip_sync {
+			GossipSync::Rapid(_) => !have_pruned || prune_timer_elapsed,
+			_ => prune_timer_elapsed,
+		};
+		if should_prune {
+			// The network graph must not be pruned while rapid sync completion is pending
+			if let Some(network_graph) = gossip_sync.prunable_network_graph() {
+				if let Some(duration_since_epoch) = fetch_time() {
+					log_trace!(logger, "Pruning and persisting network graph.");
+					network_graph.remove_stale_channels_and_tracking_with_time(
+						duration_since_epoch.as_secs(),
+					);
+				} else {
+					log_warn!(logger, "Not pruning network graph, consider implementing the fetch_time argument or calling remove_stale_channels_and_tracking_with_time manually.");
+					log_trace!(logger, "Persisting network graph.");
+				}
+				let fut = async {
+					if let Err(e) = kv_store
+						.write(
+							NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+							NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+							NETWORK_GRAPH_PERSISTENCE_KEY,
+							network_graph.encode(),
+						)
+						.await
+					{
+						log_error!(logger, "Error: Failed to persist network graph, check your disk and permissions {}",e);
+					}
+
+					Ok(())
+				};
+
+				// TODO: Once our MSRV is 1.68 we should be able to drop the Box
+				futures.set_b(Box::pin(fut));
+
+				have_pruned = true;
+			}
+		}
+		if !have_decayed_scorer {
+			if let Some(ref scorer) = scorer {
+				if let Some(duration_since_epoch) = fetch_time() {
+					log_trace!(logger, "Calling time_passed on scorer at startup");
+					scorer.write_lock().time_passed(duration_since_epoch);
+				}
+			}
+			have_decayed_scorer = true;
+		}
+		match check_and_reset_sleeper(&mut last_scorer_persist_call, || {
+			sleeper(SCORER_PERSIST_TIMER)
+		}) {
+			Some(false) => {
+				if let Some(ref scorer) = scorer {
+					if let Some(duration_since_epoch) = fetch_time() {
+						log_trace!(logger, "Calling time_passed and persisting scorer");
+						scorer.write_lock().time_passed(duration_since_epoch);
+					} else {
+						log_trace!(logger, "Persisting scorer");
+					}
+					let fut = async {
+						if let Err(e) = kv_store
+							.write(
+								SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+								SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+								SCORER_PERSISTENCE_KEY,
+								scorer.encode(),
+							)
+							.await
+						{
+							log_error!(
+							logger,
+							"Error: Failed to persist scorer, check your disk and permissions {}",
+							e
+						);
+						}
+
+						Ok(())
+					};
+
+					// TODO: Once our MSRV is 1.68 we should be able to drop the Box
+					futures.set_c(Box::pin(fut));
+				}
+			},
+			Some(true) => break,
+			None => {},
+		}
+		match check_and_reset_sleeper(&mut last_sweeper_call, || sleeper(SWEEPER_TIMER)) {
+			Some(false) => {
+				log_trace!(logger, "Regenerating sweeper spends if necessary");
+				if let Some(ref sweeper) = sweeper {
+					let fut = async {
+						let _ = sweeper.regenerate_and_broadcast_spend_if_necessary().await;
+
+						Ok(())
+					};
+
+					// TODO: Once our MSRV is 1.68 we should be able to drop the Box
+					futures.set_d(Box::pin(fut));
+				}
+			},
+			Some(true) => break,
+			None => {},
+		}
+
+		if let Some(liquidity_manager) = liquidity_manager.as_ref() {
+			log_trace!(logger, "Persisting LiquidityManager...");
+			let fut = async {
+				liquidity_manager.get_lm().persist().await.map_err(|e| {
+					log_error!(logger, "Persisting LiquidityManager failed: {}", e);
+					e
+				})
+			};
+			futures.set_e(Box::pin(fut));
+		}
+
+		// Run persistence tasks in parallel and exit if any of them returns an error.
+		for res in futures.await {
+			res?;
+		}
+
+		match check_and_reset_sleeper(&mut last_onion_message_handler_call, || {
+			sleeper(ONION_MESSAGE_HANDLER_TIMER)
+		}) {
+			Some(false) => {
+				if let Some(om) = &onion_messenger {
+					log_trace!(logger, "Calling OnionMessageHandler's timer_tick_occurred");
+					om.get_om().timer_tick_occurred();
+				}
+			},
+			Some(true) => break,
+			None => {},
+		}
+
+		// Peer manager timer tick. If we were interrupted on a mobile platform, we disconnect all peers.
+		if await_slow {
+			// On various platforms, we may be starved of CPU cycles for several reasons.
+			// E.g. on iOS, if we've been in the background, we will be entirely paused.
+			// Similarly, if we're on a desktop platform and the device has been asleep, we
+			// may not get any cycles.
+			// We detect this by checking if our max-100ms-sleep, above, ran longer than a
+			// full second, at which point we assume sockets may have been killed (they
+			// appear to be at least on some platforms, even if it has only been a second).
+			// Note that we have to take care to not get here just because user event
+			// processing was slow at the top of the loop. For example, the sample client
+			// may call Bitcoin Core RPCs during event handling, which very often takes
+			// more than a handful of seconds to complete, and shouldn't disconnect all our
+			// peers.
+			log_trace!(logger, "100ms sleep took more than a second, disconnecting peers.");
+			peer_manager.as_ref().disconnect_all_peers();
+			last_ping_call = sleeper(PING_TIMER);
+		} else {
+			match check_and_reset_sleeper(&mut last_ping_call, || sleeper(PING_TIMER)) {
+				Some(false) => {
+					log_trace!(logger, "Calling PeerManager's timer_tick_occurred");
+					peer_manager.as_ref().timer_tick_occurred();
+				},
+				Some(true) => break,
+				_ => {},
+			}
+		}
+
+		// Rebroadcast pending claims.
+		match check_and_reset_sleeper(&mut last_rebroadcast_call, || sleeper(REBROADCAST_TIMER)) {
+			Some(false) => {
+				log_trace!(logger, "Rebroadcasting monitor's pending claims");
+				chain_monitor.rebroadcast_pending_claims();
+			},
+			Some(true) => break,
+			None => {},
+		}
+	}
+	log_trace!(logger, "Terminating background processor.");
+
+	// After we exit, ensure we persist the ChannelManager one final time - this avoids
+	// some races where users quit while channel updates were in-flight, with
+	// ChannelMonitor update(s) persisted without a corresponding ChannelManager update.
+	kv_store
+		.write(
+			CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+			CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+			CHANNEL_MANAGER_PERSISTENCE_KEY,
+			channel_manager.get_cm().encode(),
+		)
+		.await?;
+	if let Some(ref scorer) = scorer {
+		kv_store
+			.write(
+				SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+				SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+				SCORER_PERSISTENCE_KEY,
+				scorer.encode(),
+			)
+			.await?;
+	}
+	if let Some(network_graph) = gossip_sync.network_graph() {
+		kv_store
+			.write(
+				NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+				NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+				NETWORK_GRAPH_PERSISTENCE_KEY,
+				network_graph.encode(),
+			)
+			.await?;
+	}
+	Ok(())
+}
+
+fn check_and_reset_sleeper<
+	SleepFuture: core::future::Future<Output = bool> + core::marker::Unpin,
+>(
+	fut: &mut SleepFuture, mut new_sleeper: impl FnMut() -> SleepFuture,
+) -> Option<bool> {
+	let mut waker = dummy_waker();
+	let mut ctx = task::Context::from_waker(&mut waker);
+	match core::pin::Pin::new(&mut *fut).poll(&mut ctx) {
+		task::Poll::Ready(exit) => {
+			*fut = new_sleeper();
+			Some(exit)
 		},
+		task::Poll::Pending => None,
+	}
+}
+
+/// Async events processor that is based on [`process_events_async`] but allows for [`KVStoreSync`] to be used for
+/// synchronous background persistence.
+pub async fn process_events_async_with_kv_store_sync<
+	UL: Deref,
+	CF: Deref,
+	T: Deref,
+	F: Deref,
+	G: Deref<Target = NetworkGraph<L>>,
+	L: Deref,
+	P: Deref,
+	EventHandlerFuture: core::future::Future<Output = Result<(), ReplayEvent>>,
+	EventHandler: Fn(Event) -> EventHandlerFuture,
+	ES: Deref,
+	M: Deref<Target = ChainMonitor<<CM::Target as AChannelManager>::Signer, CF, T, F, L, P, ES>>,
+	CM: Deref,
+	OM: Deref,
+	PGS: Deref<Target = P2PGossipSync<G, UL, L>>,
+	RGS: Deref<Target = RapidGossipSync<G, L>>,
+	PM: Deref,
+	LM: Deref,
+	D: Deref,
+	O: Deref,
+	K: Deref,
+	OS: Deref<Target = OutputSweeperSync<T, D, F, CF, K, L, O>>,
+	S: Deref<Target = SC>,
+	SC: for<'b> WriteableScore<'b>,
+	SleepFuture: core::future::Future<Output = bool> + core::marker::Unpin,
+	Sleeper: Fn(Duration) -> SleepFuture,
+	FetchTime: Fn() -> Option<Duration>,
+>(
+	kv_store: K, event_handler: EventHandler, chain_monitor: M, channel_manager: CM,
+	onion_messenger: Option<OM>, gossip_sync: GossipSync<PGS, RGS, G, UL, L>, peer_manager: PM,
+	liquidity_manager: Option<LM>, sweeper: Option<OS>, logger: L, scorer: Option<S>,
+	sleeper: Sleeper, mobile_interruptable_platform: bool, fetch_time: FetchTime,
+) -> Result<(), lightning::io::Error>
+where
+	UL::Target: UtxoLookup,
+	CF::Target: chain::Filter,
+	T::Target: BroadcasterInterface,
+	F::Target: FeeEstimator,
+	L::Target: Logger,
+	P::Target: Persist<<CM::Target as AChannelManager>::Signer>,
+	ES::Target: EntropySource,
+	CM::Target: AChannelManager,
+	OM::Target: AOnionMessenger,
+	PM::Target: APeerManager,
+	LM::Target: ALiquidityManager,
+	O::Target: OutputSpender,
+	D::Target: ChangeDestinationSourceSync,
+	K::Target: KVStoreSync,
+{
+	let kv_store = KVStoreSyncWrapper(kv_store);
+	process_events_async(
+		kv_store,
+		event_handler,
+		chain_monitor,
+		channel_manager,
+		onion_messenger,
+		gossip_sync,
+		peer_manager,
+		liquidity_manager,
+		sweeper.as_ref().map(|os| os.sweeper_async()),
+		logger,
+		scorer,
+		sleeper,
 		mobile_interruptable_platform,
 		fetch_time,
 	)
+	.await
 }
 
 #[cfg(feature = "std")]
@@ -861,21 +1423,21 @@ impl BackgroundProcessor {
 	/// documentation].
 	///
 	/// The thread runs indefinitely unless the object is dropped, [`stop`] is called, or
-	/// [`Persister::persist_manager`] returns an error. In case of an error, the error is retrieved by calling
+	/// [`KVStoreSync`] returns an error. In case of an error, the error is retrieved by calling
 	/// either [`join`] or [`stop`].
 	///
 	/// # Data Persistence
 	///
-	/// [`Persister::persist_manager`] is responsible for writing out the [`ChannelManager`] to disk, and/or
+	/// [`KVStoreSync`] is responsible for writing out the [`ChannelManager`] to disk, and/or
 	/// uploading to one or more backup services. See [`ChannelManager::write`] for writing out a
 	/// [`ChannelManager`]. See the `lightning-persister` crate for LDK's
 	/// provided implementation.
 	///
-	/// [`Persister::persist_graph`] is responsible for writing out the [`NetworkGraph`] to disk, if
+	/// [`KVStoreSync`] is also responsible for writing out the [`NetworkGraph`] to disk, if
 	/// [`GossipSync`] is supplied. See [`NetworkGraph::write`] for writing out a [`NetworkGraph`].
 	/// See the `lightning-persister` crate for LDK's provided implementation.
 	///
-	/// Typically, users should either implement [`Persister::persist_manager`] to never return an
+	/// Typically, users should either implement [`KVStoreSync`] to never return an
 	/// error or call [`join`] and handle any error that may arise. For the latter case,
 	/// `BackgroundProcessor` must be restarted by calling `start` again after handling the error.
 	///
@@ -897,36 +1459,41 @@ impl BackgroundProcessor {
 	/// [`stop`]: Self::stop
 	/// [`ChannelManager`]: lightning::ln::channelmanager::ChannelManager
 	/// [`ChannelManager::write`]: lightning::ln::channelmanager::ChannelManager#impl-Writeable
-	/// [`Persister::persist_manager`]: lightning::util::persist::Persister::persist_manager
-	/// [`Persister::persist_graph`]: lightning::util::persist::Persister::persist_graph
 	/// [`NetworkGraph`]: lightning::routing::gossip::NetworkGraph
 	/// [`NetworkGraph::write`]: lightning::routing::gossip::NetworkGraph#impl-Writeable
 	pub fn start<
 		'a,
-		UL: 'static + Deref + Send + Sync,
-		CF: 'static + Deref + Send + Sync,
-		T: 'static + Deref + Send + Sync,
-		F: 'static + Deref + Send + Sync,
-		G: 'static + Deref<Target = NetworkGraph<L>> + Send + Sync,
-		L: 'static + Deref + Send + Sync,
-		P: 'static + Deref + Send + Sync,
+		UL: 'static + Deref,
+		CF: 'static + Deref,
+		T: 'static + Deref,
+		F: 'static + Deref + Send,
+		G: 'static + Deref<Target = NetworkGraph<L>>,
+		L: 'static + Deref + Send,
+		P: 'static + Deref,
 		EH: 'static + EventHandler + Send,
-		PS: 'static + Deref + Send,
+		ES: 'static + Deref + Send,
 		M: 'static
-			+ Deref<Target = ChainMonitor<<CM::Target as AChannelManager>::Signer, CF, T, F, L, P>>
+			+ Deref<
+				Target = ChainMonitor<<CM::Target as AChannelManager>::Signer, CF, T, F, L, P, ES>,
+			>
 			+ Send
 			+ Sync,
-		CM: 'static + Deref + Send + Sync,
-		OM: 'static + Deref + Send + Sync,
-		PGS: 'static + Deref<Target = P2PGossipSync<G, UL, L>> + Send + Sync,
+		CM: 'static + Deref + Send,
+		OM: 'static + Deref + Send,
+		PGS: 'static + Deref<Target = P2PGossipSync<G, UL, L>> + Send,
 		RGS: 'static + Deref<Target = RapidGossipSync<G, L>> + Send,
-		PM: 'static + Deref + Send + Sync,
+		PM: 'static + Deref + Send,
+		LM: 'static + Deref + Send,
 		S: 'static + Deref<Target = SC> + Send + Sync,
 		SC: for<'b> WriteableScore<'b>,
+		D: 'static + Deref,
+		O: 'static + Deref,
+		K: 'static + Deref + Send,
+		OS: 'static + Deref<Target = OutputSweeperSync<T, D, F, CF, K, L, O>> + Send,
 	>(
-		persister: PS, event_handler: EH, chain_monitor: M, channel_manager: CM,
+		kv_store: K, event_handler: EH, chain_monitor: M, channel_manager: CM,
 		onion_messenger: Option<OM>, gossip_sync: GossipSync<PGS, RGS, G, UL, L>, peer_manager: PM,
-		logger: L, scorer: Option<S>,
+		liquidity_manager: Option<LM>, sweeper: Option<OS>, logger: L, scorer: Option<S>,
 	) -> Self
 	where
 		UL::Target: 'static + UtxoLookup,
@@ -935,13 +1502,17 @@ impl BackgroundProcessor {
 		F::Target: 'static + FeeEstimator,
 		L::Target: 'static + Logger,
 		P::Target: 'static + Persist<<CM::Target as AChannelManager>::Signer>,
-		PS::Target: 'static + Persister<'a, CM, L, S>,
-		CM::Target: AChannelManager + Send + Sync,
-		OM::Target: AOnionMessenger + Send + Sync,
-		PM::Target: APeerManager + Send + Sync,
+		ES::Target: 'static + EntropySource,
+		CM::Target: AChannelManager,
+		OM::Target: AOnionMessenger,
+		PM::Target: APeerManager,
+		LM::Target: ALiquidityManagerSync,
+		D::Target: ChangeDestinationSourceSync,
+		O::Target: 'static + OutputSpender,
+		K::Target: 'static + KVStoreSync,
 	{
 		let stop_thread = Arc::new(AtomicBool::new(false));
-		let stop_thread_clone = stop_thread.clone();
+		let stop_thread_clone = Arc::clone(&stop_thread);
 		let handle = thread::spawn(move || -> Result<(), std::io::Error> {
 			let event_handler = |event| {
 				let network_graph = gossip_sync.network_graph();
@@ -955,55 +1526,237 @@ impl BackgroundProcessor {
 						.expect("Time should be sometime after 1970");
 					if update_scorer(scorer, &event, duration_since_epoch) {
 						log_trace!(logger, "Persisting scorer after update");
-						if let Err(e) = persister.persist_scorer(&scorer) {
+						if let Err(e) = kv_store.write(
+							SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+							SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+							SCORER_PERSISTENCE_KEY,
+							scorer.encode(),
+						) {
 							log_error!(logger, "Error: Failed to persist scorer, check your disk and permissions {}", e)
 						}
 					}
 				}
 				event_handler.handle_event(event)
 			};
-			define_run_body!(
-				persister,
-				chain_monitor,
-				chain_monitor.process_pending_events(&event_handler),
-				channel_manager,
-				channel_manager.get_cm().process_pending_events(&event_handler),
-				onion_messenger,
+			let mut batch_delay = BatchDelay::new();
+
+			log_trace!(logger, "Calling ChannelManager's timer_tick_occurred on startup");
+			channel_manager.get_cm().timer_tick_occurred();
+			log_trace!(logger, "Rebroadcasting monitor's pending claims on startup");
+			chain_monitor.rebroadcast_pending_claims();
+
+			let mut last_freshness_call = Instant::now();
+			let mut last_onion_message_handler_call = Instant::now();
+			let mut last_ping_call = Instant::now();
+			let mut last_prune_call = Instant::now();
+			let mut last_scorer_persist_call = Instant::now();
+			let mut last_rebroadcast_call = Instant::now();
+			let mut last_sweeper_call = Instant::now();
+			let mut have_pruned = false;
+			let mut have_decayed_scorer = false;
+
+			let mut cur_batch_delay = batch_delay.get();
+			let mut last_forwards_processing_call = Instant::now();
+
+			loop {
+				channel_manager.get_cm().process_pending_events(&event_handler);
+				chain_monitor.process_pending_events(&event_handler);
 				if let Some(om) = &onion_messenger {
 					om.get_om().process_pending_events(&event_handler)
-				},
-				peer_manager,
-				gossip_sync,
-				logger,
-				scorer,
-				stop_thread.load(Ordering::Acquire),
-				{
-					let sleeper = if let Some(om) = onion_messenger.as_ref() {
-						Sleeper::from_three_futures(
-							&channel_manager.get_cm().get_event_or_persistence_needed_future(),
-							&chain_monitor.get_update_future(),
-							&om.get_om().get_update_future(),
-						)
-					} else {
-						Sleeper::from_two_futures(
-							&channel_manager.get_cm().get_event_or_persistence_needed_future(),
-							&chain_monitor.get_update_future(),
-						)
-					};
-					sleeper.wait_timeout(Duration::from_millis(100));
-				},
-				|_| Instant::now(),
-				|time: &Instant, dur| time.elapsed().as_secs() > dur,
-				false,
-				|| {
-					use std::time::SystemTime;
-					Some(
-						SystemTime::now()
-							.duration_since(SystemTime::UNIX_EPOCH)
-							.expect("Time should be sometime after 1970"),
-					)
-				},
-			)
+				};
+
+				// Note that the PeerManager::process_events may block on ChannelManager's locks,
+				// hence it comes last here. When the ChannelManager finishes whatever it's doing,
+				// we want to ensure we get into `persist_manager` as quickly as we can, especially
+				// without running the normal event processing above and handing events to users.
+				//
+				// Specifically, on an *extremely* slow machine, we may see ChannelManager start
+				// processing a message effectively at any point during this loop. In order to
+				// minimize the time between such processing completing and persisting the updated
+				// ChannelManager, we want to minimize methods blocking on a ChannelManager
+				// generally, and as a fallback place such blocking only immediately before
+				// persistence.
+				peer_manager.as_ref().process_events();
+				if last_forwards_processing_call.elapsed() > cur_batch_delay {
+					channel_manager.get_cm().process_pending_htlc_forwards();
+					cur_batch_delay = batch_delay.next();
+					last_forwards_processing_call = Instant::now();
+				}
+				if stop_thread.load(Ordering::Acquire) {
+					log_trace!(logger, "Terminating background processor.");
+					break;
+				}
+				let sleeper = match (onion_messenger.as_ref(), liquidity_manager.as_ref()) {
+					(Some(om), Some(lm)) => Sleeper::from_four_futures(
+						&channel_manager.get_cm().get_event_or_persistence_needed_future(),
+						&chain_monitor.get_update_future(),
+						&om.get_om().get_update_future(),
+						&lm.get_lm().get_pending_msgs_or_needs_persist_future(),
+					),
+					(Some(om), None) => Sleeper::from_three_futures(
+						&channel_manager.get_cm().get_event_or_persistence_needed_future(),
+						&chain_monitor.get_update_future(),
+						&om.get_om().get_update_future(),
+					),
+					(None, Some(lm)) => Sleeper::from_three_futures(
+						&channel_manager.get_cm().get_event_or_persistence_needed_future(),
+						&chain_monitor.get_update_future(),
+						&lm.get_lm().get_pending_msgs_or_needs_persist_future(),
+					),
+					(None, None) => Sleeper::from_two_futures(
+						&channel_manager.get_cm().get_event_or_persistence_needed_future(),
+						&chain_monitor.get_update_future(),
+					),
+				};
+				let batch_delay = if channel_manager.get_cm().needs_pending_htlc_processing() {
+					batch_delay.get()
+				} else {
+					Duration::MAX
+				};
+				let fastest_timeout = batch_delay.min(Duration::from_millis(100));
+				sleeper.wait_timeout(fastest_timeout);
+				if stop_thread.load(Ordering::Acquire) {
+					log_trace!(logger, "Terminating background processor.");
+					break;
+				}
+				if last_freshness_call.elapsed() > FRESHNESS_TIMER {
+					log_trace!(logger, "Calling ChannelManager's timer_tick_occurred");
+					channel_manager.get_cm().timer_tick_occurred();
+					last_freshness_call = Instant::now();
+				}
+				if channel_manager.get_cm().get_and_clear_needs_persistence() {
+					log_trace!(logger, "Persisting ChannelManager...");
+					(kv_store.write(
+						CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+						CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+						CHANNEL_MANAGER_PERSISTENCE_KEY,
+						channel_manager.get_cm().encode(),
+					))?;
+					log_trace!(logger, "Done persisting ChannelManager.");
+				}
+
+				if let Some(liquidity_manager) = liquidity_manager.as_ref() {
+					log_trace!(logger, "Persisting LiquidityManager...");
+					let _ = liquidity_manager.get_lm().persist().map_err(|e| {
+						log_error!(logger, "Persisting LiquidityManager failed: {}", e);
+					});
+				}
+
+				// Note that we want to run a graph prune once not long after startup before
+				// falling back to our usual hourly prunes. This avoids short-lived clients never
+				// pruning their network graph. We run once 60 seconds after startup before
+				// continuing our normal cadence. For RGS, since 60 seconds is likely too long,
+				// we prune after an initial sync completes.
+				let prune_timer =
+					if have_pruned { NETWORK_PRUNE_TIMER } else { FIRST_NETWORK_PRUNE_TIMER };
+				let prune_timer_elapsed = last_prune_call.elapsed() > prune_timer;
+				let should_prune = match gossip_sync {
+					GossipSync::Rapid(_) => !have_pruned || prune_timer_elapsed,
+					_ => prune_timer_elapsed,
+				};
+				if should_prune {
+					// The network graph must not be pruned while rapid sync completion is pending
+					if let Some(network_graph) = gossip_sync.prunable_network_graph() {
+						let duration_since_epoch = std::time::SystemTime::now()
+							.duration_since(std::time::SystemTime::UNIX_EPOCH)
+							.expect("Time should be sometime after 1970");
+
+						log_trace!(logger, "Pruning and persisting network graph.");
+						network_graph.remove_stale_channels_and_tracking_with_time(
+							duration_since_epoch.as_secs(),
+						);
+						if let Err(e) = kv_store.write(
+							NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+							NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+							NETWORK_GRAPH_PERSISTENCE_KEY,
+							network_graph.encode(),
+						) {
+							log_error!(logger, "Error: Failed to persist network graph, check your disk and permissions {}", e);
+						}
+						have_pruned = true;
+					}
+					last_prune_call = Instant::now();
+				}
+				if !have_decayed_scorer {
+					if let Some(ref scorer) = scorer {
+						let duration_since_epoch = std::time::SystemTime::now()
+							.duration_since(std::time::SystemTime::UNIX_EPOCH)
+							.expect("Time should be sometime after 1970");
+						log_trace!(logger, "Calling time_passed on scorer at startup");
+						scorer.write_lock().time_passed(duration_since_epoch);
+					}
+					have_decayed_scorer = true;
+				}
+				if last_scorer_persist_call.elapsed() > SCORER_PERSIST_TIMER {
+					if let Some(ref scorer) = scorer {
+						let duration_since_epoch = std::time::SystemTime::now()
+							.duration_since(std::time::SystemTime::UNIX_EPOCH)
+							.expect("Time should be sometime after 1970");
+						log_trace!(logger, "Calling time_passed and persisting scorer");
+						scorer.write_lock().time_passed(duration_since_epoch);
+						if let Err(e) = kv_store.write(
+							SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+							SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+							SCORER_PERSISTENCE_KEY,
+							scorer.encode(),
+						) {
+							log_error!(logger, "Error: Failed to persist scorer, check your disk and permissions {}", e);
+						}
+					}
+					last_scorer_persist_call = Instant::now();
+				}
+				if last_sweeper_call.elapsed() > SWEEPER_TIMER {
+					log_trace!(logger, "Regenerating sweeper spends if necessary");
+					if let Some(ref sweeper) = sweeper {
+						let _ = sweeper.regenerate_and_broadcast_spend_if_necessary();
+					}
+					last_sweeper_call = Instant::now();
+				}
+				if last_onion_message_handler_call.elapsed() > ONION_MESSAGE_HANDLER_TIMER {
+					if let Some(om) = &onion_messenger {
+						log_trace!(logger, "Calling OnionMessageHandler's timer_tick_occurred");
+						om.get_om().timer_tick_occurred();
+					}
+					last_onion_message_handler_call = Instant::now();
+				}
+				if last_ping_call.elapsed() > PING_TIMER {
+					log_trace!(logger, "Calling PeerManager's timer_tick_occurred");
+					peer_manager.as_ref().timer_tick_occurred();
+					last_ping_call = Instant::now();
+				}
+				if last_rebroadcast_call.elapsed() > REBROADCAST_TIMER {
+					log_trace!(logger, "Rebroadcasting monitor's pending claims");
+					chain_monitor.rebroadcast_pending_claims();
+					last_rebroadcast_call = Instant::now();
+				}
+			}
+
+			// After we exit, ensure we persist the ChannelManager one final time - this avoids
+			// some races where users quit while channel updates were in-flight, with
+			// ChannelMonitor update(s) persisted without a corresponding ChannelManager update.
+			kv_store.write(
+				CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+				CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+				CHANNEL_MANAGER_PERSISTENCE_KEY,
+				channel_manager.get_cm().encode(),
+			)?;
+			if let Some(ref scorer) = scorer {
+				kv_store.write(
+					SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+					SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+					SCORER_PERSISTENCE_KEY,
+					scorer.encode(),
+				)?;
+			}
+			if let Some(network_graph) = gossip_sync.network_graph() {
+				kv_store.write(
+					NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+					NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+					NETWORK_GRAPH_PERSISTENCE_KEY,
+					network_graph.encode(),
+				)?;
+			}
+			Ok(())
 		});
 		Self { stop_thread: stop_thread_clone, thread_handle: Some(handle) }
 	}
@@ -1071,37 +1824,41 @@ mod tests {
 	use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 	use lightning::chain::transaction::OutPoint;
 	use lightning::chain::{chainmonitor, BestBlock, Confirm, Filter};
-	use lightning::events::{
-		Event, MessageSendEvent, MessageSendEventsProvider, PathFailure, ReplayEvent,
-	};
+	use lightning::events::{Event, PathFailure, ReplayEvent};
 	use lightning::ln::channelmanager;
 	use lightning::ln::channelmanager::{
 		ChainParameters, PaymentId, BREAKDOWN_TIMEOUT, MIN_CLTV_EXPIRY_DELTA,
 	};
-	use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 	use lightning::ln::functional_test_utils::*;
-	use lightning::ln::msgs::{ChannelMessageHandler, Init};
+	use lightning::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, Init, MessageSendEvent};
 	use lightning::ln::peer_handler::{
 		IgnoringMessageHandler, MessageHandler, PeerManager, SocketDescriptor,
 	};
-	use lightning::ln::types::{ChannelId, PaymentHash};
+	use lightning::ln::types::ChannelId;
 	use lightning::onion_message::messenger::{DefaultMessageRouter, OnionMessenger};
 	use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
 	use lightning::routing::router::{CandidateRouteHop, DefaultRouter, Path, RouteHop};
 	use lightning::routing::scoring::{ChannelUsage, LockableScore, ScoreLookUp, ScoreUpdate};
-	use lightning::sign::{ChangeDestinationSource, InMemorySigner, KeysManager};
+	use lightning::sign::{ChangeDestinationSourceSync, InMemorySigner, KeysManager, NodeSigner};
+	use lightning::types::features::{ChannelFeatures, NodeFeatures};
+	use lightning::types::payment::PaymentHash;
 	use lightning::util::config::UserConfig;
 	use lightning::util::persist::{
-		KVStore, CHANNEL_MANAGER_PERSISTENCE_KEY, CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+		KVStoreSync, KVStoreSyncWrapper, CHANNEL_MANAGER_PERSISTENCE_KEY,
+		CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 		CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_KEY,
 		NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
 		SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 		SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 	};
 	use lightning::util::ser::Writeable;
-	use lightning::util::sweep::{OutputSpendStatus, OutputSweeper};
+	use lightning::util::sweep::{
+		OutputSpendStatus, OutputSweeper, OutputSweeperSync, PRUNE_DELAY_BLOCKS,
+	};
 	use lightning::util::test_utils;
 	use lightning::{get_event, get_event_msg};
+	use lightning_liquidity::utils::time::DefaultTimeProvider;
+	use lightning_liquidity::{ALiquidityManagerSync, LiquidityManager, LiquidityManagerSync};
 	use lightning_persister::fs_store::FilesystemStore;
 	use lightning_rapid_gossip_sync::RapidGossipSync;
 	use std::collections::VecDeque;
@@ -1111,12 +1868,13 @@ mod tests {
 	use std::time::Duration;
 	use std::{env, fs};
 
-	const EVENT_DEADLINE: u64 = 5 * FRESHNESS_TIMER;
+	const EVENT_DEADLINE: Duration =
+		Duration::from_millis(5 * (FRESHNESS_TIMER.as_millis() as u64));
 
 	#[derive(Clone, Hash, PartialEq, Eq)]
 	struct TestDescriptor {}
 	impl SocketDescriptor for TestDescriptor {
-		fn send_data(&mut self, _data: &[u8], _resume_read: bool) -> usize {
+		fn send_data(&mut self, _data: &[u8], _continue_read: bool) -> usize {
 			0
 		}
 
@@ -1145,6 +1903,13 @@ mod tests {
 				TestScorer,
 			>,
 		>,
+		Arc<
+			DefaultMessageRouter<
+				Arc<NetworkGraph<Arc<test_utils::TestLogger>>>,
+				Arc<test_utils::TestLogger>,
+				Arc<KeysManager>,
+			>,
+		>,
 		Arc<test_utils::TestLogger>,
 	>;
 
@@ -1154,7 +1919,8 @@ mod tests {
 		Arc<test_utils::TestBroadcaster>,
 		Arc<test_utils::TestFeeEstimator>,
 		Arc<test_utils::TestLogger>,
-		Arc<FilesystemStore>,
+		Arc<Persister>,
+		Arc<KeysManager>,
 	>;
 
 	type PGS = Arc<
@@ -1186,6 +1952,17 @@ mod tests {
 		IgnoringMessageHandler,
 		Arc<ChannelManager>,
 		IgnoringMessageHandler,
+		IgnoringMessageHandler,
+	>;
+
+	type LM = LiquidityManagerSync<
+		Arc<KeysManager>,
+		Arc<KeysManager>,
+		Arc<ChannelManager>,
+		Arc<dyn Filter + Sync + Send>,
+		Arc<Persister>,
+		DefaultTimeProvider,
+		Arc<test_utils::TestBroadcaster>,
 	>;
 
 	struct Node {
@@ -1202,22 +1979,24 @@ mod tests {
 				Arc<test_utils::TestLogger>,
 				IgnoringMessageHandler,
 				Arc<KeysManager>,
+				IgnoringMessageHandler,
 			>,
 		>,
+		liquidity_manager: Arc<LM>,
 		chain_monitor: Arc<ChainMonitor>,
-		kv_store: Arc<FilesystemStore>,
+		kv_store: Arc<Persister>,
 		tx_broadcaster: Arc<test_utils::TestBroadcaster>,
 		network_graph: Arc<NetworkGraph<Arc<test_utils::TestLogger>>>,
 		logger: Arc<test_utils::TestLogger>,
 		best_block: BestBlock,
 		scorer: Arc<LockingWrapper<TestScorer>>,
 		sweeper: Arc<
-			OutputSweeper<
+			OutputSweeperSync<
 				Arc<test_utils::TestBroadcaster>,
 				Arc<TestWallet>,
 				Arc<test_utils::TestFeeEstimator>,
-				Arc<dyn Filter + Sync + Send>,
-				Arc<FilesystemStore>,
+				Arc<test_utils::TestChainSource>,
+				Arc<Persister>,
 				Arc<test_utils::TestLogger>,
 				Arc<KeysManager>,
 			>,
@@ -1234,7 +2013,7 @@ mod tests {
 			Arc<test_utils::TestChainSource>,
 			Arc<test_utils::TestLogger>,
 		> {
-			GossipSync::P2P(self.p2p_gossip_sync.clone())
+			GossipSync::P2P(Arc::clone(&self.p2p_gossip_sync))
 		}
 
 		fn rapid_gossip_sync(
@@ -1246,7 +2025,7 @@ mod tests {
 			Arc<test_utils::TestChainSource>,
 			Arc<test_utils::TestLogger>,
 		> {
-			GossipSync::Rapid(self.rapid_gossip_sync.clone())
+			GossipSync::Rapid(Arc::clone(&self.rapid_gossip_sync))
 		}
 
 		fn no_gossip_sync(
@@ -1309,9 +2088,13 @@ mod tests {
 		fn with_scorer_error(self, error: std::io::ErrorKind, message: &'static str) -> Self {
 			Self { scorer_error: Some((error, message)), ..self }
 		}
+
+		pub fn get_data_dir(&self) -> PathBuf {
+			self.kv_store.get_data_dir()
+		}
 	}
 
-	impl KVStore for Persister {
+	impl KVStoreSync for Persister {
 		fn read(
 			&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 		) -> lightning::io::Result<Vec<u8>> {
@@ -1319,7 +2102,7 @@ mod tests {
 		}
 
 		fn write(
-			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: &[u8],
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 		) -> lightning::io::Result<()> {
 			if primary_namespace == CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE
 				&& secondary_namespace == CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE
@@ -1513,7 +2296,7 @@ mod tests {
 
 	struct TestWallet {}
 
-	impl ChangeDestinationSource for TestWallet {
+	impl ChangeDestinationSourceSync for TestWallet {
 		fn get_change_destination_script(&self) -> Result<ScriptBuf, ()> {
 			Ok(ScriptBuf::new())
 		}
@@ -1535,97 +2318,119 @@ mod tests {
 			let fee_estimator = Arc::new(test_utils::TestFeeEstimator::new(253));
 			let logger = Arc::new(test_utils::TestLogger::with_id(format!("node {}", i)));
 			let genesis_block = genesis_block(network);
-			let network_graph = Arc::new(NetworkGraph::new(network, logger.clone()));
+			let network_graph = Arc::new(NetworkGraph::new(network, Arc::clone(&logger)));
 			let scorer = Arc::new(LockingWrapper::new(TestScorer::new()));
 			let now = Duration::from_secs(genesis_block.header.time as u64);
 			let seed = [i as u8; 32];
-			let keys_manager = Arc::new(KeysManager::new(&seed, now.as_secs(), now.subsec_nanos()));
+			let keys_manager =
+				Arc::new(KeysManager::new(&seed, now.as_secs(), now.subsec_nanos(), true));
 			let router = Arc::new(DefaultRouter::new(
-				network_graph.clone(),
-				logger.clone(),
+				Arc::clone(&network_graph),
+				Arc::clone(&logger),
 				Arc::clone(&keys_manager),
-				scorer.clone(),
+				Arc::clone(&scorer),
 				Default::default(),
 			));
 			let msg_router = Arc::new(DefaultMessageRouter::new(
-				network_graph.clone(),
+				Arc::clone(&network_graph),
 				Arc::clone(&keys_manager),
 			));
 			let chain_source = Arc::new(test_utils::TestChainSource::new(Network::Bitcoin));
 			let kv_store =
-				Arc::new(FilesystemStore::new(format!("{}_persister_{}", &persist_dir, i).into()));
+				Arc::new(Persister::new(format!("{}_persister_{}", &persist_dir, i).into()));
 			let now = Duration::from_secs(genesis_block.header.time as u64);
-			let keys_manager = Arc::new(KeysManager::new(&seed, now.as_secs(), now.subsec_nanos()));
+			let keys_manager =
+				Arc::new(KeysManager::new(&seed, now.as_secs(), now.subsec_nanos(), true));
 			let chain_monitor = Arc::new(chainmonitor::ChainMonitor::new(
-				Some(chain_source.clone()),
-				tx_broadcaster.clone(),
-				logger.clone(),
-				fee_estimator.clone(),
-				kv_store.clone(),
+				Some(Arc::clone(&chain_source)),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&logger),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&kv_store),
+				Arc::clone(&keys_manager),
+				keys_manager.get_peer_storage_key(),
 			));
 			let best_block = BestBlock::from_network(network);
 			let params = ChainParameters { network, best_block };
 			let manager = Arc::new(ChannelManager::new(
-				fee_estimator.clone(),
-				chain_monitor.clone(),
-				tx_broadcaster.clone(),
-				router.clone(),
-				logger.clone(),
-				keys_manager.clone(),
-				keys_manager.clone(),
-				keys_manager.clone(),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&chain_monitor),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&router),
+				Arc::clone(&msg_router),
+				Arc::clone(&logger),
+				Arc::clone(&keys_manager),
+				Arc::clone(&keys_manager),
+				Arc::clone(&keys_manager),
 				UserConfig::default(),
 				params,
 				genesis_block.header.time,
 			));
 			let messenger = Arc::new(OnionMessenger::new(
-				keys_manager.clone(),
-				keys_manager.clone(),
-				logger.clone(),
-				manager.clone(),
-				msg_router.clone(),
+				Arc::clone(&keys_manager),
+				Arc::clone(&keys_manager),
+				Arc::clone(&logger),
+				Arc::clone(&manager),
+				Arc::clone(&msg_router),
 				IgnoringMessageHandler {},
-				manager.clone(),
+				Arc::clone(&manager),
+				IgnoringMessageHandler {},
 				IgnoringMessageHandler {},
 			));
 			let wallet = Arc::new(TestWallet {});
-			let sweeper = Arc::new(OutputSweeper::new(
+			let sweeper = Arc::new(OutputSweeperSync::new(
 				best_block,
 				Arc::clone(&tx_broadcaster),
 				Arc::clone(&fee_estimator),
-				None::<Arc<dyn Filter + Sync + Send>>,
+				None::<Arc<test_utils::TestChainSource>>,
 				Arc::clone(&keys_manager),
 				wallet,
 				Arc::clone(&kv_store),
 				Arc::clone(&logger),
 			));
 			let p2p_gossip_sync = Arc::new(P2PGossipSync::new(
-				network_graph.clone(),
-				Some(chain_source.clone()),
-				logger.clone(),
+				Arc::clone(&network_graph),
+				Some(Arc::clone(&chain_source)),
+				Arc::clone(&logger),
 			));
 			let rapid_gossip_sync =
-				Arc::new(RapidGossipSync::new(network_graph.clone(), logger.clone()));
+				Arc::new(RapidGossipSync::new(Arc::clone(&network_graph), Arc::clone(&logger)));
 			let msg_handler = MessageHandler {
 				chan_handler: Arc::new(test_utils::TestChannelMessageHandler::new(
 					ChainHash::using_genesis_block(Network::Testnet),
 				)),
 				route_handler: Arc::new(test_utils::TestRoutingMessageHandler::new()),
-				onion_message_handler: messenger.clone(),
+				onion_message_handler: Arc::clone(&messenger),
 				custom_message_handler: IgnoringMessageHandler {},
+				send_only_message_handler: IgnoringMessageHandler {},
 			};
 			let peer_manager = Arc::new(PeerManager::new(
 				msg_handler,
 				0,
 				&seed,
-				logger.clone(),
-				keys_manager.clone(),
+				Arc::clone(&logger),
+				Arc::clone(&keys_manager),
 			));
+			let liquidity_manager = Arc::new(
+				LiquidityManagerSync::new(
+					Arc::clone(&keys_manager),
+					Arc::clone(&keys_manager),
+					Arc::clone(&manager),
+					None,
+					None,
+					Arc::clone(&kv_store),
+					Arc::clone(&tx_broadcaster),
+					None,
+					None,
+				)
+				.unwrap(),
+			);
 			let node = Node {
 				node: manager,
 				p2p_gossip_sync,
 				rapid_gossip_sync,
 				peer_manager,
+				liquidity_manager,
 				chain_monitor,
 				kv_store,
 				tx_broadcaster,
@@ -1648,7 +2453,7 @@ mod tests {
 				};
 				nodes[i]
 					.node
-					.peer_connected(&nodes[j].node.get_our_node_id(), &init_i, true)
+					.peer_connected(nodes[j].node.get_our_node_id(), &init_i, true)
 					.unwrap();
 				let init_j = Init {
 					features: nodes[i].node.init_features(),
@@ -1657,7 +2462,7 @@ mod tests {
 				};
 				nodes[j]
 					.node
-					.peer_connected(&nodes[i].node.get_our_node_id(), &init_j, false)
+					.peer_connected(nodes[i].node.get_our_node_id(), &init_j, false)
 					.unwrap();
 			}
 		}
@@ -1685,14 +2490,14 @@ mod tests {
 				MessageSendEvent::SendFundingCreated,
 				$node_b.node.get_our_node_id()
 			);
-			$node_b.node.handle_funding_created(&$node_a.node.get_our_node_id(), &msg_a);
+			$node_b.node.handle_funding_created($node_a.node.get_our_node_id(), &msg_a);
 			get_event!($node_b, Event::ChannelPending);
 			let msg_b = get_event_msg!(
 				$node_b,
 				MessageSendEvent::SendFundingSigned,
 				$node_a.node.get_our_node_id()
 			);
-			$node_a.node.handle_funding_signed(&$node_b.node.get_our_node_id(), &msg_b);
+			$node_a.node.handle_funding_signed($node_b.node.get_our_node_id(), &msg_b);
 			get_event!($node_a, Event::ChannelPending);
 			tx
 		}};
@@ -1709,13 +2514,13 @@ mod tests {
 				MessageSendEvent::SendOpenChannel,
 				$node_b.node.get_our_node_id()
 			);
-			$node_b.node.handle_open_channel(&$node_a.node.get_our_node_id(), &msg_a);
+			$node_b.node.handle_open_channel($node_a.node.get_our_node_id(), &msg_a);
 			let msg_b = get_event_msg!(
 				$node_b,
 				MessageSendEvent::SendAcceptChannel,
 				$node_a.node.get_our_node_id()
 			);
-			$node_a.node.handle_accept_channel(&$node_b.node.get_our_node_id(), &msg_b);
+			$node_a.node.handle_accept_channel($node_b.node.get_our_node_id(), &msg_b);
 		}};
 	}
 
@@ -1818,13 +2623,15 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].p2p_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
 		macro_rules! check_persisted_data {
@@ -1911,13 +2718,15 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 		loop {
 			let log_entries = nodes[0].logger.lines.lock().unwrap();
@@ -1953,13 +2762,15 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 		match bg_processor.join() {
 			Ok(_) => panic!("Expected error persisting manager"),
@@ -1971,27 +2782,40 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[cfg(feature = "futures")]
 	async fn test_channel_manager_persist_error_async() {
 		// Test that if we encounter an error during manager persistence, the thread panics.
 		let (_, nodes) = create_nodes(2, "test_persist_error_sync");
 		open_channel!(nodes[0], nodes[1], 100000);
 
 		let data_dir = nodes[0].kv_store.get_data_dir();
-		let persister = Arc::new(
+		let kv_store_sync = Arc::new(
 			Persister::new(data_dir).with_manager_error(std::io::ErrorKind::Other, "test"),
 		);
+		let kv_store = KVStoreSyncWrapper(kv_store_sync);
+
+		// Yes, you can unsafe { turn off the borrow checker }
+		let lm_async: &'static LiquidityManager<_, _, _, _, _, _, _> = unsafe {
+			&*(nodes[0].liquidity_manager.get_lm_async()
+				as *const LiquidityManager<_, _, _, _, _, _, _>)
+				as &'static LiquidityManager<_, _, _, _, _, _, _>
+		};
+		let sweeper_async: &'static OutputSweeper<_, _, _, _, _, _, _> = unsafe {
+			&*(nodes[0].sweeper.sweeper_async() as *const OutputSweeper<_, _, _, _, _, _, _>)
+				as &'static OutputSweeper<_, _, _, _, _, _, _>
+		};
 
 		let bp_future = super::process_events_async(
-			persister,
+			kv_store,
 			|_: _| async { Ok(()) },
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].rapid_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(lm_async),
+			Some(sweeper_async),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 			move |dur: Duration| {
 				Box::pin(async move {
 					tokio::time::sleep(dur).await;
@@ -2021,13 +2845,15 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].p2p_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
 		match bg_processor.stop() {
@@ -2050,13 +2876,15 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
 		match bg_processor.stop() {
@@ -2096,31 +2924,33 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
 		// Open a channel and check that the FundingGenerationReady event was handled.
 		begin_open_channel!(nodes[0], nodes[1], channel_value);
 		let (temporary_channel_id, funding_tx) = funding_generation_recv
-			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
+			.recv_timeout(EVENT_DEADLINE)
 			.expect("FundingGenerationReady not handled within deadline");
 		nodes[0]
 			.node
 			.funding_transaction_generated(temporary_channel_id, node_1_id, funding_tx.clone())
 			.unwrap();
 		let msg_0 = get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, node_1_id);
-		nodes[1].node.handle_funding_created(&node_0_id, &msg_0);
+		nodes[1].node.handle_funding_created(node_0_id, &msg_0);
 		get_event!(nodes[1], Event::ChannelPending);
 		let msg_1 = get_event_msg!(nodes[1], MessageSendEvent::SendFundingSigned, node_0_id);
-		nodes[0].node.handle_funding_signed(&node_1_id, &msg_1);
-		let _ = channel_pending_recv
-			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
+		nodes[0].node.handle_funding_signed(node_1_id, &msg_1);
+		channel_pending_recv
+			.recv_timeout(EVENT_DEADLINE)
 			.expect("ChannelPending not handled within deadline");
 
 		// Confirm the funding transaction.
@@ -2128,10 +2958,10 @@ mod tests {
 		let as_funding = get_event_msg!(nodes[0], MessageSendEvent::SendChannelReady, node_1_id);
 		confirm_transaction(&mut nodes[1], &funding_tx);
 		let bs_funding = get_event_msg!(nodes[1], MessageSendEvent::SendChannelReady, node_0_id);
-		nodes[0].node.handle_channel_ready(&node_1_id, &bs_funding);
+		nodes[0].node.handle_channel_ready(node_1_id, &bs_funding);
 		let _as_channel_update =
 			get_event_msg!(nodes[0], MessageSendEvent::SendChannelUpdate, node_1_id);
-		nodes[1].node.handle_channel_ready(&node_0_id, &as_funding);
+		nodes[1].node.handle_channel_ready(node_0_id, &as_funding);
 		let _bs_channel_update =
 			get_event_msg!(nodes[1], MessageSendEvent::SendChannelUpdate, node_0_id);
 		let broadcast_funding =
@@ -2158,13 +2988,15 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
 		// Force close the channel and check that the SpendableOutputs event was handled.
@@ -2180,9 +3012,8 @@ mod tests {
 		let commitment_tx = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().pop().unwrap();
 		confirm_transaction_depth(&mut nodes[0], &commitment_tx, BREAKDOWN_TIMEOUT as u32);
 
-		let event = receiver
-			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
-			.expect("Events not handled within deadline");
+		let event =
+			receiver.recv_timeout(EVENT_DEADLINE).expect("Events not handled within deadline");
 		match event {
 			Event::SpendableOutputs { outputs, channel_id } => {
 				nodes[0]
@@ -2208,10 +3039,22 @@ mod tests {
 
 		advance_chain(&mut nodes[0], 3);
 
+		let tx_broadcaster = Arc::clone(&nodes[0].tx_broadcaster);
+		let wait_for_sweep_tx = || -> Transaction {
+			loop {
+				let sweep_tx = tx_broadcaster.txn_broadcasted.lock().unwrap().pop();
+				if let Some(sweep_tx) = sweep_tx {
+					return sweep_tx;
+				}
+
+				std::thread::sleep(Duration::from_millis(10));
+			}
+		};
+
 		// Check we generate an initial sweeping tx.
 		assert_eq!(nodes[0].sweeper.tracked_spendable_outputs().len(), 1);
+		let sweep_tx_0 = wait_for_sweep_tx();
 		let tracked_output = nodes[0].sweeper.tracked_spendable_outputs().first().unwrap().clone();
-		let sweep_tx_0 = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().pop().unwrap();
 		match tracked_output.status {
 			OutputSpendStatus::PendingFirstConfirmation { latest_spending_tx, .. } => {
 				assert_eq!(sweep_tx_0.compute_txid(), latest_spending_tx.compute_txid());
@@ -2222,8 +3065,8 @@ mod tests {
 		// Check we regenerate and rebroadcast the sweeping tx each block.
 		advance_chain(&mut nodes[0], 1);
 		assert_eq!(nodes[0].sweeper.tracked_spendable_outputs().len(), 1);
+		let sweep_tx_1 = wait_for_sweep_tx();
 		let tracked_output = nodes[0].sweeper.tracked_spendable_outputs().first().unwrap().clone();
-		let sweep_tx_1 = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().pop().unwrap();
 		match tracked_output.status {
 			OutputSpendStatus::PendingFirstConfirmation { latest_spending_tx, .. } => {
 				assert_eq!(sweep_tx_1.compute_txid(), latest_spending_tx.compute_txid());
@@ -2234,8 +3077,8 @@ mod tests {
 
 		advance_chain(&mut nodes[0], 1);
 		assert_eq!(nodes[0].sweeper.tracked_spendable_outputs().len(), 1);
+		let sweep_tx_2 = wait_for_sweep_tx();
 		let tracked_output = nodes[0].sweeper.tracked_spendable_outputs().first().unwrap().clone();
-		let sweep_tx_2 = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().pop().unwrap();
 		match tracked_output.status {
 			OutputSpendStatus::PendingFirstConfirmation { latest_spending_tx, .. } => {
 				assert_eq!(sweep_tx_2.compute_txid(), latest_spending_tx.compute_txid());
@@ -2272,8 +3115,8 @@ mod tests {
 		}
 
 		// Check we stop tracking the spendable outputs when one of the txs reaches
-		// ANTI_REORG_DELAY confirmations.
-		confirm_transaction_depth(&mut nodes[0], &sweep_tx_0, ANTI_REORG_DELAY);
+		// PRUNE_DELAY_BLOCKS confirmations.
+		confirm_transaction_depth(&mut nodes[0], &sweep_tx_0, PRUNE_DELAY_BLOCKS);
 		assert_eq!(nodes[0].sweeper.tracked_spendable_outputs().len(), 0);
 
 		if !std::thread::panicking() {
@@ -2309,19 +3152,21 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
 		begin_open_channel!(nodes[0], nodes[1], channel_value);
 		assert_eq!(
-			first_event_recv.recv_timeout(Duration::from_secs(EVENT_DEADLINE)).unwrap(),
-			second_event_recv.recv_timeout(Duration::from_secs(EVENT_DEADLINE)).unwrap()
+			first_event_recv.recv_timeout(EVENT_DEADLINE).unwrap(),
+			second_event_recv.recv_timeout(EVENT_DEADLINE).unwrap()
 		);
 
 		if !std::thread::panicking() {
@@ -2338,13 +3183,15 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
 		loop {
@@ -2367,10 +3214,11 @@ mod tests {
 				.network_graph
 				.add_channel_from_partial_announcement(
 					42,
+					None,
 					53,
 					features,
-					$nodes[0].node.get_our_node_id(),
-					$nodes[1].node.get_our_node_id(),
+					$nodes[0].node.get_our_node_id().into(),
+					$nodes[1].node.get_our_node_id().into(),
 				)
 				.expect("Failed to update channel from partial announcement");
 			let original_graph_description = $nodes[0].network_graph.to_string();
@@ -2433,18 +3281,20 @@ mod tests {
 		let background_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].rapid_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
 		do_test_not_pruning_network_graph_until_graph_sync_completion!(
 			nodes,
-			receiver.recv_timeout(Duration::from_secs(super::FIRST_NETWORK_PRUNE_TIMER * 5)),
+			receiver.recv_timeout(super::FIRST_NETWORK_PRUNE_TIMER * 5),
 			std::thread::sleep(Duration::from_millis(1))
 		);
 
@@ -2452,26 +3302,40 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[cfg(feature = "futures")]
 	async fn test_not_pruning_network_graph_until_graph_sync_completion_async() {
 		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
 
 		let (_, nodes) =
 			create_nodes(2, "test_not_pruning_network_graph_until_graph_sync_completion_async");
 		let data_dir = nodes[0].kv_store.get_data_dir();
-		let persister = Arc::new(Persister::new(data_dir).with_graph_persistence_notifier(sender));
+		let kv_store_sync =
+			Arc::new(Persister::new(data_dir).with_graph_persistence_notifier(sender));
+		let kv_store = KVStoreSyncWrapper(kv_store_sync);
+
+		// Yes, you can unsafe { turn off the borrow checker }
+		let lm_async: &'static LiquidityManager<_, _, _, _, _, _, _> = unsafe {
+			&*(nodes[0].liquidity_manager.get_lm_async()
+				as *const LiquidityManager<_, _, _, _, _, _, _>)
+				as &'static LiquidityManager<_, _, _, _, _, _, _>
+		};
+		let sweeper_async: &'static OutputSweeper<_, _, _, _, _, _, _> = unsafe {
+			&*(nodes[0].sweeper.sweeper_async() as *const OutputSweeper<_, _, _, _, _, _, _>)
+				as &'static OutputSweeper<_, _, _, _, _, _, _>
+		};
 
 		let (exit_sender, exit_receiver) = tokio::sync::watch::channel(());
 		let bp_future = super::process_events_async(
-			persister,
+			kv_store,
 			|_: _| async { Ok(()) },
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].rapid_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(lm_async),
+			Some(sweeper_async),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 			move |dur: Duration| {
 				let mut exit_receiver = exit_receiver.clone();
 				Box::pin(async move {
@@ -2492,8 +3356,7 @@ mod tests {
 				{
 					let mut i = 0;
 					loop {
-						tokio::time::sleep(Duration::from_secs(super::FIRST_NETWORK_PRUNE_TIMER))
-							.await;
+						tokio::time::sleep(super::FIRST_NETWORK_PRUNE_TIMER).await;
 						if let Ok(()) = receiver.try_recv() {
 							break Ok::<(), ()>(());
 						}
@@ -2540,6 +3403,9 @@ mod tests {
 				failure: PathFailure::OnPath { network_update: None },
 				path: path.clone(),
 				short_channel_id: Some(scored_scid),
+				error_code: None,
+				error_data: None,
+				hold_times: Vec::new(),
 			});
 			let event = $receive.expect("PaymentPathFailed not handled within deadline");
 			match event {
@@ -2557,6 +3423,9 @@ mod tests {
 				failure: PathFailure::OnPath { network_update: None },
 				path: path.clone(),
 				short_channel_id: None,
+				error_code: None,
+				error_data: None,
+				hold_times: Vec::new(),
 			});
 			let event = $receive.expect("PaymentPathFailed not handled within deadline");
 			match event {
@@ -2569,6 +3438,7 @@ mod tests {
 				payment_id: PaymentId([42; 32]),
 				payment_hash: None,
 				path: path.clone(),
+				hold_times: Vec::new(),
 			});
 			let event = $receive.expect("PaymentPathSuccessful not handled within deadline");
 			match event {
@@ -2623,19 +3493,18 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(
 			persister,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(Arc::clone(&nodes[0].liquidity_manager)),
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 		);
 
-		do_test_payment_path_scoring!(
-			nodes,
-			receiver.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
-		);
+		do_test_payment_path_scoring!(nodes, receiver.recv_timeout(EVENT_DEADLINE));
 
 		if !std::thread::panicking() {
 			bg_processor.stop().unwrap();
@@ -2647,7 +3516,6 @@ mod tests {
 	}
 
 	#[tokio::test]
-	#[cfg(feature = "futures")]
 	async fn test_payment_path_scoring_async() {
 		let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
 		let event_handler = move |event: Event| {
@@ -2666,20 +3534,34 @@ mod tests {
 
 		let (_, nodes) = create_nodes(1, "test_payment_path_scoring_async");
 		let data_dir = nodes[0].kv_store.get_data_dir();
-		let persister = Arc::new(Persister::new(data_dir));
+		let kv_store_sync = Arc::new(Persister::new(data_dir));
+		let kv_store = KVStoreSyncWrapper(kv_store_sync);
 
 		let (exit_sender, exit_receiver) = tokio::sync::watch::channel(());
 
+		// Yes, you can unsafe { turn off the borrow checker }
+		let lm_async: &'static LiquidityManager<_, _, _, _, _, _, _> = unsafe {
+			&*(nodes[0].liquidity_manager.get_lm_async()
+				as *const LiquidityManager<_, _, _, _, _, _, _>)
+				as &'static LiquidityManager<_, _, _, _, _, _, _>
+		};
+		let sweeper_async: &'static OutputSweeper<_, _, _, _, _, _, _> = unsafe {
+			&*(nodes[0].sweeper.sweeper_async() as *const OutputSweeper<_, _, _, _, _, _, _>)
+				as &'static OutputSweeper<_, _, _, _, _, _, _>
+		};
+
 		let bp_future = super::process_events_async(
-			persister,
+			kv_store,
 			event_handler,
-			nodes[0].chain_monitor.clone(),
-			nodes[0].node.clone(),
-			Some(nodes[0].messenger.clone()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			Some(Arc::clone(&nodes[0].messenger)),
 			nodes[0].no_gossip_sync(),
-			nodes[0].peer_manager.clone(),
-			nodes[0].logger.clone(),
-			Some(nodes[0].scorer.clone()),
+			Arc::clone(&nodes[0].peer_manager),
+			Some(lm_async),
+			Some(sweeper_async),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
 			move |dur: Duration| {
 				let mut exit_receiver = exit_receiver.clone();
 				Box::pin(async move {
@@ -2708,5 +3590,63 @@ mod tests {
 		let (r1, r2) = tokio::join!(t1, t2);
 		r1.unwrap().unwrap();
 		r2.unwrap()
+	}
+
+	#[tokio::test]
+	#[cfg(not(c_bindings))]
+	async fn test_no_consts() {
+		// Compile-test the NO_* constants can be used.
+		let (_, nodes) = create_nodes(1, "test_no_consts");
+		let bg_processor = BackgroundProcessor::start(
+			Arc::clone(&nodes[0].kv_store),
+			move |_: Event| Ok(()),
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			crate::NO_ONION_MESSENGER,
+			nodes[0].no_gossip_sync(),
+			Arc::clone(&nodes[0].peer_manager),
+			crate::NO_LIQUIDITY_MANAGER_SYNC,
+			Some(Arc::clone(&nodes[0].sweeper)),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
+		);
+
+		if !std::thread::panicking() {
+			bg_processor.stop().unwrap();
+		}
+
+		let kv_store = KVStoreSyncWrapper(Arc::clone(&nodes[0].kv_store));
+		let (exit_sender, exit_receiver) = tokio::sync::watch::channel(());
+		let sweeper_async: &'static OutputSweeper<_, _, _, _, _, _, _> = unsafe {
+			&*(nodes[0].sweeper.sweeper_async() as *const OutputSweeper<_, _, _, _, _, _, _>)
+				as &'static OutputSweeper<_, _, _, _, _, _, _>
+		};
+		let bp_future = super::process_events_async(
+			kv_store,
+			move |_: Event| async move { Ok(()) },
+			Arc::clone(&nodes[0].chain_monitor),
+			Arc::clone(&nodes[0].node),
+			crate::NO_ONION_MESSENGER,
+			nodes[0].no_gossip_sync(),
+			Arc::clone(&nodes[0].peer_manager),
+			crate::NO_LIQUIDITY_MANAGER,
+			Some(sweeper_async),
+			Arc::clone(&nodes[0].logger),
+			Some(Arc::clone(&nodes[0].scorer)),
+			move |dur: Duration| {
+				let mut exit_receiver = exit_receiver.clone();
+				Box::pin(async move {
+					tokio::select! {
+						_ = tokio::time::sleep(dur) => false,
+						_ = exit_receiver.changed() => true,
+					}
+				})
+			},
+			false,
+			|| Some(Duration::ZERO),
+		);
+		let t1 = tokio::spawn(bp_future);
+		exit_sender.send(()).unwrap();
+		t1.await.unwrap().unwrap();
 	}
 }

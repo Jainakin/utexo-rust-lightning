@@ -25,7 +25,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::private_intra_doc_links)]
 #![deny(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use bitcoin::secp256k1::PublicKey;
 
@@ -183,7 +183,7 @@ impl Connection {
 		// a chance to do some work.
 		let mut buf = [0; 4096];
 
-		let mut our_descriptor = SocketDescriptor::new(us.clone());
+		let mut our_descriptor = SocketDescriptor::new(Arc::clone(&us));
 		// An enum describing why we did/are disconnecting:
 		enum Disconnect {
 			// Rust-Lightning told us to disconnect, either by returning an Err or by calling
@@ -243,13 +243,8 @@ impl Connection {
 						Ok(len) => {
 							let read_res =
 								peer_manager.as_ref().read_event(&mut our_descriptor, &buf[0..len]);
-							let mut us_lock = us.lock().unwrap();
 							match read_res {
-								Ok(pause_read) => {
-									if pause_read {
-										us_lock.read_paused = true;
-									}
-								},
+								Ok(()) => {},
 								Err(_) => break Disconnect::CloseConnection,
 							}
 						},
@@ -338,7 +333,7 @@ where
 
 	let handle_opt = if peer_manager
 		.as_ref()
-		.new_inbound_connection(SocketDescriptor::new(us.clone()), remote_addr)
+		.new_inbound_connection(SocketDescriptor::new(Arc::clone(&us)), remote_addr)
 		.is_ok()
 	{
 		let handle = tokio::spawn(Connection::schedule_read(
@@ -391,7 +386,7 @@ where
 	let last_us = Arc::clone(&us);
 	let handle_opt = if let Ok(initial_send) = peer_manager.as_ref().new_outbound_connection(
 		their_node_id,
-		SocketDescriptor::new(us.clone()),
+		SocketDescriptor::new(Arc::clone(&us)),
 		remote_addr,
 	) {
 		let handle = tokio::spawn(async move {
@@ -402,7 +397,7 @@ where
 			// and use a relatively tight timeout.
 			let send_fut = async {
 				loop {
-					match SocketDescriptor::new(us.clone()).send_data(&initial_send, true) {
+					match SocketDescriptor::new(Arc::clone(&us)).send_data(&initial_send, true) {
 						v if v == initial_send.len() => break Ok(()),
 						0 => {
 							write_receiver.recv().await;
@@ -533,7 +528,7 @@ impl SocketDescriptor {
 	}
 }
 impl peer_handler::SocketDescriptor for SocketDescriptor {
-	fn send_data(&mut self, data: &[u8], resume_read: bool) -> usize {
+	fn send_data(&mut self, data: &[u8], continue_read: bool) -> usize {
 		// To send data, we take a lock on our Connection to access the TcpStream, writing to it if
 		// there's room in the kernel buffer, or otherwise create a new Waker with a
 		// SocketDescriptor in it which can wake up the write_avail Sender, waking up the
@@ -544,13 +539,16 @@ impl peer_handler::SocketDescriptor for SocketDescriptor {
 			return 0;
 		}
 
-		if resume_read && us.read_paused {
+		let read_was_paused = us.read_paused;
+		us.read_paused = !continue_read;
+
+		if continue_read && read_was_paused {
 			// The schedule_read future may go to lock up but end up getting woken up by there
 			// being more room in the write buffer, dropping the other end of this Sender
 			// before we get here, so we ignore any failures to wake it up.
-			us.read_paused = false;
 			let _ = us.read_waker.try_send(());
 		}
+
 		if data.is_empty() {
 			return 0;
 		}
@@ -576,16 +574,7 @@ impl peer_handler::SocketDescriptor for SocketDescriptor {
 					}
 				},
 				task::Poll::Ready(Err(_)) => return written_len,
-				task::Poll::Pending => {
-					// We're queued up for a write event now, but we need to make sure we also
-					// pause read given we're now waiting on the remote end to ACK (and in
-					// accordance with the send_data() docs).
-					us.read_paused = true;
-					// Further, to avoid any current pending read causing a `read_event` call, wake
-					// up the read_waker and restart its loop.
-					let _ = us.read_waker.try_send(());
-					return written_len;
-				},
+				task::Poll::Pending => return written_len,
 			}
 		}
 	}
@@ -623,11 +612,11 @@ mod tests {
 	use bitcoin::constants::ChainHash;
 	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 	use bitcoin::Network;
-	use lightning::events::*;
-	use lightning::ln::features::*;
 	use lightning::ln::msgs::*;
 	use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager};
+	use lightning::ln::types::ChannelId;
 	use lightning::routing::gossip::NodeId;
+	use lightning::types::features::*;
 	use lightning::util::test_utils::TestNodeSigner;
 
 	use tokio::sync::mpsc;
@@ -660,16 +649,18 @@ mod tests {
 	}
 	impl RoutingMessageHandler for MsgHandler {
 		fn handle_node_announcement(
-			&self, _msg: &NodeAnnouncement,
+			&self, _their_node_id: Option<PublicKey>, _msg: &NodeAnnouncement,
 		) -> Result<bool, LightningError> {
 			Ok(false)
 		}
 		fn handle_channel_announcement(
-			&self, _msg: &ChannelAnnouncement,
+			&self, _their_node_id: Option<PublicKey>, _msg: &ChannelAnnouncement,
 		) -> Result<bool, LightningError> {
 			Ok(false)
 		}
-		fn handle_channel_update(&self, _msg: &ChannelUpdate) -> Result<bool, LightningError> {
+		fn handle_channel_update(
+			&self, _their_node_id: Option<PublicKey>, _msg: &ChannelUpdate,
+		) -> Result<bool, LightningError> {
 			Ok(false)
 		}
 		fn get_next_channel_announcement(
@@ -682,113 +673,114 @@ mod tests {
 		) -> Option<NodeAnnouncement> {
 			None
 		}
-		fn peer_connected(
-			&self, _their_node_id: &PublicKey, _init_msg: &Init, _inbound: bool,
-		) -> Result<(), ()> {
-			Ok(())
-		}
 		fn handle_reply_channel_range(
-			&self, _their_node_id: &PublicKey, _msg: ReplyChannelRange,
+			&self, _their_node_id: PublicKey, _msg: ReplyChannelRange,
 		) -> Result<(), LightningError> {
 			Ok(())
 		}
 		fn handle_reply_short_channel_ids_end(
-			&self, _their_node_id: &PublicKey, _msg: ReplyShortChannelIdsEnd,
+			&self, _their_node_id: PublicKey, _msg: ReplyShortChannelIdsEnd,
 		) -> Result<(), LightningError> {
 			Ok(())
 		}
 		fn handle_query_channel_range(
-			&self, _their_node_id: &PublicKey, _msg: QueryChannelRange,
+			&self, _their_node_id: PublicKey, _msg: QueryChannelRange,
 		) -> Result<(), LightningError> {
 			Ok(())
 		}
 		fn handle_query_short_channel_ids(
-			&self, _their_node_id: &PublicKey, _msg: QueryShortChannelIds,
+			&self, _their_node_id: PublicKey, _msg: QueryShortChannelIds,
 		) -> Result<(), LightningError> {
 			Ok(())
-		}
-		fn provided_node_features(&self) -> NodeFeatures {
-			NodeFeatures::empty()
-		}
-		fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures {
-			InitFeatures::empty()
 		}
 		fn processing_queue_high(&self) -> bool {
 			false
 		}
 	}
 	impl ChannelMessageHandler for MsgHandler {
-		fn handle_open_channel(&self, _their_node_id: &PublicKey, _msg: &OpenChannel) {}
-		fn handle_accept_channel(&self, _their_node_id: &PublicKey, _msg: &AcceptChannel) {}
-		fn handle_funding_created(&self, _their_node_id: &PublicKey, _msg: &FundingCreated) {}
-		fn handle_funding_signed(&self, _their_node_id: &PublicKey, _msg: &FundingSigned) {}
-		fn handle_channel_ready(&self, _their_node_id: &PublicKey, _msg: &ChannelReady) {}
-		fn handle_shutdown(&self, _their_node_id: &PublicKey, _msg: &Shutdown) {}
-		fn handle_closing_signed(&self, _their_node_id: &PublicKey, _msg: &ClosingSigned) {}
-		fn handle_update_add_htlc(&self, _their_node_id: &PublicKey, _msg: &UpdateAddHTLC) {}
-		fn handle_update_fulfill_htlc(&self, _their_node_id: &PublicKey, _msg: &UpdateFulfillHTLC) {
-		}
-		fn handle_update_fail_htlc(&self, _their_node_id: &PublicKey, _msg: &UpdateFailHTLC) {}
+		fn handle_open_channel(&self, _their_node_id: PublicKey, _msg: &OpenChannel) {}
+		fn handle_accept_channel(&self, _their_node_id: PublicKey, _msg: &AcceptChannel) {}
+		fn handle_funding_created(&self, _their_node_id: PublicKey, _msg: &FundingCreated) {}
+		fn handle_funding_signed(&self, _their_node_id: PublicKey, _msg: &FundingSigned) {}
+		fn handle_channel_ready(&self, _their_node_id: PublicKey, _msg: &ChannelReady) {}
+		fn handle_shutdown(&self, _their_node_id: PublicKey, _msg: &Shutdown) {}
+		fn handle_closing_signed(&self, _their_node_id: PublicKey, _msg: &ClosingSigned) {}
+		#[cfg(simple_close)]
+		fn handle_closing_complete(&self, _their_node_id: PublicKey, _msg: ClosingComplete) {}
+		#[cfg(simple_close)]
+		fn handle_closing_sig(&self, _their_node_id: PublicKey, _msg: ClosingSig) {}
+		fn handle_update_add_htlc(&self, _their_node_id: PublicKey, _msg: &UpdateAddHTLC) {}
+		fn handle_update_fulfill_htlc(&self, _their_node_id: PublicKey, _msg: UpdateFulfillHTLC) {}
+		fn handle_update_fail_htlc(&self, _their_node_id: PublicKey, _msg: &UpdateFailHTLC) {}
 		fn handle_update_fail_malformed_htlc(
-			&self, _their_node_id: &PublicKey, _msg: &UpdateFailMalformedHTLC,
+			&self, _their_node_id: PublicKey, _msg: &UpdateFailMalformedHTLC,
 		) {
 		}
-		fn handle_commitment_signed(&self, _their_node_id: &PublicKey, _msg: &CommitmentSigned) {}
-		fn handle_revoke_and_ack(&self, _their_node_id: &PublicKey, _msg: &RevokeAndACK) {}
-		fn handle_update_fee(&self, _their_node_id: &PublicKey, _msg: &UpdateFee) {}
+		fn handle_commitment_signed(&self, _their_node_id: PublicKey, _msg: &CommitmentSigned) {}
+		fn handle_commitment_signed_batch(
+			&self, _their_node_id: PublicKey, _channel_id: ChannelId, _batch: Vec<CommitmentSigned>,
+		) {
+		}
+		fn handle_revoke_and_ack(&self, _their_node_id: PublicKey, _msg: &RevokeAndACK) {}
+		fn handle_update_fee(&self, _their_node_id: PublicKey, _msg: &UpdateFee) {}
 		fn handle_announcement_signatures(
-			&self, _their_node_id: &PublicKey, _msg: &AnnouncementSignatures,
+			&self, _their_node_id: PublicKey, _msg: &AnnouncementSignatures,
 		) {
 		}
-		fn handle_channel_update(&self, _their_node_id: &PublicKey, _msg: &ChannelUpdate) {}
-		fn handle_open_channel_v2(&self, _their_node_id: &PublicKey, _msg: &OpenChannelV2) {}
-		fn handle_accept_channel_v2(&self, _their_node_id: &PublicKey, _msg: &AcceptChannelV2) {}
-		fn handle_stfu(&self, _their_node_id: &PublicKey, _msg: &Stfu) {}
-		#[cfg(splicing)]
-		fn handle_splice_init(&self, _their_node_id: &PublicKey, _msg: &SpliceInit) {}
-		#[cfg(splicing)]
-		fn handle_splice_ack(&self, _their_node_id: &PublicKey, _msg: &SpliceAck) {}
-		#[cfg(splicing)]
-		fn handle_splice_locked(&self, _their_node_id: &PublicKey, _msg: &SpliceLocked) {}
-		fn handle_tx_add_input(&self, _their_node_id: &PublicKey, _msg: &TxAddInput) {}
-		fn handle_tx_add_output(&self, _their_node_id: &PublicKey, _msg: &TxAddOutput) {}
-		fn handle_tx_remove_input(&self, _their_node_id: &PublicKey, _msg: &TxRemoveInput) {}
-		fn handle_tx_remove_output(&self, _their_node_id: &PublicKey, _msg: &TxRemoveOutput) {}
-		fn handle_tx_complete(&self, _their_node_id: &PublicKey, _msg: &TxComplete) {}
-		fn handle_tx_signatures(&self, _their_node_id: &PublicKey, _msg: &TxSignatures) {}
-		fn handle_tx_init_rbf(&self, _their_node_id: &PublicKey, _msg: &TxInitRbf) {}
-		fn handle_tx_ack_rbf(&self, _their_node_id: &PublicKey, _msg: &TxAckRbf) {}
-		fn handle_tx_abort(&self, _their_node_id: &PublicKey, _msg: &TxAbort) {}
-		fn peer_disconnected(&self, their_node_id: &PublicKey) {
-			if *their_node_id == self.expected_pubkey {
-				self.disconnected_flag.store(true, Ordering::SeqCst);
-				self.pubkey_disconnected.clone().try_send(()).unwrap();
-			}
-		}
-		fn peer_connected(
-			&self, their_node_id: &PublicKey, _init_msg: &Init, _inbound: bool,
-		) -> Result<(), ()> {
-			if *their_node_id == self.expected_pubkey {
-				self.pubkey_connected.clone().try_send(()).unwrap();
-			}
-			Ok(())
-		}
-		fn handle_channel_reestablish(
-			&self, _their_node_id: &PublicKey, _msg: &ChannelReestablish,
+		fn handle_channel_update(&self, _their_node_id: PublicKey, _msg: &ChannelUpdate) {}
+		fn handle_open_channel_v2(&self, _their_node_id: PublicKey, _msg: &OpenChannelV2) {}
+		fn handle_accept_channel_v2(&self, _their_node_id: PublicKey, _msg: &AcceptChannelV2) {}
+		fn handle_stfu(&self, _their_node_id: PublicKey, _msg: &Stfu) {}
+		fn handle_splice_init(&self, _their_node_id: PublicKey, _msg: &SpliceInit) {}
+		fn handle_splice_ack(&self, _their_node_id: PublicKey, _msg: &SpliceAck) {}
+		fn handle_splice_locked(&self, _their_node_id: PublicKey, _msg: &SpliceLocked) {}
+		fn handle_tx_add_input(&self, _their_node_id: PublicKey, _msg: &TxAddInput) {}
+		fn handle_tx_add_output(&self, _their_node_id: PublicKey, _msg: &TxAddOutput) {}
+		fn handle_tx_remove_input(&self, _their_node_id: PublicKey, _msg: &TxRemoveInput) {}
+		fn handle_tx_remove_output(&self, _their_node_id: PublicKey, _msg: &TxRemoveOutput) {}
+		fn handle_tx_complete(&self, _their_node_id: PublicKey, _msg: &TxComplete) {}
+		fn handle_tx_signatures(&self, _their_node_id: PublicKey, _msg: &TxSignatures) {}
+		fn handle_tx_init_rbf(&self, _their_node_id: PublicKey, _msg: &TxInitRbf) {}
+		fn handle_tx_ack_rbf(&self, _their_node_id: PublicKey, _msg: &TxAckRbf) {}
+		fn handle_tx_abort(&self, _their_node_id: PublicKey, _msg: &TxAbort) {}
+		fn handle_peer_storage(&self, _their_node_id: PublicKey, _msg: PeerStorage) {}
+		fn handle_peer_storage_retrieval(
+			&self, _their_node_id: PublicKey, _msg: PeerStorageRetrieval,
 		) {
 		}
-		fn handle_error(&self, _their_node_id: &PublicKey, _msg: &ErrorMessage) {}
-		fn provided_node_features(&self) -> NodeFeatures {
-			NodeFeatures::empty()
+		fn handle_channel_reestablish(&self, _their_node_id: PublicKey, _msg: &ChannelReestablish) {
 		}
-		fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures {
-			InitFeatures::empty()
-		}
+		fn handle_error(&self, _their_node_id: PublicKey, _msg: &ErrorMessage) {}
 		fn get_chain_hashes(&self) -> Option<Vec<ChainHash>> {
 			Some(vec![ChainHash::using_genesis_block(Network::Testnet)])
 		}
+		fn message_received(&self) {}
 	}
-	impl MessageSendEventsProvider for MsgHandler {
+	impl BaseMessageHandler for MsgHandler {
+		fn peer_disconnected(&self, their_node_id: PublicKey) {
+			if their_node_id == self.expected_pubkey {
+				self.disconnected_flag.store(true, Ordering::SeqCst);
+				// This method is called twice as we're two message handlers. `try_send` will fail
+				// the second time.
+				let _ = self.pubkey_disconnected.clone().try_send(());
+			}
+		}
+		fn peer_connected(
+			&self, their_node_id: PublicKey, _init_msg: &Init, _inbound: bool,
+		) -> Result<(), ()> {
+			if their_node_id == self.expected_pubkey {
+				// This method is called twice as we're two message handlers. `try_send` will fail
+				// the second time.
+				let _ = self.pubkey_connected.clone().try_send(());
+			}
+			Ok(())
+		}
+		fn provided_node_features(&self) -> NodeFeatures {
+			NodeFeatures::empty()
+		}
+		fn provided_init_features(&self, _their_node_id: PublicKey) -> InitFeatures {
+			InitFeatures::empty()
+		}
 		fn get_and_clear_pending_msg_events(&self) -> Vec<MessageSendEvent> {
 			let mut ret = Vec::new();
 			mem::swap(&mut *self.msg_events.lock().unwrap(), &mut ret);
@@ -835,6 +827,7 @@ mod tests {
 			route_handler: Arc::clone(&a_handler),
 			onion_message_handler: Arc::new(IgnoringMessageHandler {}),
 			custom_message_handler: Arc::new(IgnoringMessageHandler {}),
+			send_only_message_handler: Arc::new(IgnoringMessageHandler {}),
 		};
 		let a_manager = Arc::new(PeerManager::new(
 			a_msg_handler,
@@ -858,6 +851,7 @@ mod tests {
 			route_handler: Arc::clone(&b_handler),
 			onion_message_handler: Arc::new(IgnoringMessageHandler {}),
 			custom_message_handler: Arc::new(IgnoringMessageHandler {}),
+			send_only_message_handler: Arc::new(IgnoringMessageHandler {}),
 		};
 		let b_manager = Arc::new(PeerManager::new(
 			b_msg_handler,
@@ -920,6 +914,7 @@ mod tests {
 			onion_message_handler: Arc::new(IgnoringMessageHandler {}),
 			route_handler: Arc::new(lightning::ln::peer_handler::IgnoringMessageHandler {}),
 			custom_message_handler: Arc::new(IgnoringMessageHandler {}),
+			send_only_message_handler: Arc::new(IgnoringMessageHandler {}),
 		};
 		let a_manager = Arc::new(PeerManager::new(
 			a_msg_handler,

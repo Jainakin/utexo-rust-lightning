@@ -1,3 +1,10 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
 use crate::common::{ConfirmedTx, FilterQueue, SyncState};
 use crate::error::{InternalError, TxSyncError};
 
@@ -5,6 +12,8 @@ use lightning::chain::WatchedOutput;
 use lightning::chain::{Confirm, Filter};
 use lightning::util::logger::Logger;
 use lightning::{log_debug, log_error, log_trace};
+
+use lightning_macros::{maybe_async, maybe_await};
 
 use bitcoin::{BlockHash, Script, Txid};
 

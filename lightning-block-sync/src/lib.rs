@@ -17,7 +17,7 @@
 #![deny(rustdoc::private_intra_doc_links)]
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(any(feature = "rest-client", feature = "rpc-client"))]
 pub mod http;
@@ -49,7 +49,7 @@ use bitcoin::hash_types::BlockHash;
 use bitcoin::pow::Work;
 
 use lightning::chain;
-use lightning::chain::Listen;
+use lightning::chain::{BestBlock, Listen};
 
 use std::future::Future;
 use std::ops::Deref;
@@ -78,7 +78,7 @@ pub trait BlockSource: Sync + Send {
 	/// to allow for a more efficient lookup.
 	///
 	/// [`get_header`]: Self::get_header
-	fn get_best_block<'a>(&'a self) -> AsyncBlockSourceResult<(BlockHash, Option<u32>)>;
+	fn get_best_block(&self) -> AsyncBlockSourceResult<'_, (BlockHash, Option<u32>)>;
 }
 
 /// Result type for `BlockSource` requests.
@@ -398,12 +398,15 @@ where
 	}
 
 	/// Notifies the chain listeners of disconnected blocks.
-	fn disconnect_blocks(&mut self, mut disconnected_blocks: Vec<ValidatedBlockHeader>) {
-		for header in disconnected_blocks.drain(..) {
+	fn disconnect_blocks(&mut self, disconnected_blocks: Vec<ValidatedBlockHeader>) {
+		for header in disconnected_blocks.iter() {
 			if let Some(cached_header) = self.header_cache.block_disconnected(&header.block_hash) {
-				assert_eq!(cached_header, header);
+				assert_eq!(cached_header, *header);
 			}
-			self.chain_listener.block_disconnected(&header.header, header.height);
+		}
+		if let Some(block) = disconnected_blocks.last() {
+			let fork_point = BestBlock::new(block.header.prev_blockhash, block.height - 1);
+			self.chain_listener.blocks_disconnected(fork_point);
 		}
 	}
 
@@ -615,7 +618,7 @@ mod chain_notifier_tests {
 		let new_tip = fork_chain.tip();
 		let old_tip = main_chain.tip();
 		let chain_listener = &MockChainListener::new()
-			.expect_block_disconnected(*old_tip)
+			.expect_blocks_disconnected(*fork_chain.at_height(1))
 			.expect_block_connected(*new_tip);
 		let mut notifier =
 			ChainNotifier { header_cache: &mut main_chain.header_cache(0..=2), chain_listener };
@@ -635,8 +638,7 @@ mod chain_notifier_tests {
 		let new_tip = fork_chain.tip();
 		let old_tip = main_chain.tip();
 		let chain_listener = &MockChainListener::new()
-			.expect_block_disconnected(*old_tip)
-			.expect_block_disconnected(*main_chain.at_height(2))
+			.expect_blocks_disconnected(*main_chain.at_height(1))
 			.expect_block_connected(*new_tip);
 		let mut notifier =
 			ChainNotifier { header_cache: &mut main_chain.header_cache(0..=3), chain_listener };
@@ -656,7 +658,7 @@ mod chain_notifier_tests {
 		let new_tip = fork_chain.tip();
 		let old_tip = main_chain.tip();
 		let chain_listener = &MockChainListener::new()
-			.expect_block_disconnected(*old_tip)
+			.expect_blocks_disconnected(*fork_chain.at_height(1))
 			.expect_block_connected(*fork_chain.at_height(2))
 			.expect_block_connected(*new_tip);
 		let mut notifier =

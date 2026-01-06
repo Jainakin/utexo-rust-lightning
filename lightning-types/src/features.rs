@@ -21,76 +21,87 @@
 //!
 //! The following features are currently required in the LDK:
 //! - `VariableLengthOnion` - requires/supports variable-length routing onion payloads
-//!     (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md) for more information).
+//!   (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md) for more information).
 //! - `StaticRemoteKey` - requires/supports static key for remote output
-//!     (see [BOLT-3](https://github.com/lightning/bolts/blob/master/03-transactions.md) for more information).
+//!   (see [BOLT-3](https://github.com/lightning/bolts/blob/master/03-transactions.md) for more information).
 //!
 //! The following features are currently supported in the LDK:
 //! - `DataLossProtect` - requires/supports that a node which has somehow fallen behind, e.g., has been restored from an old backup,
-//!     can detect that it has fallen behind
-//!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
+//!   can detect that it has fallen behind
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
 //! - `InitialRoutingSync` - requires/supports that the sending node needs a complete routing information dump
-//!     (see [BOLT-7](https://github.com/lightning/bolts/blob/master/07-routing-gossip.md#initial-sync) for more information).
+//!   (see [BOLT-7](https://github.com/lightning/bolts/blob/master/07-routing-gossip.md#initial-sync) for more information).
 //! - `UpfrontShutdownScript` - commits to a shutdown scriptpubkey when opening a channel
-//!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message) for more information).
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message) for more information).
 //! - `GossipQueries` - requires/supports more sophisticated gossip control
-//!     (see [BOLT-7](https://github.com/lightning/bolts/blob/master/07-routing-gossip.md) for more information).
+//!   (see [BOLT-7](https://github.com/lightning/bolts/blob/master/07-routing-gossip.md) for more information).
 //! - `PaymentSecret` - requires/supports that a node supports payment_secret field
-//!     (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md) for more information).
+//!   (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md) for more information).
 //! - `BasicMPP` - requires/supports that a node can receive basic multi-part payments
-//!     (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#basic-multi-part-payments) for more information).
+//!   (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#basic-multi-part-payments) for more information).
 //! - `Wumbo` - requires/supports that a node create large channels. Called `option_support_large_channel` in the spec.
-//!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message) for more information).
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message) for more information).
 //! - `AnchorsZeroFeeHtlcTx` - requires/supports that commitment transactions include anchor outputs
-//!     and HTLC transactions are pre-signed with zero fee (see
-//!     [BOLT-3](https://github.com/lightning/bolts/blob/master/03-transactions.md) for more
-//!     information).
+//!   and HTLC transactions are pre-signed with zero fee (see
+//!   [BOLT-3](https://github.com/lightning/bolts/blob/master/03-transactions.md) for more
+//!   information).
 //! - `RouteBlinding` - requires/supports that a node can relay payments over blinded paths
-//!     (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#route-blinding) for more information).
+//!   (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#route-blinding) for more information).
 //! - `ShutdownAnySegwit` - requires/supports that future segwit versions are allowed in `shutdown`
-//!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
+//! - `DualFund` - requires/supports V2 channel establishment
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#channel-establishment-v2) for more information).
+//! - `SimpleClose` - requires/supports simplified closing negotiation
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#closing-negotiation-closing_complete-and-closing_sig) for more information).
 //! - `OnionMessages` - requires/supports forwarding onion messages
-//!     (see [BOLT-7](https://github.com/lightning/bolts/pull/759/files) for more information).
-//     TODO: update link
+//!   (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#onion-messages) for more information).
 //! - `ChannelType` - node supports the channel_type field in open/accept
-//!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
 //! - `SCIDPrivacy` - supply channel aliases for routing
-//!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
 //! - `PaymentMetadata` - include additional data in invoices which is passed to recipients in the
-//!      onion.
-//!      (see [BOLT-11](https://github.com/lightning/bolts/blob/master/11-payment-encoding.md) for
-//!      more).
+//!   onion.
+//!   (see [BOLT-11](https://github.com/lightning/bolts/blob/master/11-payment-encoding.md) for
+//!   more).
 //! - `ZeroConf` - supports accepting HTLCs and using channels prior to funding confirmation
-//!      (see
-//!      [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-channel_ready-message)
-//!      for more info).
+//!   (see
+//!   [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-channel_ready-message)
+//!   for more info).
 //! - `Keysend` - send funds to a node without an invoice
-//!     (see the [`Keysend` feature assignment proposal](https://github.com/lightning/bolts/issues/605#issuecomment-606679798) for more information).
+//!   (see the [`Keysend` feature assignment proposal](https://github.com/lightning/bolts/issues/605#issuecomment-606679798) for more information).
 //! - `Trampoline` - supports receiving and forwarding Trampoline payments
-//!     (see the [`Trampoline` feature proposal](https://github.com/lightning/bolts/pull/836) for more information).
+//!   (see the [`Trampoline` feature proposal](https://github.com/lightning/bolts/pull/836) for more information).
+//! - `DnsResolver` - supports resolving DNS names to TXT DNSSEC proofs for BIP 353 payments
+//!   (see [bLIP 32](https://github.com/lightning/blips/blob/master/blip-0032.md) for more information).
+//! - `ProvideStorage` - Indicates that we offer the capability to store data of our peers
+//!   (see [BOLT PR #1110](https://github.com/lightning/bolts/pull/1110) for more info).
+//! - `Quiescence` - protocol to quiesce a channel by indicating that "SomeThing Fundamental is Underway"
+//!   (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#channel-quiescence) for more information).
+//! - `ZeroFeeCommitments` - A channel type which always uses zero transaction fee on commitment transactions.
+//!   (see [BOLT PR #1228](https://github.com/lightning/bolts/pull/1228) for more info).
+//! - `Splice` - Allows replacing the currently-locked funding transaction with a new one
+//!   (see [BOLT PR #1160](https://github.com/lightning/bolts/pull/1160) for more information).
+//! - `HtlcHold` - requires/supports holding HTLCs and forwarding on receipt of an onion message
+//!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
-//!     vulnerable (see this
-//!     [mailing list post](https://lists.linuxfoundation.org/pipermail/lightning-dev/2020-September/002796.html)
-//!     for more information).
+//!   vulnerable (see this
+//!   [mailing list post](https://lists.linuxfoundation.org/pipermail/lightning-dev/2020-September/002796.html)
+//!   for more information).
 //!
 //! [BOLT #9]: https://github.com/lightning/bolts/blob/master/09-features.md
 
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
 use core::{cmp, fmt};
 
-use alloc::vec;
 use alloc::vec::Vec;
-
-use bech32::{u5, Base32Len, FromBase32, ToBase32, WriteBase32};
 
 mod sealed {
 	use super::Features;
-
-	use alloc::vec::Vec;
 
 	/// The context in which [`Features`] are applicable. Defines which features are known to the
 	/// implementation, though specification of them as required or optional is up to the code
@@ -147,15 +158,23 @@ mod sealed {
 			// Byte 2
 			BasicMPP | Wumbo | AnchorsNonzeroFeeHtlcTx | AnchorsZeroFeeHtlcTx,
 			// Byte 3
-			RouteBlinding | ShutdownAnySegwit | Taproot,
+			RouteBlinding | ShutdownAnySegwit | DualFund | Taproot,
 			// Byte 4
-			OnionMessages,
+			Quiescence | OnionMessages,
 			// Byte 5
-			ChannelType | SCIDPrivacy,
+			ProvideStorage | ChannelType | SCIDPrivacy,
 			// Byte 6
 			ZeroConf,
 			// Byte 7
-			Trampoline,
+			Trampoline | SimpleClose | SpliceProduction,
+			// Byte 8 - 16
+			,,,,,,,,,
+			// Byte 17
+			AnchorZeroFeeCommitmentsStaging,
+			// Byte 18
+			,
+			// Byte 19
+			HtlcHold | SplicePrototype,
 		]
 	);
 	define_context!(
@@ -168,15 +187,27 @@ mod sealed {
 			// Byte 2
 			BasicMPP | Wumbo | AnchorsNonzeroFeeHtlcTx | AnchorsZeroFeeHtlcTx,
 			// Byte 3
-			RouteBlinding | ShutdownAnySegwit | Taproot,
+			RouteBlinding | ShutdownAnySegwit | DualFund | Taproot,
 			// Byte 4
-			OnionMessages,
+			Quiescence | OnionMessages,
 			// Byte 5
-			ChannelType | SCIDPrivacy,
+			ProvideStorage | ChannelType | SCIDPrivacy,
 			// Byte 6
 			ZeroConf | Keysend,
 			// Byte 7
-			Trampoline,
+			Trampoline | SimpleClose | SpliceProduction,
+			// Byte 8 - 16
+			,,,,,,,,,
+			// Byte 17
+			AnchorZeroFeeCommitmentsStaging,
+			// Byte 18
+			,
+			// Byte 19
+			HtlcHold | SplicePrototype,
+			// Byte 20 - 31
+			,,,,,,,,,,,,
+			// Byte 32
+			DnsResolver,
 		]
 	);
 	define_context!(ChannelContext, []);
@@ -207,6 +238,16 @@ mod sealed {
 		,
 		// Byte 2
 		BasicMPP,
+		// Byte 3
+		,
+		// Byte 4
+		,
+		// Byte 5
+		,
+		// Byte 6
+		,
+		// Byte 7
+		Trampoline,
 	]);
 	define_context!(BlindedHopContext, []);
 	// This isn't a "real" feature context, and is only used in the channel_type field in an
@@ -226,13 +267,17 @@ mod sealed {
 		SCIDPrivacy,
 		// Byte 6
 		ZeroConf,
+		// Byte 7 - 16
+		,,,,,,,,,,
+		// Byte 17
+		AnchorZeroFeeCommitmentsStaging,
 	]);
 
 	/// Defines a feature with the given bits for the specified [`Context`]s. The generated trait is
 	/// useful for manipulating feature flags.
 	macro_rules! define_feature {
 		($odd_bit: expr, $feature: ident, [$($context: ty),+], $doc: expr, $optional_setter: ident,
-		 $required_setter: ident, $supported_getter: ident) => {
+		 $required_setter: ident, $clear: ident, $supported_getter: ident) => {
 			#[doc = $doc]
 			///
 			/// See [BOLT #9] for details.
@@ -276,63 +321,68 @@ mod sealed {
 
 				/// Returns whether the feature is required by the given flags.
 				#[inline]
-				fn requires_feature(flags: &Vec<u8>) -> bool {
+				fn requires_feature(flags: &[u8]) -> bool {
 					flags.len() > Self::BYTE_OFFSET &&
 						(flags[Self::BYTE_OFFSET] & Self::REQUIRED_MASK) != 0
 				}
 
 				/// Returns whether the feature is supported by the given flags.
 				#[inline]
-				fn supports_feature(flags: &Vec<u8>) -> bool {
+				fn supports_feature(flags: &[u8]) -> bool {
 					flags.len() > Self::BYTE_OFFSET &&
 						(flags[Self::BYTE_OFFSET] & (Self::REQUIRED_MASK | Self::OPTIONAL_MASK)) != 0
 				}
 
 				/// Sets the feature's required (even) bit in the given flags.
 				#[inline]
-				fn set_required_bit(flags: &mut Vec<u8>) {
-					if flags.len() <= Self::BYTE_OFFSET {
-						flags.resize(Self::BYTE_OFFSET + 1, 0u8);
+				fn set_required_bit(obj: &mut Features<Self>) {
+					if obj.flags.len() <= Self::BYTE_OFFSET {
+						obj.flags.resize(Self::BYTE_OFFSET + 1, 0u8);
 					}
 
-					flags[Self::BYTE_OFFSET] |= Self::REQUIRED_MASK;
-					flags[Self::BYTE_OFFSET] &= !Self::OPTIONAL_MASK;
+					obj.flags[Self::BYTE_OFFSET] |= Self::REQUIRED_MASK;
+					obj.flags[Self::BYTE_OFFSET] &= !Self::OPTIONAL_MASK;
 				}
 
 				/// Sets the feature's optional (odd) bit in the given flags.
 				#[inline]
-				fn set_optional_bit(flags: &mut Vec<u8>) {
-					if flags.len() <= Self::BYTE_OFFSET {
-						flags.resize(Self::BYTE_OFFSET + 1, 0u8);
+				fn set_optional_bit(obj: &mut Features<Self>) {
+					if obj.flags.len() <= Self::BYTE_OFFSET {
+						obj.flags.resize(Self::BYTE_OFFSET + 1, 0u8);
 					}
 
-					flags[Self::BYTE_OFFSET] |= Self::OPTIONAL_MASK;
+					obj.flags[Self::BYTE_OFFSET] |= Self::OPTIONAL_MASK;
 				}
 
 				/// Clears the feature's required (even) and optional (odd) bits from the given
 				/// flags.
 				#[inline]
-				fn clear_bits(flags: &mut Vec<u8>) {
-					if flags.len() > Self::BYTE_OFFSET {
-						flags[Self::BYTE_OFFSET] &= !Self::REQUIRED_MASK;
-						flags[Self::BYTE_OFFSET] &= !Self::OPTIONAL_MASK;
+				fn clear_bits(obj: &mut Features<Self>) {
+					if obj.flags.len() > Self::BYTE_OFFSET {
+						obj.flags[Self::BYTE_OFFSET] &= !Self::REQUIRED_MASK;
+						obj.flags[Self::BYTE_OFFSET] &= !Self::OPTIONAL_MASK;
 					}
 
-					let last_non_zero_byte = flags.iter().rposition(|&byte| byte != 0);
+					let last_non_zero_byte = obj.flags.iter().rposition(|&byte| byte != 0);
 					let size = if let Some(offset) = last_non_zero_byte { offset + 1 } else { 0 };
-					flags.resize(size, 0u8);
+					obj.flags.resize(size, 0u8);
 				}
 			}
 
 			impl <T: $feature> Features<T> {
 				/// Set this feature as optional.
 				pub fn $optional_setter(&mut self) {
-					<T as $feature>::set_optional_bit(&mut self.flags);
+					<T as $feature>::set_optional_bit(self);
 				}
 
 				/// Set this feature as required.
 				pub fn $required_setter(&mut self) {
-					<T as $feature>::set_required_bit(&mut self.flags);
+					<T as $feature>::set_required_bit(self);
+				}
+
+				/// Unsets this feature.
+				pub fn $clear(&mut self) {
+					<T as $feature>::clear_bits(self);
 				}
 
 				/// Checks if this feature is supported.
@@ -358,8 +408,8 @@ mod sealed {
 			)*
 		};
 		($odd_bit: expr, $feature: ident, [$($context: ty),+], $doc: expr, $optional_setter: ident,
-		 $required_setter: ident, $supported_getter: ident, $required_getter: ident) => {
-			define_feature!($odd_bit, $feature, [$($context),+], $doc, $optional_setter, $required_setter, $supported_getter);
+		 $required_setter: ident, $clear: ident, $supported_getter: ident, $required_getter: ident) => {
+			define_feature!($odd_bit, $feature, [$($context),+], $doc, $optional_setter, $required_setter, $clear, $supported_getter);
 			impl <T: $feature> Features<T> {
 				/// Checks if this feature is required.
 				pub fn $required_getter(&self) -> bool {
@@ -376,6 +426,7 @@ mod sealed {
 		"Feature flags for `option_data_loss_protect`.",
 		set_data_loss_protect_optional,
 		set_data_loss_protect_required,
+		clear_data_loss_protect,
 		supports_data_loss_protect,
 		requires_data_loss_protect
 	);
@@ -387,6 +438,7 @@ mod sealed {
 		"Feature flags for `initial_routing_sync`.",
 		set_initial_routing_sync_optional,
 		set_initial_routing_sync_required,
+		clear_initial_routing_sync,
 		initial_routing_sync
 	);
 	define_feature!(
@@ -396,6 +448,7 @@ mod sealed {
 		"Feature flags for `option_upfront_shutdown_script`.",
 		set_upfront_shutdown_script_optional,
 		set_upfront_shutdown_script_required,
+		clear_upfront_shutdown_script,
 		supports_upfront_shutdown_script,
 		requires_upfront_shutdown_script
 	);
@@ -406,6 +459,7 @@ mod sealed {
 		"Feature flags for `gossip_queries`.",
 		set_gossip_queries_optional,
 		set_gossip_queries_required,
+		clear_gossip_queries,
 		supports_gossip_queries,
 		requires_gossip_queries
 	);
@@ -416,6 +470,7 @@ mod sealed {
 		"Feature flags for `var_onion_optin`.",
 		set_variable_length_onion_optional,
 		set_variable_length_onion_required,
+		clear_variable_length_onion,
 		supports_variable_length_onion,
 		requires_variable_length_onion
 	);
@@ -426,6 +481,7 @@ mod sealed {
 		"Feature flags for `option_static_remotekey`.",
 		set_static_remote_key_optional,
 		set_static_remote_key_required,
+		clear_static_remote_key,
 		supports_static_remote_key,
 		requires_static_remote_key
 	);
@@ -436,6 +492,7 @@ mod sealed {
 		"Feature flags for `payment_secret`.",
 		set_payment_secret_optional,
 		set_payment_secret_required,
+		clear_payment_secret,
 		supports_payment_secret,
 		requires_payment_secret
 	);
@@ -446,6 +503,7 @@ mod sealed {
 		"Feature flags for `basic_mpp`.",
 		set_basic_mpp_optional,
 		set_basic_mpp_required,
+		clear_basic_mpp,
 		supports_basic_mpp,
 		requires_basic_mpp
 	);
@@ -456,6 +514,7 @@ mod sealed {
 		"Feature flags for `option_support_large_channel` (aka wumbo channels).",
 		set_wumbo_optional,
 		set_wumbo_required,
+		clear_wumbo,
 		supports_wumbo,
 		requires_wumbo
 	);
@@ -466,6 +525,7 @@ mod sealed {
 		"Feature flags for `option_anchors_nonzero_fee_htlc_tx`.",
 		set_anchors_nonzero_fee_htlc_tx_optional,
 		set_anchors_nonzero_fee_htlc_tx_required,
+		clear_anchors_nonzero_fee_htlc_tx,
 		supports_anchors_nonzero_fee_htlc_tx,
 		requires_anchors_nonzero_fee_htlc_tx
 	);
@@ -476,6 +536,7 @@ mod sealed {
 		"Feature flags for `option_anchors_zero_fee_htlc_tx`.",
 		set_anchors_zero_fee_htlc_tx_optional,
 		set_anchors_zero_fee_htlc_tx_required,
+		clear_anchors_zero_fee_htlc_tx,
 		supports_anchors_zero_fee_htlc_tx,
 		requires_anchors_zero_fee_htlc_tx
 	);
@@ -486,6 +547,7 @@ mod sealed {
 		"Feature flags for `option_route_blinding`.",
 		set_route_blinding_optional,
 		set_route_blinding_required,
+		clear_route_blinding,
 		supports_route_blinding,
 		requires_route_blinding
 	);
@@ -496,8 +558,20 @@ mod sealed {
 		"Feature flags for `opt_shutdown_anysegwit`.",
 		set_shutdown_any_segwit_optional,
 		set_shutdown_any_segwit_required,
+		clear_shutdown_anysegwit,
 		supports_shutdown_anysegwit,
 		requires_shutdown_anysegwit
+	);
+	define_feature!(
+		29,
+		DualFund,
+		[InitContext, NodeContext],
+		"Feature flags for `option_dual_fund`.",
+		set_dual_fund_optional,
+		set_dual_fund_required,
+		clear_dual_fund,
+		supports_dual_fund,
+		requires_dual_fund
 	);
 	define_feature!(
 		31,
@@ -506,8 +580,20 @@ mod sealed {
 		"Feature flags for `option_taproot`.",
 		set_taproot_optional,
 		set_taproot_required,
+		clear_taproot,
 		supports_taproot,
 		requires_taproot
+	);
+	define_feature!(
+		35,
+		Quiescence,
+		[InitContext, NodeContext],
+		"Feature flags for `option_quiesce`.",
+		set_quiescence_optional,
+		set_quiescence_required,
+		clear_quiescence,
+		supports_quiescence,
+		requires_quiescence
 	);
 	define_feature!(
 		39,
@@ -516,8 +602,20 @@ mod sealed {
 		"Feature flags for `option_onion_messages`.",
 		set_onion_messages_optional,
 		set_onion_messages_required,
+		clear_onion_messages,
 		supports_onion_messages,
 		requires_onion_messages
+	);
+	define_feature!(
+		43,
+		ProvideStorage,
+		[InitContext, NodeContext],
+		"Feature flags for `option_provide_storage`.",
+		set_provide_storage_optional,
+		set_provide_storage_required,
+		clear_provide_storage,
+		supports_provide_storage,
+		requires_provide_storage
 	);
 	define_feature!(
 		45,
@@ -526,12 +624,20 @@ mod sealed {
 		"Feature flags for `option_channel_type`.",
 		set_channel_type_optional,
 		set_channel_type_required,
+		clear_channel_type,
 		supports_channel_type,
 		requires_channel_type
 	);
-	define_feature!(47, SCIDPrivacy, [InitContext, NodeContext, ChannelTypeContext],
+	define_feature!(47,
+		SCIDPrivacy,
+		[InitContext, NodeContext, ChannelTypeContext],
 		"Feature flags for only forwarding with SCID aliasing. Called `option_scid_alias` in the BOLTs",
-		set_scid_privacy_optional, set_scid_privacy_required, supports_scid_privacy, requires_scid_privacy);
+		set_scid_privacy_optional,
+		set_scid_privacy_required,
+		clear_scid_privacy,
+		supports_scid_privacy,
+		requires_scid_privacy
+	);
 	define_feature!(
 		49,
 		PaymentMetadata,
@@ -539,6 +645,7 @@ mod sealed {
 		"Feature flags for payment metadata in invoices.",
 		set_payment_metadata_optional,
 		set_payment_metadata_required,
+		clear_payment_metadata,
 		supports_payment_metadata,
 		requires_payment_metadata
 	);
@@ -552,19 +659,91 @@ mod sealed {
 		"Feature flags for keysend payments.",
 		set_keysend_optional,
 		set_keysend_required,
+		clear_keysend,
 		supports_keysend,
 		requires_keysend
 	);
 	define_feature!(
 		57,
 		Trampoline,
-		[InitContext, NodeContext, Bolt11InvoiceContext],
+		[InitContext, NodeContext, Bolt11InvoiceContext, Bolt12InvoiceContext],
 		"Feature flags for Trampoline routing.",
 		set_trampoline_routing_optional,
 		set_trampoline_routing_required,
+		clear_trampoline_routing,
 		supports_trampoline_routing,
 		requires_trampoline_routing
 	);
+	define_feature!(
+		61,
+		SimpleClose,
+		[InitContext, NodeContext],
+		"Feature flags for simplified closing negotiation.",
+		set_simple_close_optional,
+		set_simple_close_required,
+		clear_simple_close,
+		supports_simple_close,
+		requires_simple_close
+	);
+	define_feature!(
+		63,
+		SpliceProduction,
+		[InitContext, NodeContext],
+		"Feature flags for channel splicing.",
+		set_splicing_production_optional,
+		set_splicing_production_required,
+		clear_splicing_production,
+		supports_splicing_production,
+		requires_splicing_production
+	);
+	// By default, allocate enough bytes to cover up to Splice. Update this as new features are
+	// added which we expect to appear commonly across contexts.
+	pub(super) const MIN_FEATURES_ALLOCATION_BYTES: usize = (63 + 7) / 8;
+	define_feature!(
+		141, // The BOLTs PR uses feature bit 40/41, so add +100 for the experimental bit
+		AnchorZeroFeeCommitmentsStaging,
+		[InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for `option_zero_fee_commitments`.",
+		set_anchor_zero_fee_commitments_optional,
+		set_anchor_zero_fee_commitments_required,
+		clear_anchor_zero_fee_commitments,
+		supports_anchor_zero_fee_commitments,
+		requires_anchor_zero_fee_commitments
+	);
+	define_feature!(
+		153, // The BOLTs PR uses feature bit 52/53, so add +100 for the experimental bit
+		HtlcHold,
+		[InitContext, NodeContext],
+		"Feature flags for holding HTLCs and forwarding on receipt of an onion message",
+		set_htlc_hold_optional,
+		set_htlc_hold_required,
+		clear_htlc_hold,
+		supports_htlc_hold,
+		requires_htlc_hold
+	);
+	define_feature!(
+		155, // Splice prototype feature bit as listed in https://github.com/lightning/bolts/issues/605#issuecomment-877237519.
+		SplicePrototype,
+		[InitContext, NodeContext],
+		"Feature flags for channel splicing.",
+		set_splicing_optional,
+		set_splicing_required,
+		clear_splicing,
+		supports_splicing,
+		requires_splicing
+	);
+	define_feature!(
+		259,
+		DnsResolver,
+		[NodeContext],
+		"Feature flags for DNS resolving.",
+		set_dns_resolution_optional,
+		set_dns_resolution_required,
+		clear_dns_resolution,
+		supports_dns_resolution,
+		requires_dns_resolution
+	);
+
 	// Note: update the module-level docs when a new feature bit is added!
 
 	#[cfg(any(test, feature = "_test_utils"))]
@@ -583,6 +762,7 @@ mod sealed {
 		"Feature flags for an unknown feature used in testing.",
 		set_unknown_feature_optional,
 		set_unknown_feature_required,
+		clear_unknown_feature,
 		supports_unknown_test_feature,
 		requires_unknown_test_feature
 	);
@@ -591,14 +771,146 @@ mod sealed {
 const ANY_REQUIRED_FEATURES_MASK: u8 = 0b01_01_01_01;
 const ANY_OPTIONAL_FEATURES_MASK: u8 = 0b10_10_10_10;
 
+// Vecs are always 3 pointers long, so `FeatureFlags` is never shorter than 24 bytes on 64-bit
+// platforms no matter what we do.
+//
+// Luckily, because `Vec` uses a `NonNull` pointer to its buffer, the two-variant enum is free
+// space-wise, but we only get the remaining 2 usizes in length available for our own stuff (as any
+// other value is interpreted as the `Heap` variant).
+//
+// Thus, as long as we never use more than 16 bytes (15 bytes for the data and one byte for the
+// length) for our Held variant `FeatureFlags` is the same length as a `Vec` in memory.
+const DIRECT_ALLOC_BYTES: usize = if sealed::MIN_FEATURES_ALLOCATION_BYTES > 8 * 2 - 1 {
+	sealed::MIN_FEATURES_ALLOCATION_BYTES
+} else {
+	8 * 2 - 1
+};
+const _ASSERT: () = assert!(DIRECT_ALLOC_BYTES <= u8::MAX as usize);
+
+#[cfg(fuzzing)]
+#[derive(Clone, PartialEq, Eq)]
+pub enum FeatureFlags {
+	Held { bytes: [u8; DIRECT_ALLOC_BYTES], len: u8 },
+	Heap(Vec<u8>),
+}
+
+#[cfg(not(fuzzing))]
+#[derive(Clone, PartialEq, Eq)]
+enum FeatureFlags {
+	Held { bytes: [u8; DIRECT_ALLOC_BYTES], len: u8 },
+	Heap(Vec<u8>),
+}
+
+impl FeatureFlags {
+	/// Constructs an empty [`FeatureFlags`]
+	pub fn empty() -> Self {
+		Self::Held { bytes: [0; DIRECT_ALLOC_BYTES], len: 0 }
+	}
+
+	/// Constructs a [`FeatureFlags`] from the given bytes
+	pub fn from(vec: Vec<u8>) -> Self {
+		if vec.len() <= DIRECT_ALLOC_BYTES {
+			let mut bytes = [0; DIRECT_ALLOC_BYTES];
+			bytes[..vec.len()].copy_from_slice(&vec);
+			Self::Held { bytes, len: vec.len() as u8 }
+		} else {
+			Self::Heap(vec)
+		}
+	}
+
+	/// Resizes a [`FeatureFlags`] to the given length, padding with `default` if required.
+	///
+	/// See [`Vec::resize`] for more info.
+	pub fn resize(&mut self, new_len: usize, default: u8) {
+		match self {
+			Self::Held { bytes, len } => {
+				let start_len = *len as usize;
+				if new_len <= DIRECT_ALLOC_BYTES {
+					bytes[start_len..].copy_from_slice(&[default; DIRECT_ALLOC_BYTES][start_len..]);
+					*len = new_len as u8;
+				} else {
+					let mut vec = Vec::new();
+					vec.resize(new_len, default);
+					vec[..start_len].copy_from_slice(&bytes[..start_len]);
+					*self = Self::Heap(vec);
+				}
+			},
+			Self::Heap(vec) => {
+				vec.resize(new_len, default);
+				if new_len <= DIRECT_ALLOC_BYTES {
+					let mut bytes = [0; DIRECT_ALLOC_BYTES];
+					bytes[..new_len].copy_from_slice(&vec[..new_len]);
+					*self = Self::Held { bytes, len: new_len as u8 };
+				}
+			},
+		}
+	}
+
+	/// Fetches the length of the [`FeatureFlags`], in bytes.
+	pub fn len(&self) -> usize {
+		self.deref().len()
+	}
+
+	/// Fetches an iterator over the bytes of this [`FeatureFlags`]
+	pub fn iter(
+		&self,
+	) -> impl Clone + ExactSizeIterator<Item = &u8> + DoubleEndedIterator<Item = &u8> {
+		let slice = self.deref();
+		slice.iter()
+	}
+
+	/// Fetches a mutable iterator over the bytes of this [`FeatureFlags`]
+	pub fn iter_mut(
+		&mut self,
+	) -> impl ExactSizeIterator<Item = &mut u8> + DoubleEndedIterator<Item = &mut u8> {
+		let slice = self.deref_mut();
+		slice.iter_mut()
+	}
+}
+
+impl Deref for FeatureFlags {
+	type Target = [u8];
+	fn deref(&self) -> &[u8] {
+		match self {
+			FeatureFlags::Held { bytes, len } => &bytes[..*len as usize],
+			FeatureFlags::Heap(vec) => &vec,
+		}
+	}
+}
+
+impl DerefMut for FeatureFlags {
+	fn deref_mut(&mut self) -> &mut [u8] {
+		match self {
+			FeatureFlags::Held { bytes, len } => &mut bytes[..*len as usize],
+			FeatureFlags::Heap(vec) => &mut vec[..],
+		}
+	}
+}
+
+impl PartialOrd for FeatureFlags {
+	fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+impl Ord for FeatureFlags {
+	fn cmp(&self, other: &Self) -> cmp::Ordering {
+		self.deref().cmp(other.deref())
+	}
+}
+impl fmt::Debug for FeatureFlags {
+	fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+		self.deref().fmt(fmt)
+	}
+}
+
 /// Tracks the set of features which a node implements, templated by the context in which it
 /// appears.
 ///
 /// This is not exported to bindings users as we map the concrete feature types below directly instead
 #[derive(Eq)]
-pub struct Features<T: sealed::Context> {
+pub struct Features<T: sealed::Context + ?Sized> {
 	/// Note that, for convenience, flags is LITTLE endian (despite being big-endian on the wire)
-	flags: Vec<u8>,
+	flags: FeatureFlags,
 	mark: PhantomData<T>,
 }
 
@@ -635,7 +947,7 @@ impl<T: sealed::Context> Hash for Features<T> {
 		nonzero_flags.hash(hasher);
 	}
 }
-impl<T: sealed::Context> PartialEq for Features<T> {
+impl<T: sealed::Context + ?Sized> PartialEq for Features<T> {
 	fn eq(&self, o: &Self) -> bool {
 		let mut o_iter = o.flags.iter();
 		let mut self_iter = self.flags.iter();
@@ -770,106 +1082,48 @@ impl ChannelTypeFeatures {
 	/// Constructs a ChannelTypeFeatures with only static_remotekey set
 	pub fn only_static_remote_key() -> Self {
 		let mut ret = Self::empty();
-		<sealed::ChannelTypeContext as sealed::StaticRemoteKey>::set_required_bit(&mut ret.flags);
+		<sealed::ChannelTypeContext as sealed::StaticRemoteKey>::set_required_bit(&mut ret);
 		ret
 	}
 
 	/// Constructs a ChannelTypeFeatures with anchors support
 	pub fn anchors_zero_htlc_fee_and_dependencies() -> Self {
 		let mut ret = Self::empty();
-		<sealed::ChannelTypeContext as sealed::StaticRemoteKey>::set_required_bit(&mut ret.flags);
-		<sealed::ChannelTypeContext as sealed::AnchorsZeroFeeHtlcTx>::set_required_bit(
-			&mut ret.flags,
-		);
+		<sealed::ChannelTypeContext as sealed::StaticRemoteKey>::set_required_bit(&mut ret);
+		<sealed::ChannelTypeContext as sealed::AnchorsZeroFeeHtlcTx>::set_required_bit(&mut ret);
 		ret
 	}
-}
 
-impl ToBase32 for Bolt11InvoiceFeatures {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		// Explanation for the "4": the normal way to round up when dividing is to add the divisor
-		// minus one before dividing
-		let length_u5s = (self.flags.len() * 8 + 4) / 5 as usize;
-		let mut res_u5s: Vec<u5> = vec![u5::try_from_u8(0).unwrap(); length_u5s];
-		for (byte_idx, byte) in self.flags.iter().enumerate() {
-			let bit_pos_from_left_0_indexed = byte_idx * 8;
-			let new_u5_idx = length_u5s - (bit_pos_from_left_0_indexed / 5) as usize - 1;
-			let new_bit_pos = bit_pos_from_left_0_indexed % 5;
-			let shifted_chunk_u16 = (*byte as u16) << new_bit_pos;
-			let curr_u5_as_u8 = res_u5s[new_u5_idx].to_u8();
-			res_u5s[new_u5_idx] =
-				u5::try_from_u8(curr_u5_as_u8 | ((shifted_chunk_u16 & 0x001f) as u8)).unwrap();
-			if new_u5_idx > 0 {
-				let curr_u5_as_u8 = res_u5s[new_u5_idx - 1].to_u8();
-				res_u5s[new_u5_idx - 1] =
-					u5::try_from_u8(curr_u5_as_u8 | (((shifted_chunk_u16 >> 5) & 0x001f) as u8))
-						.unwrap();
-			}
-			if new_u5_idx > 1 {
-				let curr_u5_as_u8 = res_u5s[new_u5_idx - 2].to_u8();
-				res_u5s[new_u5_idx - 2] =
-					u5::try_from_u8(curr_u5_as_u8 | (((shifted_chunk_u16 >> 10) & 0x001f) as u8))
-						.unwrap();
-			}
-		}
-		// Trim the highest feature bits.
-		while !res_u5s.is_empty() && res_u5s[0] == u5::try_from_u8(0).unwrap() {
-			res_u5s.remove(0);
-		}
-		writer.write(&res_u5s)
-	}
-}
-
-impl Base32Len for Bolt11InvoiceFeatures {
-	fn base32_len(&self) -> usize {
-		self.to_base32().len()
-	}
-}
-
-impl FromBase32 for Bolt11InvoiceFeatures {
-	type Err = bech32::Error;
-
-	fn from_base32(field_data: &[u5]) -> Result<Bolt11InvoiceFeatures, bech32::Error> {
-		// Explanation for the "7": the normal way to round up when dividing is to add the divisor
-		// minus one before dividing
-		let length_bytes = (field_data.len() * 5 + 7) / 8 as usize;
-		let mut res_bytes: Vec<u8> = vec![0; length_bytes];
-		for (u5_idx, chunk) in field_data.iter().enumerate() {
-			let bit_pos_from_right_0_indexed = (field_data.len() - u5_idx - 1) * 5;
-			let new_byte_idx = (bit_pos_from_right_0_indexed / 8) as usize;
-			let new_bit_pos = bit_pos_from_right_0_indexed % 8;
-			let chunk_u16 = chunk.to_u8() as u16;
-			res_bytes[new_byte_idx] |= ((chunk_u16 << new_bit_pos) & 0xff) as u8;
-			if new_byte_idx != length_bytes - 1 {
-				res_bytes[new_byte_idx + 1] |= ((chunk_u16 >> (8 - new_bit_pos)) & 0xff) as u8;
-			}
-		}
-		// Trim the highest feature bits.
-		while !res_bytes.is_empty() && res_bytes[res_bytes.len() - 1] == 0 {
-			res_bytes.pop();
-		}
-		Ok(Bolt11InvoiceFeatures::from_le_bytes(res_bytes))
+	/// Constructs a ChannelTypeFeatures with zero fee commitment anchors support.
+	pub fn anchors_zero_fee_commitments() -> Self {
+		let mut ret = Self::empty();
+		<sealed::ChannelTypeContext as sealed::AnchorZeroFeeCommitmentsStaging>::set_required_bit(
+			&mut ret,
+		);
+		ret
 	}
 }
 
 impl<T: sealed::Context> Features<T> {
 	/// Create a blank Features with no features set
 	pub fn empty() -> Self {
-		Features { flags: Vec::new(), mark: PhantomData }
+		Features { flags: FeatureFlags::empty(), mark: PhantomData }
 	}
 
 	/// Converts `Features<T>` to `Features<C>`. Only known `T` features relevant to context `C` are
 	/// included in the result.
 	fn to_context_internal<C: sealed::Context>(&self) -> Features<C> {
-		let from_byte_count = T::KNOWN_FEATURE_MASK.len();
-		let to_byte_count = C::KNOWN_FEATURE_MASK.len();
-		let mut flags = Vec::new();
-		for (i, byte) in self.flags.iter().enumerate() {
-			if i < from_byte_count && i < to_byte_count {
-				let from_known_features = T::KNOWN_FEATURE_MASK[i];
-				let to_known_features = C::KNOWN_FEATURE_MASK[i];
-				flags.push(byte & from_known_features & to_known_features);
+		let flag_iter = self.flags.iter().enumerate().filter_map(|(i, byte)| {
+			if i < T::KNOWN_FEATURE_MASK.len() && i < C::KNOWN_FEATURE_MASK.len() {
+				Some((i, *byte & T::KNOWN_FEATURE_MASK[i] & C::KNOWN_FEATURE_MASK[i]))
+			} else {
+				None
 			}
+		});
+		let mut flags = FeatureFlags::empty();
+		flags.resize(flag_iter.clone().count(), 0);
+		for (i, byte) in flag_iter {
+			flags[i] = byte;
 		}
 		Features::<C> { flags, mark: PhantomData }
 	}
@@ -879,7 +1133,7 @@ impl<T: sealed::Context> Features<T> {
 	///
 	/// This is not exported to bindings users as we don't support export across multiple T
 	pub fn from_le_bytes(flags: Vec<u8>) -> Features<T> {
-		Features { flags, mark: PhantomData }
+		Features { flags: FeatureFlags::from(flags), mark: PhantomData }
 	}
 
 	/// Returns the feature set as a list of bytes, in little-endian. This is in reverse byte order
@@ -894,7 +1148,7 @@ impl<T: sealed::Context> Features<T> {
 	/// This is not exported to bindings users as we don't support export across multiple T
 	pub fn from_be_bytes(mut flags: Vec<u8>) -> Features<T> {
 		flags.reverse(); // Swap to little-endian
-		Self { flags, mark: PhantomData }
+		Self { flags: FeatureFlags::from(flags), mark: PhantomData }
 	}
 
 	/// Returns true if this `Features` has any optional flags set
@@ -1045,51 +1299,6 @@ impl<T: sealed::Context> Features<T> {
 	}
 }
 
-impl<T: sealed::UpfrontShutdownScript> Features<T> {
-	/// Unsets the `upfront_shutdown_script` feature
-	pub fn clear_upfront_shutdown_script(mut self) -> Self {
-		<T as sealed::UpfrontShutdownScript>::clear_bits(&mut self.flags);
-		self
-	}
-}
-
-impl<T: sealed::ShutdownAnySegwit> Features<T> {
-	/// Unsets the `shutdown_anysegwit` feature
-	pub fn clear_shutdown_anysegwit(mut self) -> Self {
-		<T as sealed::ShutdownAnySegwit>::clear_bits(&mut self.flags);
-		self
-	}
-}
-
-impl<T: sealed::Wumbo> Features<T> {
-	/// Unsets the `wumbo` feature
-	pub fn clear_wumbo(mut self) -> Self {
-		<T as sealed::Wumbo>::clear_bits(&mut self.flags);
-		self
-	}
-}
-
-impl<T: sealed::SCIDPrivacy> Features<T> {
-	/// Unsets the `scid_privacy` feature
-	pub fn clear_scid_privacy(&mut self) {
-		<T as sealed::SCIDPrivacy>::clear_bits(&mut self.flags);
-	}
-}
-
-impl<T: sealed::AnchorsZeroFeeHtlcTx> Features<T> {
-	/// Unsets the `anchors_zero_fee_htlc_tx` feature
-	pub fn clear_anchors_zero_fee_htlc_tx(&mut self) {
-		<T as sealed::AnchorsZeroFeeHtlcTx>::clear_bits(&mut self.flags);
-	}
-}
-
-impl<T: sealed::RouteBlinding> Features<T> {
-	/// Unsets the `route_blinding` feature
-	pub fn clear_route_blinding(&mut self) {
-		<T as sealed::RouteBlinding>::clear_bits(&mut self.flags);
-	}
-}
-
 #[cfg(any(test, feature = "_test_utils"))]
 impl<T: sealed::UnknownFeature> Features<T> {
 	/// Sets an unknown feature for testing
@@ -1157,6 +1366,14 @@ mod tests {
 		assert!(!features1.requires_unknown_bits_from(&features2));
 		assert!(!features2.requires_unknown_bits_from(&features1));
 
+		features1.set_provide_storage_required();
+		assert!(features1.requires_unknown_bits_from(&features2));
+		assert!(!features2.requires_unknown_bits_from(&features1));
+
+		features2.set_provide_storage_optional();
+		assert!(!features1.requires_unknown_bits_from(&features2));
+		assert!(!features2.requires_unknown_bits_from(&features1));
+
 		features1.set_data_loss_protect_required();
 		assert!(features1.requires_unknown_bits_from(&features2));
 		assert!(!features2.requires_unknown_bits_from(&features1));
@@ -1206,6 +1423,9 @@ mod tests {
 		init_features.set_channel_type_optional();
 		init_features.set_scid_privacy_optional();
 		init_features.set_zero_conf_optional();
+		init_features.set_quiescence_optional();
+		init_features.set_simple_close_optional();
+		init_features.set_splicing_optional();
 
 		assert!(init_features.initial_routing_sync());
 		assert!(!init_features.supports_upfront_shutdown_script());
@@ -1221,14 +1441,28 @@ mod tests {
 			// - onion_messages
 			// - option_channel_type | option_scid_alias
 			// - option_zeroconf
-			assert_eq!(node_features.flags.len(), 7);
+			// - option_simple_close | option_splice
+			assert_eq!(node_features.flags.len(), 20);
 			assert_eq!(node_features.flags[0], 0b00000001);
 			assert_eq!(node_features.flags[1], 0b01010001);
 			assert_eq!(node_features.flags[2], 0b10001010);
 			assert_eq!(node_features.flags[3], 0b00001010);
-			assert_eq!(node_features.flags[4], 0b10000000);
+			assert_eq!(node_features.flags[4], 0b10001000);
 			assert_eq!(node_features.flags[5], 0b10100000);
 			assert_eq!(node_features.flags[6], 0b00001000);
+			assert_eq!(node_features.flags[7], 0b00100000);
+			assert_eq!(node_features.flags[8], 0b00000000);
+			assert_eq!(node_features.flags[9], 0b00000000);
+			assert_eq!(node_features.flags[10], 0b00000000);
+			assert_eq!(node_features.flags[11], 0b00000000);
+			assert_eq!(node_features.flags[12], 0b00000000);
+			assert_eq!(node_features.flags[13], 0b00000000);
+			assert_eq!(node_features.flags[14], 0b00000000);
+			assert_eq!(node_features.flags[15], 0b00000000);
+			assert_eq!(node_features.flags[16], 0b00000000);
+			assert_eq!(node_features.flags[17], 0b00000000);
+			assert_eq!(node_features.flags[18], 0b00000000);
+			assert_eq!(node_features.flags[19], 0b00001000);
 		}
 
 		// Check that cleared flags are kept blank when converting back:
@@ -1304,37 +1538,6 @@ mod tests {
 	}
 
 	#[test]
-	fn invoice_features_encoding() {
-		let features_as_u5s = vec![
-			u5::try_from_u8(6).unwrap(),
-			u5::try_from_u8(10).unwrap(),
-			u5::try_from_u8(25).unwrap(),
-			u5::try_from_u8(1).unwrap(),
-			u5::try_from_u8(10).unwrap(),
-			u5::try_from_u8(0).unwrap(),
-			u5::try_from_u8(20).unwrap(),
-			u5::try_from_u8(2).unwrap(),
-			u5::try_from_u8(0).unwrap(),
-			u5::try_from_u8(6).unwrap(),
-			u5::try_from_u8(0).unwrap(),
-			u5::try_from_u8(16).unwrap(),
-			u5::try_from_u8(1).unwrap(),
-		];
-		let features = Bolt11InvoiceFeatures::from_le_bytes(vec![1, 2, 3, 4, 5, 42, 100, 101]);
-
-		// Test length calculation.
-		assert_eq!(features.base32_len(), 13);
-
-		// Test serialization.
-		let features_serialized = features.to_base32();
-		assert_eq!(features_as_u5s, features_serialized);
-
-		// Test deserialization.
-		let features_deserialized = Bolt11InvoiceFeatures::from_base32(&features_as_u5s).unwrap();
-		assert_eq!(features, features_deserialized);
-	}
-
-	#[test]
 	fn test_channel_type_mapping() {
 		// If we map an Bolt11InvoiceFeatures with StaticRemoteKey optional, it should map into a
 		// required-StaticRemoteKey ChannelTypeFeatures.
@@ -1354,7 +1557,7 @@ mod tests {
 		use std::hash::{Hash, Hasher};
 
 		let mut zerod_features = InitFeatures::empty();
-		zerod_features.flags = vec![0];
+		zerod_features.flags = FeatureFlags::Heap(vec![0]);
 		let empty_features = InitFeatures::empty();
 		assert!(empty_features.flags.is_empty());
 
@@ -1365,5 +1568,28 @@ mod tests {
 		let mut empty_hash = DefaultHasher::new();
 		empty_features.hash(&mut empty_hash);
 		assert_eq!(zerod_hash.finish(), empty_hash.finish());
+	}
+
+	#[test]
+	fn test_feature_flags_transitions() {
+		// Tests transitions from stack to heap and back in `FeatureFlags`
+		let mut flags = FeatureFlags::empty();
+		assert!(matches!(flags, FeatureFlags::Held { .. }));
+
+		flags.resize(DIRECT_ALLOC_BYTES, 42);
+		assert_eq!(flags.len(), DIRECT_ALLOC_BYTES);
+		assert!(flags.iter().take(DIRECT_ALLOC_BYTES).all(|b| *b == 42));
+		assert!(matches!(flags, FeatureFlags::Held { .. }));
+
+		flags.resize(DIRECT_ALLOC_BYTES * 2, 43);
+		assert_eq!(flags.len(), DIRECT_ALLOC_BYTES * 2);
+		assert!(flags.iter().take(DIRECT_ALLOC_BYTES).all(|b| *b == 42));
+		assert!(flags.iter().skip(DIRECT_ALLOC_BYTES).all(|b| *b == 43));
+		assert!(matches!(flags, FeatureFlags::Heap(_)));
+
+		flags.resize(DIRECT_ALLOC_BYTES, 0);
+		assert_eq!(flags.len(), DIRECT_ALLOC_BYTES);
+		assert!(flags.iter().take(DIRECT_ALLOC_BYTES).all(|b| *b == 42));
+		assert!(matches!(flags, FeatureFlags::Held { .. }));
 	}
 }

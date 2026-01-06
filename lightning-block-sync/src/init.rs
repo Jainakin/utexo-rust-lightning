@@ -9,6 +9,7 @@ use bitcoin::hash_types::BlockHash;
 use bitcoin::network::Network;
 
 use lightning::chain;
+use lightning::chain::BestBlock;
 
 use std::ops::Deref;
 
@@ -49,10 +50,11 @@ where
 /// use lightning::chain::channelmonitor::ChannelMonitor;
 /// use lightning::chain::chaininterface::BroadcasterInterface;
 /// use lightning::chain::chaininterface::FeeEstimator;
+/// use lightning::ln::channelmanager::{ChannelManager, ChannelManagerReadArgs};
+/// use lightning::onion_message::messenger::MessageRouter;
+/// use lightning::routing::router::Router;
 /// use lightning::sign;
 /// use lightning::sign::{EntropySource, NodeSigner, SignerProvider};
-/// use lightning::ln::channelmanager::{ChannelManager, ChannelManagerReadArgs};
-/// use lightning::routing::router::Router;
 /// use lightning::util::config::UserConfig;
 /// use lightning::util::logger::Logger;
 /// use lightning::util::ser::ReadableArgs;
@@ -69,12 +71,13 @@ where
 /// 	T: BroadcasterInterface,
 /// 	F: FeeEstimator,
 /// 	R: Router,
+/// 	MR: MessageRouter,
 /// 	L: Logger,
 /// 	C: chain::Filter,
 /// 	P: chainmonitor::Persist<SP::EcdsaSigner>,
 /// >(
 /// 	block_source: &B,
-/// 	chain_monitor: &ChainMonitor<SP::EcdsaSigner, &C, &T, &F, &L, &P>,
+/// 	chain_monitor: &ChainMonitor<SP::EcdsaSigner, &C, &T, &F, &L, &P, &ES>,
 /// 	config: UserConfig,
 /// 	entropy_source: &ES,
 /// 	node_signer: &NS,
@@ -82,6 +85,7 @@ where
 /// 	tx_broadcaster: &T,
 /// 	fee_estimator: &F,
 /// 	router: &R,
+/// 	message_router: &MR,
 /// 	logger: &L,
 /// 	persister: &P,
 /// ) {
@@ -101,11 +105,12 @@ where
 /// 			chain_monitor,
 /// 			tx_broadcaster,
 /// 			router,
+/// 			message_router,
 /// 			logger,
 /// 			config,
 /// 			vec![&mut monitor],
 /// 		);
-/// 		<(BlockHash, ChannelManager<&ChainMonitor<SP::EcdsaSigner, &C, &T, &F, &L, &P>, &T, &ES, &NS, &SP, &F, &R, &L>)>::read(
+/// 		<(BlockHash, ChannelManager<&ChainMonitor<SP::EcdsaSigner, &C, &T, &F, &L, &P, &ES>, &T, &ES, &NS, &SP, &F, &R, &MR, &L>)>::read(
 /// 			&mut Cursor::new(&serialized_manager), read_args).unwrap()
 /// 	};
 ///
@@ -121,7 +126,7 @@ where
 ///
 /// 	// Allow the chain monitor to watch any channels.
 /// 	let monitor = monitor_listener.0;
-/// 	chain_monitor.watch_channel(monitor.get_funding_txo().0, monitor);
+/// 	chain_monitor.watch_channel(monitor.channel_id(), monitor);
 ///
 /// 	// Create an SPV client to notify the chain monitor and channel manager of block events.
 /// 	let chain_poller = poll::ChainPoller::new(block_source, Network::Bitcoin);
@@ -226,8 +231,8 @@ impl<'a, L: chain::Listen + ?Sized> chain::Listen for DynamicChainListener<'a, L
 		unreachable!()
 	}
 
-	fn block_disconnected(&self, header: &Header, height: u32) {
-		self.0.block_disconnected(header, height)
+	fn blocks_disconnected(&self, fork_point: BestBlock) {
+		self.0.blocks_disconnected(fork_point)
 	}
 }
 
@@ -253,7 +258,7 @@ impl<'a, L: chain::Listen + ?Sized> chain::Listen for ChainListenerSet<'a, L> {
 		}
 	}
 
-	fn block_disconnected(&self, _header: &Header, _height: u32) {
+	fn blocks_disconnected(&self, _fork_point: BestBlock) {
 		unreachable!()
 	}
 }
@@ -296,19 +301,16 @@ mod tests {
 		let fork_chain_3 = main_chain.fork_at_height(3);
 
 		let listener_1 = MockChainListener::new()
-			.expect_block_disconnected(*fork_chain_1.at_height(4))
-			.expect_block_disconnected(*fork_chain_1.at_height(3))
-			.expect_block_disconnected(*fork_chain_1.at_height(2))
+			.expect_blocks_disconnected(*fork_chain_1.at_height(1))
 			.expect_block_connected(*main_chain.at_height(2))
 			.expect_block_connected(*main_chain.at_height(3))
 			.expect_block_connected(*main_chain.at_height(4));
 		let listener_2 = MockChainListener::new()
-			.expect_block_disconnected(*fork_chain_2.at_height(4))
-			.expect_block_disconnected(*fork_chain_2.at_height(3))
+			.expect_blocks_disconnected(*fork_chain_2.at_height(2))
 			.expect_block_connected(*main_chain.at_height(3))
 			.expect_block_connected(*main_chain.at_height(4));
 		let listener_3 = MockChainListener::new()
-			.expect_block_disconnected(*fork_chain_3.at_height(4))
+			.expect_blocks_disconnected(*fork_chain_3.at_height(3))
 			.expect_block_connected(*main_chain.at_height(4));
 
 		let listeners = vec![
@@ -333,23 +335,17 @@ mod tests {
 		let fork_chain_3 = fork_chain_2.fork_at_height(3);
 
 		let listener_1 = MockChainListener::new()
-			.expect_block_disconnected(*fork_chain_1.at_height(4))
-			.expect_block_disconnected(*fork_chain_1.at_height(3))
-			.expect_block_disconnected(*fork_chain_1.at_height(2))
+			.expect_blocks_disconnected(*fork_chain_1.at_height(1))
 			.expect_block_connected(*main_chain.at_height(2))
 			.expect_block_connected(*main_chain.at_height(3))
 			.expect_block_connected(*main_chain.at_height(4));
 		let listener_2 = MockChainListener::new()
-			.expect_block_disconnected(*fork_chain_2.at_height(4))
-			.expect_block_disconnected(*fork_chain_2.at_height(3))
-			.expect_block_disconnected(*fork_chain_2.at_height(2))
+			.expect_blocks_disconnected(*fork_chain_2.at_height(1))
 			.expect_block_connected(*main_chain.at_height(2))
 			.expect_block_connected(*main_chain.at_height(3))
 			.expect_block_connected(*main_chain.at_height(4));
 		let listener_3 = MockChainListener::new()
-			.expect_block_disconnected(*fork_chain_3.at_height(4))
-			.expect_block_disconnected(*fork_chain_3.at_height(3))
-			.expect_block_disconnected(*fork_chain_3.at_height(2))
+			.expect_blocks_disconnected(*fork_chain_3.at_height(1))
 			.expect_block_connected(*main_chain.at_height(2))
 			.expect_block_connected(*main_chain.at_height(3))
 			.expect_block_connected(*main_chain.at_height(4));
@@ -376,7 +372,7 @@ mod tests {
 		let old_tip = fork_chain.tip();
 
 		let listener = MockChainListener::new()
-			.expect_block_disconnected(*old_tip)
+			.expect_blocks_disconnected(*fork_chain.at_height(1))
 			.expect_block_connected(*new_tip);
 
 		let listeners = vec![(old_tip.block_hash, &listener as &dyn chain::Listen)];

@@ -21,10 +21,10 @@
 //! # use bitcoin::secp256k1::PublicKey;
 //! # use lightning::io;
 //! # use lightning::ln::msgs::{DecodeError, Init, LightningError};
-//! # use lightning::ln::features::{InitFeatures, NodeFeatures};
 //! use lightning::ln::peer_handler::CustomMessageHandler;
 //! use lightning::ln::wire::{CustomMessageReader, self};
-//! use lightning::util::ser::Writeable;
+//! # use lightning::types::features::{InitFeatures, NodeFeatures};
+//! use lightning::util::ser::{LengthLimitedRead, Writeable};
 //! # use lightning::util::ser::Writer;
 //!
 //! // Assume that `FooHandler` and `BarHandler` are defined in one crate and `BazHandler` is
@@ -52,7 +52,7 @@
 //! impl CustomMessageReader for FooHandler {
 //!     // ...
 //! #     type CustomMessage = Foo;
-//! #     fn read<R: io::Read>(
+//! #     fn read<R: LengthLimitedRead>(
 //! #         &self, _message_type: u16, _buffer: &mut R
 //! #     ) -> Result<Option<Self::CustomMessage>, DecodeError> {
 //! #         unimplemented!()
@@ -61,23 +61,23 @@
 //! impl CustomMessageHandler for FooHandler {
 //!     // ...
 //! #     fn handle_custom_message(
-//! #         &self, _msg: Self::CustomMessage, _sender_node_id: &PublicKey
+//! #         &self, _msg: Self::CustomMessage, _sender_node_id: PublicKey
 //! #     ) -> Result<(), LightningError> {
 //! #         unimplemented!()
 //! #     }
 //! #     fn get_and_clear_pending_msg(&self) -> Vec<(PublicKey, Self::CustomMessage)> {
 //! #         unimplemented!()
 //! #     }
-//! #     fn peer_disconnected(&self, _their_node_id: &PublicKey) {
+//! #     fn peer_disconnected(&self, _their_node_id: PublicKey) {
 //! #         unimplemented!()
 //! #     }
-//! #     fn peer_connected(&self, _their_node_id: &PublicKey, _msg: &Init, _inbound: bool) -> Result<(), ()> {
+//! #     fn peer_connected(&self, _their_node_id: PublicKey, _msg: &Init, _inbound: bool) -> Result<(), ()> {
 //! #         unimplemented!()
 //! #     }
 //! #     fn provided_node_features(&self) -> NodeFeatures {
 //! #         unimplemented!()
 //! #     }
-//! #     fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures {
+//! #     fn provided_init_features(&self, _their_node_id: PublicKey) -> InitFeatures {
 //! #         unimplemented!()
 //! #     }
 //! }
@@ -104,7 +104,7 @@
 //! impl CustomMessageReader for BarHandler {
 //!     // ...
 //! #     type CustomMessage = Bar;
-//! #     fn read<R: io::Read>(
+//! #     fn read<R: LengthLimitedRead>(
 //! #         &self, _message_type: u16, _buffer: &mut R
 //! #     ) -> Result<Option<Self::CustomMessage>, DecodeError> {
 //! #         unimplemented!()
@@ -113,23 +113,23 @@
 //! impl CustomMessageHandler for BarHandler {
 //!     // ...
 //! #     fn handle_custom_message(
-//! #         &self, _msg: Self::CustomMessage, _sender_node_id: &PublicKey
+//! #         &self, _msg: Self::CustomMessage, _sender_node_id: PublicKey
 //! #     ) -> Result<(), LightningError> {
 //! #         unimplemented!()
 //! #     }
 //! #     fn get_and_clear_pending_msg(&self) -> Vec<(PublicKey, Self::CustomMessage)> {
 //! #         unimplemented!()
 //! #     }
-//! #     fn peer_disconnected(&self, _their_node_id: &PublicKey) {
+//! #     fn peer_disconnected(&self, _their_node_id: PublicKey) {
 //! #         unimplemented!()
 //! #     }
-//! #     fn peer_connected(&self, _their_node_id: &PublicKey, _msg: &Init, _inbound: bool) -> Result<(), ()> {
+//! #     fn peer_connected(&self, _their_node_id: PublicKey, _msg: &Init, _inbound: bool) -> Result<(), ()> {
 //! #         unimplemented!()
 //! #     }
 //! #     fn provided_node_features(&self) -> NodeFeatures {
 //! #         unimplemented!()
 //! #     }
-//! #     fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures {
+//! #     fn provided_init_features(&self, _their_node_id: PublicKey) -> InitFeatures {
 //! #         unimplemented!()
 //! #     }
 //! }
@@ -156,7 +156,7 @@
 //! impl CustomMessageReader for BazHandler {
 //!     // ...
 //! #     type CustomMessage = Baz;
-//! #     fn read<R: io::Read>(
+//! #     fn read<R: LengthLimitedRead>(
 //! #         &self, _message_type: u16, _buffer: &mut R
 //! #     ) -> Result<Option<Self::CustomMessage>, DecodeError> {
 //! #         unimplemented!()
@@ -165,23 +165,23 @@
 //! impl CustomMessageHandler for BazHandler {
 //!     // ...
 //! #     fn handle_custom_message(
-//! #         &self, _msg: Self::CustomMessage, _sender_node_id: &PublicKey
+//! #         &self, _msg: Self::CustomMessage, _sender_node_id: PublicKey
 //! #     ) -> Result<(), LightningError> {
 //! #         unimplemented!()
 //! #     }
 //! #     fn get_and_clear_pending_msg(&self) -> Vec<(PublicKey, Self::CustomMessage)> {
 //! #         unimplemented!()
 //! #     }
-//! #     fn peer_disconnected(&self, _their_node_id: &PublicKey) {
+//! #     fn peer_disconnected(&self, _their_node_id: PublicKey) {
 //! #         unimplemented!()
 //! #     }
-//! #     fn peer_connected(&self, _their_node_id: &PublicKey, _msg: &Init, _inbound: bool) -> Result<(), ()> {
+//! #     fn peer_connected(&self, _their_node_id: PublicKey, _msg: &Init, _inbound: bool) -> Result<(), ()> {
 //! #         unimplemented!()
 //! #     }
 //! #     fn provided_node_features(&self) -> NodeFeatures {
 //! #         unimplemented!()
 //! #     }
-//! #     fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures {
+//! #     fn provided_init_features(&self, _their_node_id: PublicKey) -> InitFeatures {
 //! #         unimplemented!()
 //! #     }
 //! }
@@ -279,7 +279,7 @@ macro_rules! composite_custom_message_handler {
 
 		impl $crate::lightning::ln::peer_handler::CustomMessageHandler for $handler {
 			fn handle_custom_message(
-				&self, msg: Self::CustomMessage, sender_node_id: &$crate::bitcoin::secp256k1::PublicKey
+				&self, msg: Self::CustomMessage, sender_node_id: $crate::bitcoin::secp256k1::PublicKey
 			) -> Result<(), $crate::lightning::ln::msgs::LightningError> {
 				match msg {
 					$(
@@ -305,13 +305,13 @@ macro_rules! composite_custom_message_handler {
 					.collect()
 			}
 
-			fn peer_disconnected(&self, their_node_id: &$crate::bitcoin::secp256k1::PublicKey) {
+			fn peer_disconnected(&self, their_node_id: $crate::bitcoin::secp256k1::PublicKey) {
 				$(
 					self.$field.peer_disconnected(their_node_id);
 				)*
 			}
 
-			fn peer_connected(&self, their_node_id: &$crate::bitcoin::secp256k1::PublicKey, msg: &$crate::lightning::ln::msgs::Init, inbound: bool) -> Result<(), ()> {
+			fn peer_connected(&self, their_node_id: $crate::bitcoin::secp256k1::PublicKey, msg: &$crate::lightning::ln::msgs::Init, inbound: bool) -> Result<(), ()> {
 				let mut result = Ok(());
 				$(
 					if let Err(e) = self.$field.peer_connected(their_node_id, msg, inbound) {
@@ -321,17 +321,17 @@ macro_rules! composite_custom_message_handler {
 				result
 			}
 
-			fn provided_node_features(&self) -> $crate::lightning::ln::features::NodeFeatures {
-				$crate::lightning::ln::features::NodeFeatures::empty()
+			fn provided_node_features(&self) -> $crate::lightning::types::features::NodeFeatures {
+				$crate::lightning::types::features::NodeFeatures::empty()
 					$(
 						| self.$field.provided_node_features()
 					)*
 			}
 
 			fn provided_init_features(
-				&self, their_node_id: &$crate::bitcoin::secp256k1::PublicKey
-			) -> $crate::lightning::ln::features::InitFeatures {
-				$crate::lightning::ln::features::InitFeatures::empty()
+				&self, their_node_id: $crate::bitcoin::secp256k1::PublicKey
+			) -> $crate::lightning::types::features::InitFeatures {
+				$crate::lightning::types::features::InitFeatures::empty()
 					$(
 						| self.$field.provided_init_features(their_node_id)
 					)*
@@ -340,7 +340,7 @@ macro_rules! composite_custom_message_handler {
 
 		impl $crate::lightning::ln::wire::CustomMessageReader for $handler {
 			type CustomMessage = $message;
-			fn read<R: $crate::lightning::io::Read>(
+			fn read<R: $crate::lightning::util::ser::LengthLimitedRead>(
 				&self, message_type: u16, buffer: &mut R
 			) -> Result<Option<Self::CustomMessage>, $crate::lightning::ln::msgs::DecodeError> {
 				match message_type {

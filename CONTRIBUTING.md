@@ -12,7 +12,7 @@ testing and risk-minimization. Any bug may cost users real money. That being
 said, we deeply welcome people contributing for the first time to an open source
 project or pick up Rust while contributing. Don't be shy, you'll learn.
 
-For the project Code of Conduct, see our [website](https://lightningdevkit.org/code_of_conduct).
+For the project Code of Conduct, see our [website](https://lightningdevkit.org/code-of-conduct/).
 
 Communication Channels
 -----------------------
@@ -124,7 +124,7 @@ display fine at any tab-length display setting. We use `rustfmt` to establish
 uniform coding standards throughout the codebase. Please run
 
 ```bash
-./contrib/run-rustfmt.sh
+cargo +1.63.0 fmt
 ```
 
 before committing and pushing any changes, as compliance will also be checked

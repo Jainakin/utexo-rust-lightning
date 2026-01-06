@@ -1,3 +1,10 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
 //! Provides utilities for syncing LDK via the transaction-based [`Confirm`] interface.
 //!
 //! The provided synchronization clients need to be registered with a [`ChainMonitor`] via the
@@ -62,26 +69,22 @@
 #![deny(rustdoc::private_intra_doc_links)]
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
-
-#[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
-#[macro_use]
-extern crate bdk_macros;
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
 mod esplora;
 
-#[cfg(any(feature = "electrum"))]
+#[cfg(any(feature = "_electrum"))]
 mod electrum;
 
-#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "electrum"))]
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "_electrum"))]
 mod common;
-#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "electrum"))]
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "_electrum"))]
 mod error;
-#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "electrum"))]
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "_electrum"))]
 pub use error::TxSyncError;
 
-#[cfg(feature = "electrum")]
+#[cfg(feature = "_electrum")]
 pub use electrum::ElectrumSyncClient;
 #[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
 pub use esplora::EsploraSyncClient;

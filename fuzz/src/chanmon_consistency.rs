@@ -33,7 +33,7 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hashes::Hash as TraitImport;
 use bitcoin::WPubkeyHash;
 
-use lightning::blinded_path::message::{BlindedMessagePath, MessageContext};
+use lightning::blinded_path::message::{BlindedMessagePath, MessageContext, MessageForwardNode};
 use lightning::blinded_path::payment::{BlindedPaymentPath, ReceiveTlvs};
 use lightning::chain;
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
@@ -43,31 +43,38 @@ use lightning::chain::{
 	chainmonitor, channelmonitor, BestBlock, ChannelMonitorUpdateStatus, Confirm, Watch,
 };
 use lightning::events;
-use lightning::events::MessageSendEventsProvider;
-use lightning::ln::channel::FEE_SPIKE_BUFFER_FEE_INCREASE_MULTIPLE;
+use lightning::ln::channel::{
+	FEE_SPIKE_BUFFER_FEE_INCREASE_MULTIPLE, MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS,
+};
 use lightning::ln::channel_state::ChannelDetails;
 use lightning::ln::channelmanager::{
-	ChainParameters, ChannelManager, ChannelManagerReadArgs, PaymentId, PaymentSendFailure,
+	ChainParameters, ChannelManager, ChannelManagerReadArgs, PaymentId, RecentPaymentDetails,
 	RecipientOnionFields,
 };
 use lightning::ln::functional_test_utils::*;
+use lightning::ln::funding::{FundingTxInput, SpliceContribution};
+use lightning::ln::inbound_payment::ExpandedKey;
 use lightning::ln::msgs::{
-	self, ChannelMessageHandler, CommitmentUpdate, DecodeError, Init, UpdateAddHTLC,
+	BaseMessageHandler, ChannelMessageHandler, CommitmentUpdate, Init, MessageSendEvent,
+	UpdateAddHTLC,
 };
 use lightning::ln::script::ShutdownScript;
-use lightning::ln::types::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning::ln::types::ChannelId;
 use lightning::offers::invoice::UnsignedBolt12Invoice;
-use lightning::offers::invoice_request::UnsignedInvoiceRequest;
 use lightning::onion_message::messenger::{Destination, MessageRouter, OnionMessagePath};
-use lightning::routing::router::{InFlightHtlcs, Path, Route, RouteHop, RouteParameters, Router};
-use lightning::sign::{
-	EntropySource, InMemorySigner, KeyMaterial, NodeSigner, Recipient, SignerProvider,
+use lightning::routing::router::{
+	InFlightHtlcs, Path, PaymentParameters, Route, RouteHop, RouteParameters, Router,
 };
+use lightning::sign::{
+	EntropySource, InMemorySigner, NodeSigner, PeerStorageKey, ReceiveAuthKey, Recipient,
+	SignerProvider,
+};
+use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::util::config::UserConfig;
 use lightning::util::errors::APIError;
 use lightning::util::hash_tables::*;
 use lightning::util::logger::Logger;
-use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use lightning::util::ser::{LengthReadable, ReadableArgs, Writeable, Writer};
 use lightning::util::test_channel_signer::{EnforcementState, TestChannelSigner};
 
 use lightning_invoice::RawBolt11Invoice;
@@ -80,8 +87,10 @@ use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::schnorr;
 use bitcoin::secp256k1::{self, Message, PublicKey, Scalar, Secp256k1, SecretKey};
 
-use lightning::io::Cursor;
-use std::cmp::{self, Ordering};
+use lightning::util::dyn_signer::DynSigner;
+
+use std::cell::RefCell;
+use std::cmp;
 use std::mem;
 use std::sync::atomic;
 use std::sync::{Arc, Mutex};
@@ -118,16 +127,13 @@ impl Router for FuzzRouter {
 	fn find_route(
 		&self, _payer: &PublicKey, _params: &RouteParameters,
 		_first_hops: Option<&[&ChannelDetails]>, _inflight_htlcs: InFlightHtlcs,
-	) -> Result<Route, msgs::LightningError> {
-		Err(msgs::LightningError {
-			err: String::from("Not implemented"),
-			action: msgs::ErrorAction::IgnoreError,
-		})
+	) -> Result<Route, &'static str> {
+		unreachable!()
 	}
 
 	fn create_blinded_payment_paths<T: secp256k1::Signing + secp256k1::Verification>(
 		&self, _recipient: PublicKey, _first_hops: Vec<ChannelDetails>, _tlvs: ReceiveTlvs,
-		_amount_msats: u64, _secp_ctx: &Secp256k1<T>,
+		_amount_msats: Option<u64>, _secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedPaymentPath>, ()> {
 		unreachable!()
 	}
@@ -141,8 +147,8 @@ impl MessageRouter for FuzzRouter {
 	}
 
 	fn create_blinded_paths<T: secp256k1::Signing + secp256k1::Verification>(
-		&self, _recipient: PublicKey, _context: MessageContext, _peers: Vec<PublicKey>,
-		_secp_ctx: &Secp256k1<T>,
+		&self, _recipient: PublicKey, _local_node_receive_key: ReceiveAuthKey,
+		_context: MessageContext, _peers: Vec<MessageForwardNode>, _secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedMessagePath>, ()> {
 		unreachable!()
 	}
@@ -161,6 +167,63 @@ impl Writer for VecWriter {
 	}
 }
 
+pub struct TestWallet {
+	secret_key: SecretKey,
+	utxos: Mutex<Vec<lightning::events::bump_transaction::Utxo>>,
+	secp: Secp256k1<bitcoin::secp256k1::All>,
+}
+
+impl TestWallet {
+	pub fn new(secret_key: SecretKey) -> Self {
+		Self { secret_key, utxos: Mutex::new(Vec::new()), secp: Secp256k1::new() }
+	}
+
+	fn get_change_script(&self) -> Result<ScriptBuf, ()> {
+		let public_key = bitcoin::PublicKey::new(self.secret_key.public_key(&self.secp));
+		Ok(ScriptBuf::new_p2wpkh(&public_key.wpubkey_hash().unwrap()))
+	}
+
+	pub fn add_utxo(&self, outpoint: bitcoin::OutPoint, value: Amount) -> TxOut {
+		let public_key = bitcoin::PublicKey::new(self.secret_key.public_key(&self.secp));
+		let utxo = lightning::events::bump_transaction::Utxo::new_v0_p2wpkh(
+			outpoint,
+			value,
+			&public_key.wpubkey_hash().unwrap(),
+		);
+		self.utxos.lock().unwrap().push(utxo.clone());
+		utxo.output
+	}
+
+	pub fn sign_tx(
+		&self, mut tx: Transaction,
+	) -> Result<Transaction, bitcoin::sighash::P2wpkhError> {
+		let utxos = self.utxos.lock().unwrap();
+		for i in 0..tx.input.len() {
+			if let Some(utxo) =
+				utxos.iter().find(|utxo| utxo.outpoint == tx.input[i].previous_output)
+			{
+				let sighash = bitcoin::sighash::SighashCache::new(&tx).p2wpkh_signature_hash(
+					i,
+					&utxo.output.script_pubkey,
+					utxo.output.value,
+					bitcoin::EcdsaSighashType::All,
+				)?;
+				let signature = self.secp.sign_ecdsa(
+					&secp256k1::Message::from_digest(sighash.to_byte_array()),
+					&self.secret_key,
+				);
+				let bitcoin_sig = bitcoin::ecdsa::Signature {
+					signature,
+					sighash_type: bitcoin::EcdsaSighashType::All,
+				};
+				tx.input[i].witness =
+					bitcoin::Witness::p2wpkh(&bitcoin_sig, &self.secret_key.public_key(&self.secp));
+			}
+		}
+		Ok(tx)
+	}
+}
+
 /// The LDK API requires that any time we tell it we're done persisting a `ChannelMonitor[Update]`
 /// we never pass it in as the "latest" `ChannelMonitor` on startup. However, we can pass
 /// out-of-date monitors as long as we never told LDK we finished persisting them, which we do by
@@ -169,7 +232,11 @@ impl Writer for VecWriter {
 /// Note that such "being persisted" `ChannelMonitor`s are stored in `ChannelManager` and will
 /// simply be replayed on startup.
 struct LatestMonitorState {
-	/// The latest monitor id which we told LDK we've persisted
+	/// The latest monitor id which we told LDK we've persisted.
+	///
+	/// Note that there may still be earlier pending monitor updates in [`Self::pending_monitors`]
+	/// which we haven't yet completed. We're allowed to reload with those as well, at least until
+	/// they're completed.
 	persisted_monitor_id: u64,
 	/// The latest serialized `ChannelMonitor` that we told LDK we persisted.
 	persisted_monitor: Vec<u8>,
@@ -190,9 +257,10 @@ struct TestChainMonitor {
 			Arc<FuzzEstimator>,
 			Arc<dyn Logger>,
 			Arc<TestPersister>,
+			Arc<KeyProvider>,
 		>,
 	>,
-	pub latest_monitors: Mutex<HashMap<OutPoint, LatestMonitorState>>,
+	pub latest_monitors: Mutex<HashMap<ChannelId, LatestMonitorState>>,
 }
 impl TestChainMonitor {
 	pub fn new(
@@ -206,6 +274,8 @@ impl TestChainMonitor {
 				logger.clone(),
 				feeest,
 				Arc::clone(&persister),
+				Arc::clone(&keys),
+				keys.get_peer_storage_key(),
 			)),
 			logger,
 			keys,
@@ -216,12 +286,12 @@ impl TestChainMonitor {
 }
 impl chain::Watch<TestChannelSigner> for TestChainMonitor {
 	fn watch_channel(
-		&self, funding_txo: OutPoint, monitor: channelmonitor::ChannelMonitor<TestChannelSigner>,
+		&self, channel_id: ChannelId, monitor: channelmonitor::ChannelMonitor<TestChannelSigner>,
 	) -> Result<chain::ChannelMonitorUpdateStatus, ()> {
 		let mut ser = VecWriter(Vec::new());
 		monitor.write(&mut ser).unwrap();
 		let monitor_id = monitor.get_latest_update_id();
-		let res = self.chain_monitor.watch_channel(funding_txo, monitor);
+		let res = self.chain_monitor.watch_channel(channel_id, monitor);
 		let state = match res {
 			Ok(chain::ChannelMonitorUpdateStatus::Completed) => LatestMonitorState {
 				persisted_monitor_id: monitor_id,
@@ -234,17 +304,17 @@ impl chain::Watch<TestChannelSigner> for TestChainMonitor {
 			Ok(chain::ChannelMonitorUpdateStatus::UnrecoverableError) => panic!(),
 			Err(()) => panic!(),
 		};
-		if self.latest_monitors.lock().unwrap().insert(funding_txo, state).is_some() {
+		if self.latest_monitors.lock().unwrap().insert(channel_id, state).is_some() {
 			panic!("Already had monitor pre-watch_channel");
 		}
 		res
 	}
 
 	fn update_channel(
-		&self, funding_txo: OutPoint, update: &channelmonitor::ChannelMonitorUpdate,
+		&self, channel_id: ChannelId, update: &channelmonitor::ChannelMonitorUpdate,
 	) -> chain::ChannelMonitorUpdateStatus {
 		let mut map_lock = self.latest_monitors.lock().unwrap();
-		let map_entry = map_lock.get_mut(&funding_txo).expect("Didn't have monitor on update call");
+		let map_entry = map_lock.get_mut(&channel_id).expect("Didn't have monitor on update call");
 		let latest_monitor_data = map_entry
 			.pending_monitors
 			.last()
@@ -253,7 +323,7 @@ impl chain::Watch<TestChannelSigner> for TestChainMonitor {
 			.unwrap_or(&map_entry.persisted_monitor);
 		let deserialized_monitor =
 			<(BlockHash, channelmonitor::ChannelMonitor<TestChannelSigner>)>::read(
-				&mut Cursor::new(&latest_monitor_data),
+				&mut &latest_monitor_data[..],
 				(&*self.keys, &*self.keys),
 			)
 			.unwrap()
@@ -268,7 +338,7 @@ impl chain::Watch<TestChannelSigner> for TestChainMonitor {
 			.unwrap();
 		let mut ser = VecWriter(Vec::new());
 		deserialized_monitor.write(&mut ser).unwrap();
-		let res = self.chain_monitor.update_channel(funding_txo, update);
+		let res = self.chain_monitor.update_channel(channel_id, update);
 		match res {
 			chain::ChannelMonitorUpdateStatus::Completed => {
 				map_entry.persisted_monitor_id = update.update_id;
@@ -284,7 +354,7 @@ impl chain::Watch<TestChannelSigner> for TestChainMonitor {
 
 	fn release_pending_monitor_events(
 		&self,
-	) -> Vec<(OutPoint, ChannelId, Vec<MonitorEvent>, Option<PublicKey>)> {
+	) -> Vec<(OutPoint, ChannelId, Vec<MonitorEvent>, PublicKey)> {
 		return self.chain_monitor.release_pending_monitor_events();
 	}
 }
@@ -327,10 +397,10 @@ impl NodeSigner for KeyProvider {
 		Ok(SharedSecret::new(other_key, &node_secret))
 	}
 
-	fn get_inbound_payment_key_material(&self) -> KeyMaterial {
+	fn get_expanded_key(&self) -> ExpandedKey {
 		#[rustfmt::skip]
 		let random_bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, self.node_secret[31]];
-		KeyMaterial(random_bytes)
+		ExpandedKey::new(random_bytes)
 	}
 
 	fn sign_invoice(
@@ -339,10 +409,12 @@ impl NodeSigner for KeyProvider {
 		unreachable!()
 	}
 
-	fn sign_bolt12_invoice_request(
-		&self, _invoice_request: &UnsignedInvoiceRequest,
-	) -> Result<schnorr::Signature, ()> {
-		unreachable!()
+	fn get_peer_storage_key(&self) -> PeerStorageKey {
+		PeerStorageKey { inner: [42; 32] }
+	}
+
+	fn get_receive_auth_key(&self) -> ReceiveAuthKey {
+		ReceiveAuthKey([41; 32])
 	}
 
 	fn sign_bolt12_invoice(
@@ -358,6 +430,10 @@ impl NodeSigner for KeyProvider {
 		let secp_ctx = Secp256k1::signing_only();
 		Ok(secp_ctx.sign_ecdsa(&msg_hash, &self.node_secret))
 	}
+
+	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
+		Ok(lightning::util::message_signing::sign(msg, &self.node_secret))
+	}
 }
 
 impl SignerProvider for KeyProvider {
@@ -365,42 +441,31 @@ impl SignerProvider for KeyProvider {
 	#[cfg(taproot)]
 	type TaprootSigner = TestChannelSigner;
 
-	fn generate_channel_keys_id(
-		&self, _inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128,
-	) -> [u8; 32] {
+	fn generate_channel_keys_id(&self, _inbound: bool, _user_channel_id: u128) -> [u8; 32] {
 		let id = self.rand_bytes_id.fetch_add(1, atomic::Ordering::Relaxed) as u8;
 		[id; 32]
 	}
 
-	fn derive_channel_signer(
-		&self, channel_value_satoshis: u64, channel_keys_id: [u8; 32],
-	) -> Self::EcdsaSigner {
-		let secp_ctx = Secp256k1::signing_only();
+	fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
 		let id = channel_keys_id[0];
 		#[rustfmt::skip]
 		let keys = InMemorySigner::new(
-			&secp_ctx,
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, self.node_secret[31]]).unwrap(),
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, self.node_secret[31]]).unwrap(),
+			// We leave both the v1 and v2 derivation to_remote keys the same as there's not any
+			// real reason to fuzz differences here.
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, self.node_secret[31]]).unwrap(),
+			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, self.node_secret[31]]).unwrap(),
+			true,
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, self.node_secret[31]]).unwrap(),
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, self.node_secret[31]]).unwrap(),
 			[id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, self.node_secret[31]],
-			channel_value_satoshis,
 			channel_keys_id,
 			channel_keys_id,
 		);
 		let revoked_commitment = self.make_enforcement_state_cell(keys.commitment_seed);
-		TestChannelSigner::new_with_revoked(keys, revoked_commitment, false)
-	}
-
-	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::EcdsaSigner, DecodeError> {
-		let mut reader = lightning::io::Cursor::new(buffer);
-
-		let inner: InMemorySigner = ReadableArgs::read(&mut reader, self)?;
-		let state = self.make_enforcement_state_cell(inner.commitment_seed);
-
-		Ok(TestChannelSigner::new_with_revoked(inner, state, false))
+		let keys = DynSigner::new(keys);
+		TestChannelSigner::new_with_revoked(keys, revoked_commitment, false, false)
 	}
 
 	fn get_destination_script(&self, _channel_keys_id: [u8; 32]) -> Result<ScriptBuf, ()> {
@@ -440,59 +505,21 @@ impl KeyProvider {
 	}
 }
 
+// Returns a bool indicating whether the payment failed.
 #[inline]
-fn check_api_err(api_err: APIError, sendable_bounds_violated: bool) {
-	match api_err {
-		APIError::APIMisuseError { .. } => panic!("We can't misuse the API"),
-		APIError::FeeRateTooHigh { .. } => panic!("We can't send too much fee?"),
-		APIError::InvalidRoute { .. } => panic!("Our routes should work"),
-		APIError::ChannelUnavailable { err } => {
-			// Test the error against a list of errors we can hit, and reject
-			// all others. If you hit this panic, the list of acceptable errors
-			// is probably just stale and you should add new messages here.
-			match err.as_str() {
-				"Peer for first hop currently disconnected" => {},
-				_ if err.starts_with("Cannot send less than our next-HTLC minimum - ") => {},
-				_ if err.starts_with("Cannot send more than our next-HTLC maximum - ") => {},
-				_ => panic!("{}", err),
-			}
-			assert!(sendable_bounds_violated);
-		},
-		APIError::MonitorUpdateInProgress => {
-			// We can (obviously) temp-fail a monitor update
-		},
-		APIError::IncompatibleShutdownScript { .. } => {
-			panic!("Cannot send an incompatible shutdown script")
-		},
+fn check_payment_send_events(source: &ChanMan, sent_payment_id: PaymentId) -> bool {
+	for payment in source.list_recent_payments() {
+		match payment {
+			RecentPaymentDetails::Pending { payment_id, .. } if payment_id == sent_payment_id => {
+				return true;
+			},
+			RecentPaymentDetails::Abandoned { payment_id, .. } if payment_id == sent_payment_id => {
+				return false;
+			},
+			_ => {},
+		}
 	}
-}
-#[inline]
-fn check_payment_err(send_err: PaymentSendFailure, sendable_bounds_violated: bool) {
-	match send_err {
-		PaymentSendFailure::ParameterError(api_err) => {
-			check_api_err(api_err, sendable_bounds_violated)
-		},
-		PaymentSendFailure::PathParameterError(per_path_results) => {
-			for res in per_path_results {
-				if let Err(api_err) = res {
-					check_api_err(api_err, sendable_bounds_violated);
-				}
-			}
-		},
-		PaymentSendFailure::AllFailedResendSafe(per_path_results) => {
-			for api_err in per_path_results {
-				check_api_err(api_err, sendable_bounds_violated);
-			}
-		},
-		PaymentSendFailure::PartialFailure { results, .. } => {
-			for res in results {
-				if let Err(api_err) = res {
-					check_api_err(api_err, sendable_bounds_violated);
-				}
-			}
-		},
-		PaymentSendFailure::DuplicatePayment => panic!(),
-	}
+	return false;
 }
 
 type ChanMan<'a> = ChannelManager<
@@ -502,6 +529,7 @@ type ChanMan<'a> = ChannelManager<
 	Arc<KeyProvider>,
 	Arc<KeyProvider>,
 	Arc<FuzzEstimator>,
+	&'a FuzzRouter,
 	&'a FuzzRouter,
 	Arc<dyn Logger>,
 >;
@@ -551,34 +579,38 @@ fn send_payment(
 		.find(|chan| chan.short_channel_id == Some(dest_chan_id))
 		.map(|chan| (chan.next_outbound_htlc_minimum_msat, chan.next_outbound_htlc_limit_msat))
 		.unwrap_or((0, 0));
-	if let Err(err) = source.send_payment_with_route(
-		Route {
-			paths: vec![Path {
-				hops: vec![RouteHop {
-					pubkey: dest.get_our_node_id(),
-					node_features: dest.node_features(),
-					short_channel_id: dest_chan_id,
-					channel_features: dest.channel_features(),
-					fee_msat: amt,
-					cltv_expiry_delta: 200,
-					maybe_announced_channel: true,
-				}],
-				blinded_tail: None,
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::from_node_id(source.get_our_node_id(), TEST_FINAL_CLTV),
+		amt,
+	);
+	let route = Route {
+		paths: vec![Path {
+			hops: vec![RouteHop {
+				pubkey: dest.get_our_node_id(),
+				node_features: dest.node_features(),
+				short_channel_id: dest_chan_id,
+				channel_features: dest.channel_features(),
+				fee_msat: amt,
+				cltv_expiry_delta: 200,
+				maybe_announced_channel: true,
 			}],
-			route_params: None,
+			blinded_tail: None,
+		}],
+		route_params: Some(route_params.clone()),
+	};
+	let onion = RecipientOnionFields::secret_only(payment_secret);
+	let payment_id = PaymentId(payment_id);
+	let res = source.send_payment_with_route(route, payment_hash, onion, payment_id);
+	match res {
+		Err(err) => {
+			panic!("Errored with {:?} on initial payment send", err);
 		},
-		payment_hash,
-		RecipientOnionFields::secret_only(payment_secret),
-		PaymentId(payment_id),
-	) {
-		check_payment_err(err, amt > max_value_sendable || amt < min_value_sendable);
-		false
-	} else {
-		// Note that while the max is a strict upper-bound, we can occasionally send substantially
-		// below the minimum, with some gap which is unusable immediately below the minimum. Thus,
-		// we don't check against min_value_sendable here.
-		assert!(amt <= max_value_sendable);
-		true
+		Ok(()) => {
+			let expect_failure = amt < min_value_sendable || amt > max_value_sendable;
+			let succeeded = check_payment_send_events(source, payment_id);
+			assert_eq!(succeeded, !expect_failure);
+			succeeded
+		},
 	}
 }
 
@@ -620,46 +652,50 @@ fn send_hop_payment(
 		.map(|chan| (chan.next_outbound_htlc_minimum_msat, chan.next_outbound_htlc_limit_msat))
 		.unwrap_or((0, 0));
 	let first_hop_fee = 50_000;
-	if let Err(err) = source.send_payment_with_route(
-		Route {
-			paths: vec![Path {
-				hops: vec![
-					RouteHop {
-						pubkey: middle.get_our_node_id(),
-						node_features: middle.node_features(),
-						short_channel_id: middle_chan_id,
-						channel_features: middle.channel_features(),
-						fee_msat: first_hop_fee,
-						cltv_expiry_delta: 100,
-						maybe_announced_channel: true,
-					},
-					RouteHop {
-						pubkey: dest.get_our_node_id(),
-						node_features: dest.node_features(),
-						short_channel_id: dest_chan_id,
-						channel_features: dest.channel_features(),
-						fee_msat: amt,
-						cltv_expiry_delta: 200,
-						maybe_announced_channel: true,
-					},
-				],
-				blinded_tail: None,
-			}],
-			route_params: None,
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::from_node_id(source.get_our_node_id(), TEST_FINAL_CLTV),
+		amt,
+	);
+	let route = Route {
+		paths: vec![Path {
+			hops: vec![
+				RouteHop {
+					pubkey: middle.get_our_node_id(),
+					node_features: middle.node_features(),
+					short_channel_id: middle_chan_id,
+					channel_features: middle.channel_features(),
+					fee_msat: first_hop_fee,
+					cltv_expiry_delta: 100,
+					maybe_announced_channel: true,
+				},
+				RouteHop {
+					pubkey: dest.get_our_node_id(),
+					node_features: dest.node_features(),
+					short_channel_id: dest_chan_id,
+					channel_features: dest.channel_features(),
+					fee_msat: amt,
+					cltv_expiry_delta: 200,
+					maybe_announced_channel: true,
+				},
+			],
+			blinded_tail: None,
+		}],
+		route_params: Some(route_params.clone()),
+	};
+	let onion = RecipientOnionFields::secret_only(payment_secret);
+	let payment_id = PaymentId(payment_id);
+	let res = source.send_payment_with_route(route, payment_hash, onion, payment_id);
+	match res {
+		Err(err) => {
+			panic!("Errored with {:?} on initial payment send", err);
 		},
-		payment_hash,
-		RecipientOnionFields::secret_only(payment_secret),
-		PaymentId(payment_id),
-	) {
-		let sent_amt = amt + first_hop_fee;
-		check_payment_err(err, sent_amt < min_value_sendable || sent_amt > max_value_sendable);
-		false
-	} else {
-		// Note that while the max is a strict upper-bound, we can occasionally send substantially
-		// below the minimum, with some gap which is unusable immediately below the minimum. Thus,
-		// we don't check against min_value_sendable here.
-		assert!(amt + first_hop_fee <= max_value_sendable);
-		true
+		Ok(()) => {
+			let sent_amt = amt + first_hop_fee;
+			let expect_failure = sent_amt < min_value_sendable || sent_amt > max_value_sendable;
+			let succeeded = check_payment_send_events(source, payment_id);
+			assert_eq!(succeeded, !expect_failure);
+			succeeded
+		},
 	}
 }
 
@@ -696,6 +732,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 			let mut config = UserConfig::default();
 			config.channel_config.forwarding_fee_proportional_millionths = 0;
 			config.channel_handshake_config.announce_for_forwarding = true;
+			config.reject_inbound_splices = false;
 			if anchors {
 				config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
 				config.manually_accept_inbound_channels = true;
@@ -708,6 +745,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 					$fee_estimator.clone(),
 					monitor.clone(),
 					broadcast.clone(),
+					&router,
 					&router,
 					Arc::clone(&logger),
 					keys_manager.clone(),
@@ -723,80 +761,102 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 		}};
 	}
 
-	macro_rules! reload_node {
-		($ser: expr, $node_id: expr, $old_monitors: expr, $keys_manager: expr, $fee_estimator: expr) => {{
-			let keys_manager = Arc::clone(&$keys_manager);
-			let logger: Arc<dyn Logger> =
-				Arc::new(test_logger::TestLogger::new($node_id.to_string(), out.clone()));
-			let chain_monitor = Arc::new(TestChainMonitor::new(
-				broadcast.clone(),
-				logger.clone(),
-				$fee_estimator.clone(),
-				Arc::new(TestPersister {
-					update_ret: Mutex::new(ChannelMonitorUpdateStatus::Completed),
-				}),
-				Arc::clone(&$keys_manager),
-			));
+	let default_mon_style = RefCell::new(ChannelMonitorUpdateStatus::Completed);
+	let mon_style = [default_mon_style.clone(), default_mon_style.clone(), default_mon_style];
 
-			let mut config = UserConfig::default();
-			config.channel_config.forwarding_fee_proportional_millionths = 0;
-			config.channel_handshake_config.announce_for_forwarding = true;
-			if anchors {
-				config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
-				config.manually_accept_inbound_channels = true;
-			}
+	let reload_node = |ser: &Vec<u8>,
+	                   node_id: u8,
+	                   old_monitors: &TestChainMonitor,
+	                   mut use_old_mons,
+	                   keys,
+	                   fee_estimator| {
+		let keys_manager = Arc::clone(keys);
+		let logger: Arc<dyn Logger> =
+			Arc::new(test_logger::TestLogger::new(node_id.to_string(), out.clone()));
+		let chain_monitor = Arc::new(TestChainMonitor::new(
+			broadcast.clone(),
+			logger.clone(),
+			Arc::clone(fee_estimator),
+			Arc::new(TestPersister {
+				update_ret: Mutex::new(ChannelMonitorUpdateStatus::Completed),
+			}),
+			Arc::clone(keys),
+		));
 
-			let mut monitors = new_hash_map();
-			let mut old_monitors = $old_monitors.latest_monitors.lock().unwrap();
-			for (outpoint, mut prev_state) in old_monitors.drain() {
-				monitors.insert(
-					outpoint,
-					<(BlockHash, ChannelMonitor<TestChannelSigner>)>::read(
-						&mut Cursor::new(&prev_state.persisted_monitor),
-						(&*$keys_manager, &*$keys_manager),
-					)
-					.expect("Failed to read monitor")
-					.1,
-				);
-				// Wipe any `ChannelMonitor`s which we never told LDK we finished persisting,
-				// considering them discarded. LDK should replay these for us as they're stored in
-				// the `ChannelManager`.
-				prev_state.pending_monitors.clear();
-				chain_monitor.latest_monitors.lock().unwrap().insert(outpoint, prev_state);
-			}
-			let mut monitor_refs = new_hash_map();
-			for (outpoint, monitor) in monitors.iter_mut() {
-				monitor_refs.insert(*outpoint, monitor);
-			}
+		let mut config = UserConfig::default();
+		config.channel_config.forwarding_fee_proportional_millionths = 0;
+		config.channel_handshake_config.announce_for_forwarding = true;
+		config.reject_inbound_splices = false;
+		if anchors {
+			config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+			config.manually_accept_inbound_channels = true;
+		}
 
-			let read_args = ChannelManagerReadArgs {
-				entropy_source: keys_manager.clone(),
-				node_signer: keys_manager.clone(),
-				signer_provider: keys_manager.clone(),
-				fee_estimator: $fee_estimator.clone(),
-				chain_monitor: chain_monitor.clone(),
-				tx_broadcaster: broadcast.clone(),
-				router: &router,
-				logger,
-				default_config: config,
-				channel_monitors: monitor_refs,
+		let mut monitors = new_hash_map();
+		let mut old_monitors = old_monitors.latest_monitors.lock().unwrap();
+		for (channel_id, mut prev_state) in old_monitors.drain() {
+			let (mon_id, serialized_mon) = if use_old_mons % 3 == 0 {
+				// Reload with the oldest `ChannelMonitor` (the one that we already told
+				// `ChannelManager` we finished persisting).
+				(prev_state.persisted_monitor_id, prev_state.persisted_monitor)
+			} else if use_old_mons % 3 == 1 {
+				// Reload with the second-oldest `ChannelMonitor`
+				let old_mon = (prev_state.persisted_monitor_id, prev_state.persisted_monitor);
+				prev_state.pending_monitors.drain(..).next().unwrap_or(old_mon)
+			} else {
+				// Reload with the newest `ChannelMonitor`
+				let old_mon = (prev_state.persisted_monitor_id, prev_state.persisted_monitor);
+				prev_state.pending_monitors.pop().unwrap_or(old_mon)
 			};
+			// Use a different value of `use_old_mons` if we have another monitor (only for node B)
+			// by shifting `use_old_mons` one in base-3.
+			use_old_mons /= 3;
+			let mon = <(BlockHash, ChannelMonitor<TestChannelSigner>)>::read(
+				&mut &serialized_mon[..],
+				(&**keys, &**keys),
+			)
+			.expect("Failed to read monitor");
+			monitors.insert(channel_id, mon.1);
+			// Update the latest `ChannelMonitor` state to match what we just told LDK.
+			prev_state.persisted_monitor = serialized_mon;
+			prev_state.persisted_monitor_id = mon_id;
+			// Wipe any `ChannelMonitor`s which we never told LDK we finished persisting,
+			// considering them discarded. LDK should replay these for us as they're stored in
+			// the `ChannelManager`.
+			prev_state.pending_monitors.clear();
+			chain_monitor.latest_monitors.lock().unwrap().insert(channel_id, prev_state);
+		}
+		let mut monitor_refs = new_hash_map();
+		for (channel_id, monitor) in monitors.iter() {
+			monitor_refs.insert(*channel_id, monitor);
+		}
 
-			let res = (
-				<(BlockHash, ChanMan)>::read(&mut Cursor::new(&$ser.0), read_args)
-					.expect("Failed to read manager")
-					.1,
-				chain_monitor.clone(),
+		let read_args = ChannelManagerReadArgs {
+			entropy_source: Arc::clone(&keys_manager),
+			node_signer: Arc::clone(&keys_manager),
+			signer_provider: keys_manager,
+			fee_estimator: Arc::clone(fee_estimator),
+			chain_monitor: chain_monitor.clone(),
+			tx_broadcaster: broadcast.clone(),
+			router: &router,
+			message_router: &router,
+			logger,
+			config,
+			channel_monitors: monitor_refs,
+		};
+
+		let manager =
+			<(BlockHash, ChanMan)>::read(&mut &ser[..], read_args).expect("Failed to read manager");
+		let res = (manager.1, chain_monitor.clone());
+		for (channel_id, mon) in monitors.drain() {
+			assert_eq!(
+				chain_monitor.chain_monitor.watch_channel(channel_id, mon),
+				Ok(ChannelMonitorUpdateStatus::Completed)
 			);
-			for (funding_txo, mon) in monitors.drain() {
-				assert_eq!(
-					chain_monitor.chain_monitor.watch_channel(funding_txo, mon),
-					Ok(ChannelMonitorUpdateStatus::Completed)
-				);
-			}
-			res
-		}};
-	}
+		}
+		*chain_monitor.persister.update_ret.lock().unwrap() = *mon_style[node_id as usize].borrow();
+		res
+	};
 
 	let mut channel_txn = Vec::new();
 	macro_rules! make_channel {
@@ -806,26 +866,26 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				networks: None,
 				remote_network_address: None,
 			};
-			$source.peer_connected(&$dest.get_our_node_id(), &init_dest, true).unwrap();
+			$source.peer_connected($dest.get_our_node_id(), &init_dest, true).unwrap();
 			let init_src = Init {
 				features: $source.init_features(),
 				networks: None,
 				remote_network_address: None,
 			};
-			$dest.peer_connected(&$source.get_our_node_id(), &init_src, false).unwrap();
+			$dest.peer_connected($source.get_our_node_id(), &init_src, false).unwrap();
 
 			$source.create_channel($dest.get_our_node_id(), 100_000, 42, 0, None, None).unwrap();
 			let open_channel = {
 				let events = $source.get_and_clear_pending_msg_events();
 				assert_eq!(events.len(), 1);
-				if let events::MessageSendEvent::SendOpenChannel { ref msg, .. } = events[0] {
+				if let MessageSendEvent::SendOpenChannel { ref msg, .. } = events[0] {
 					msg.clone()
 				} else {
 					panic!("Wrong event type");
 				}
 			};
 
-			$dest.handle_open_channel(&$source.get_our_node_id(), &open_channel);
+			$dest.handle_open_channel($source.get_our_node_id(), &open_channel);
 			let accept_channel = {
 				if anchors {
 					let events = $dest.get_and_clear_pending_events();
@@ -845,6 +905,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 								temporary_channel_id,
 								counterparty_node_id,
 								user_channel_id,
+								None,
 							)
 							.unwrap();
 					} else {
@@ -853,15 +914,14 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				}
 				let events = $dest.get_and_clear_pending_msg_events();
 				assert_eq!(events.len(), 1);
-				if let events::MessageSendEvent::SendAcceptChannel { ref msg, .. } = events[0] {
+				if let MessageSendEvent::SendAcceptChannel { ref msg, .. } = events[0] {
 					msg.clone()
 				} else {
 					panic!("Wrong event type");
 				}
 			};
 
-			$source.handle_accept_channel(&$dest.get_our_node_id(), &accept_channel);
-			let funding_output;
+			$source.handle_accept_channel($dest.get_our_node_id(), &accept_channel);
 			{
 				let mut events = $source.get_and_clear_pending_events();
 				assert_eq!(events.len(), 1);
@@ -881,7 +941,6 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 							script_pubkey: output_script,
 						}],
 					};
-					funding_output = OutPoint { txid: tx.compute_txid(), index: 0 };
 					$source
 						.funding_transaction_generated(
 							temporary_channel_id,
@@ -898,18 +957,18 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 			let funding_created = {
 				let events = $source.get_and_clear_pending_msg_events();
 				assert_eq!(events.len(), 1);
-				if let events::MessageSendEvent::SendFundingCreated { ref msg, .. } = events[0] {
+				if let MessageSendEvent::SendFundingCreated { ref msg, .. } = events[0] {
 					msg.clone()
 				} else {
 					panic!("Wrong event type");
 				}
 			};
-			$dest.handle_funding_created(&$source.get_our_node_id(), &funding_created);
+			$dest.handle_funding_created($source.get_our_node_id(), &funding_created);
 
 			let funding_signed = {
 				let events = $dest.get_and_clear_pending_msg_events();
 				assert_eq!(events.len(), 1);
-				if let events::MessageSendEvent::SendFundingSigned { ref msg, .. } = events[0] {
+				if let MessageSendEvent::SendFundingSigned { ref msg, .. } = events[0] {
 					msg.clone()
 				} else {
 					panic!("Wrong event type");
@@ -923,16 +982,22 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				panic!("Wrong event type");
 			}
 
-			$source.handle_funding_signed(&$dest.get_our_node_id(), &funding_signed);
+			$source.handle_funding_signed($dest.get_our_node_id(), &funding_signed);
 			let events = $source.get_and_clear_pending_events();
 			assert_eq!(events.len(), 1);
-			if let events::Event::ChannelPending { ref counterparty_node_id, .. } = events[0] {
+			let channel_id = if let events::Event::ChannelPending {
+				ref counterparty_node_id,
+				ref channel_id,
+				..
+			} = events[0]
+			{
 				assert_eq!(counterparty_node_id, &$dest.get_our_node_id());
+				channel_id.clone()
 			} else {
 				panic!("Wrong event type");
-			}
+			};
 
-			funding_output
+			channel_id
 		}};
 	}
 
@@ -958,12 +1023,10 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 			}
 			for (idx, node_event) in node_events.iter().enumerate() {
 				for event in node_event {
-					if let events::MessageSendEvent::SendChannelReady { ref node_id, ref msg } =
-						event
-					{
+					if let MessageSendEvent::SendChannelReady { ref node_id, ref msg } = event {
 						for node in $nodes.iter() {
 							if node.get_our_node_id() == *node_id {
-								node.handle_channel_ready(&$nodes[idx].get_our_node_id(), msg);
+								node.handle_channel_ready($nodes[idx].get_our_node_id(), msg);
 							}
 						}
 					} else {
@@ -975,7 +1038,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 			for node in $nodes.iter() {
 				let events = node.get_and_clear_pending_msg_events();
 				for event in events {
-					if let events::MessageSendEvent::SendAnnouncementSignatures { .. } = event {
+					if let MessageSendEvent::SendAnnouncementSignatures { .. } = event {
 					} else {
 						panic!("Wrong event type");
 					}
@@ -983,6 +1046,30 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 			}
 		}};
 	}
+
+	let wallet_a = TestWallet::new(SecretKey::from_slice(&[1; 32]).unwrap());
+	let wallet_b = TestWallet::new(SecretKey::from_slice(&[2; 32]).unwrap());
+	let wallet_c = TestWallet::new(SecretKey::from_slice(&[3; 32]).unwrap());
+	let wallets = vec![wallet_a, wallet_b, wallet_c];
+	let coinbase_tx = bitcoin::Transaction {
+		version: bitcoin::transaction::Version::TWO,
+		lock_time: bitcoin::absolute::LockTime::ZERO,
+		input: vec![bitcoin::TxIn { ..Default::default() }],
+		output: wallets
+			.iter()
+			.map(|w| TxOut {
+				value: Amount::from_sat(100_000),
+				script_pubkey: w.get_change_script().unwrap(),
+			})
+			.collect(),
+	};
+	let coinbase_txid = coinbase_tx.compute_txid();
+	wallets.iter().enumerate().for_each(|(i, w)| {
+		w.add_utxo(
+			bitcoin::OutPoint { txid: coinbase_txid, vout: i as u32 },
+			Amount::from_sat(100_000),
+		);
+	});
 
 	let fee_est_a = Arc::new(FuzzEstimator { ret_val: atomic::AtomicU32::new(253) });
 	let mut last_htlc_clear_fee_a = 253;
@@ -999,8 +1086,8 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 
 	let mut nodes = [node_a, node_b, node_c];
 
-	let chan_1_funding = make_channel!(nodes[0], nodes[1], keys_manager_b, 0);
-	let chan_2_funding = make_channel!(nodes[1], nodes[2], keys_manager_c, 1);
+	let chan_1_id = make_channel!(nodes[0], nodes[1], keys_manager_b, 0);
+	let chan_2_id = make_channel!(nodes[1], nodes[2], keys_manager_c, 1);
 
 	for node in nodes.iter() {
 		confirm_txn!(node);
@@ -1009,7 +1096,9 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 	lock_fundings!(nodes);
 
 	let chan_a = nodes[0].list_usable_channels()[0].short_channel_id.unwrap();
+	let chan_a_id = nodes[0].list_usable_channels()[0].channel_id;
 	let chan_b = nodes[2].list_usable_channels()[0].short_channel_id.unwrap();
+	let chan_b_id = nodes[2].list_usable_channels()[0].channel_id;
 
 	let mut p_id: u8 = 0;
 	let mut p_idx: u64 = 0;
@@ -1021,12 +1110,9 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 	let mut bc_events = Vec::new();
 	let mut cb_events = Vec::new();
 
-	let mut node_a_ser = VecWriter(Vec::new());
-	nodes[0].write(&mut node_a_ser).unwrap();
-	let mut node_b_ser = VecWriter(Vec::new());
-	nodes[1].write(&mut node_b_ser).unwrap();
-	let mut node_c_ser = VecWriter(Vec::new());
-	nodes[2].write(&mut node_c_ser).unwrap();
+	let mut node_a_ser = nodes[0].encode();
+	let mut node_b_ser = nodes[1].encode();
+	let mut node_c_ser = nodes[2].encode();
 
 	macro_rules! test_return {
 		() => {{
@@ -1058,21 +1144,53 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				let expect_drop_id = if let Some(id) = expect_drop_node { Some(nodes[id].get_our_node_id()) } else { None };
 				for event in $excess_events {
 					let push_a = match event {
-						events::MessageSendEvent::UpdateHTLCs { ref node_id, .. } => {
+						MessageSendEvent::UpdateHTLCs { ref node_id, .. } => {
 							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
 							*node_id == a_id
 						},
-						events::MessageSendEvent::SendRevokeAndACK { ref node_id, .. } => {
+						MessageSendEvent::SendRevokeAndACK { ref node_id, .. } => {
 							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
 							*node_id == a_id
 						},
-						events::MessageSendEvent::SendChannelReestablish { ref node_id, .. } => {
+						MessageSendEvent::SendChannelReestablish { ref node_id, .. } => {
 							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
 							*node_id == a_id
 						},
-						events::MessageSendEvent::SendChannelReady { .. } => continue,
-						events::MessageSendEvent::SendAnnouncementSignatures { .. } => continue,
-						events::MessageSendEvent::SendChannelUpdate { ref node_id, ref msg } => {
+						MessageSendEvent::SendStfu { ref node_id, .. } => {
+							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
+							*node_id == a_id
+						},
+						MessageSendEvent::SendSpliceInit { ref node_id, .. } => {
+							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
+							*node_id == a_id
+						},
+						MessageSendEvent::SendSpliceAck { ref node_id, .. } => {
+							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
+							*node_id == a_id
+						},
+						MessageSendEvent::SendSpliceLocked { ref node_id, .. } => {
+							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
+							*node_id == a_id
+						},
+						MessageSendEvent::SendTxAddInput { ref node_id, .. } => {
+							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
+							*node_id == a_id
+						},
+						MessageSendEvent::SendTxAddOutput { ref node_id, .. } => {
+							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
+							*node_id == a_id
+						},
+						MessageSendEvent::SendTxComplete { ref node_id, .. } => {
+							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
+							*node_id == a_id
+						},
+						MessageSendEvent::SendTxAbort { ref node_id, .. } => {
+							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
+							*node_id == a_id
+						},
+						MessageSendEvent::SendChannelReady { .. } => continue,
+						MessageSendEvent::SendAnnouncementSignatures { .. } => continue,
+						MessageSendEvent::SendChannelUpdate { ref node_id, ref msg } => {
 							assert_eq!(msg.contents.channel_flags & 2, 0); // The disable bit must never be set!
 							if Some(*node_id) == expect_drop_id { panic!("peer_disconnected should drop msgs bound for the disconnected peer"); }
 							*node_id == a_id
@@ -1128,13 +1246,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				for event in &mut events_iter {
 					had_events = true;
 					match event {
-						events::MessageSendEvent::UpdateHTLCs { node_id, updates: CommitmentUpdate { update_add_htlcs, update_fail_htlcs, update_fulfill_htlcs, update_fail_malformed_htlcs, update_fee, commitment_signed } } => {
+						MessageSendEvent::UpdateHTLCs { node_id, channel_id, updates: CommitmentUpdate { update_add_htlcs, update_fail_htlcs, update_fulfill_htlcs, update_fail_malformed_htlcs, update_fee, commitment_signed } } => {
 							for (idx, dest) in nodes.iter().enumerate() {
 								if dest.get_our_node_id() == node_id {
 									for update_add in update_add_htlcs.iter() {
-										out.locked_write(format!("Delivering update_add_htlc to node {}.\n", idx).as_bytes());
+										out.locked_write(format!("Delivering update_add_htlc from node {} to node {}.\n", $node, idx).as_bytes());
 										if !$corrupt_forward {
-											dest.handle_update_add_htlc(&nodes[$node].get_our_node_id(), update_add);
+											dest.handle_update_add_htlc(nodes[$node].get_our_node_id(), update_add);
 										} else {
 											// Corrupt the update_add_htlc message so that its HMAC
 											// check will fail and we generate a
@@ -1142,31 +1260,31 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 											// update_fail_htlc as we do when we reject a payment.
 											let mut msg_ser = update_add.encode();
 											msg_ser[1000] ^= 0xff;
-											let new_msg = UpdateAddHTLC::read(&mut Cursor::new(&msg_ser)).unwrap();
-											dest.handle_update_add_htlc(&nodes[$node].get_our_node_id(), &new_msg);
+											let new_msg = UpdateAddHTLC::read_from_fixed_length_buffer(&mut &msg_ser[..]).unwrap();
+											dest.handle_update_add_htlc(nodes[$node].get_our_node_id(), &new_msg);
 										}
-									}
-									for update_fulfill in update_fulfill_htlcs.iter() {
-										out.locked_write(format!("Delivering update_fulfill_htlc to node {}.\n", idx).as_bytes());
-										dest.handle_update_fulfill_htlc(&nodes[$node].get_our_node_id(), update_fulfill);
-									}
-									for update_fail in update_fail_htlcs.iter() {
-										out.locked_write(format!("Delivering update_fail_htlc to node {}.\n", idx).as_bytes());
-										dest.handle_update_fail_htlc(&nodes[$node].get_our_node_id(), update_fail);
-									}
-									for update_fail_malformed in update_fail_malformed_htlcs.iter() {
-										out.locked_write(format!("Delivering update_fail_malformed_htlc to node {}.\n", idx).as_bytes());
-										dest.handle_update_fail_malformed_htlc(&nodes[$node].get_our_node_id(), update_fail_malformed);
-									}
-									if let Some(msg) = update_fee {
-										out.locked_write(format!("Delivering update_fee to node {}.\n", idx).as_bytes());
-										dest.handle_update_fee(&nodes[$node].get_our_node_id(), &msg);
 									}
 									let processed_change = !update_add_htlcs.is_empty() || !update_fulfill_htlcs.is_empty() ||
 										!update_fail_htlcs.is_empty() || !update_fail_malformed_htlcs.is_empty();
+									for update_fulfill in update_fulfill_htlcs {
+										out.locked_write(format!("Delivering update_fulfill_htlc from node {} to node {}.\n", $node, idx).as_bytes());
+										dest.handle_update_fulfill_htlc(nodes[$node].get_our_node_id(), update_fulfill);
+									}
+									for update_fail in update_fail_htlcs.iter() {
+										out.locked_write(format!("Delivering update_fail_htlc from node {} to node {}.\n", $node, idx).as_bytes());
+										dest.handle_update_fail_htlc(nodes[$node].get_our_node_id(), update_fail);
+									}
+									for update_fail_malformed in update_fail_malformed_htlcs.iter() {
+										out.locked_write(format!("Delivering update_fail_malformed_htlc from node {} to node {}.\n", $node, idx).as_bytes());
+										dest.handle_update_fail_malformed_htlc(nodes[$node].get_our_node_id(), update_fail_malformed);
+									}
+									if let Some(msg) = update_fee {
+										out.locked_write(format!("Delivering update_fee from node {} to node {}.\n", $node, idx).as_bytes());
+										dest.handle_update_fee(nodes[$node].get_our_node_id(), &msg);
+									}
 									if $limit_events != ProcessMessages::AllMessages && processed_change {
 										// If we only want to process some messages, don't deliver the CS until later.
-										extra_ev = Some(events::MessageSendEvent::UpdateHTLCs { node_id, updates: CommitmentUpdate {
+										extra_ev = Some(MessageSendEvent::UpdateHTLCs { node_id, channel_id, updates: CommitmentUpdate {
 											update_add_htlcs: Vec::new(),
 											update_fail_htlcs: Vec::new(),
 											update_fulfill_htlcs: Vec::new(),
@@ -1176,35 +1294,115 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 										} });
 										break;
 									}
-									out.locked_write(format!("Delivering commitment_signed to node {}.\n", idx).as_bytes());
-									dest.handle_commitment_signed(&nodes[$node].get_our_node_id(), &commitment_signed);
+									out.locked_write(format!("Delivering commitment_signed from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_commitment_signed_batch_test(nodes[$node].get_our_node_id(), &commitment_signed);
 									break;
 								}
 							}
 						},
-						events::MessageSendEvent::SendRevokeAndACK { ref node_id, ref msg } => {
+						MessageSendEvent::SendRevokeAndACK { ref node_id, ref msg } => {
 							for (idx, dest) in nodes.iter().enumerate() {
 								if dest.get_our_node_id() == *node_id {
-									out.locked_write(format!("Delivering revoke_and_ack to node {}.\n", idx).as_bytes());
-									dest.handle_revoke_and_ack(&nodes[$node].get_our_node_id(), msg);
+									out.locked_write(format!("Delivering revoke_and_ack from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_revoke_and_ack(nodes[$node].get_our_node_id(), msg);
 								}
 							}
 						},
-						events::MessageSendEvent::SendChannelReestablish { ref node_id, ref msg } => {
+						MessageSendEvent::SendChannelReestablish { ref node_id, ref msg } => {
 							for (idx, dest) in nodes.iter().enumerate() {
 								if dest.get_our_node_id() == *node_id {
-									out.locked_write(format!("Delivering channel_reestablish to node {}.\n", idx).as_bytes());
-									dest.handle_channel_reestablish(&nodes[$node].get_our_node_id(), msg);
+									out.locked_write(format!("Delivering channel_reestablish from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_channel_reestablish(nodes[$node].get_our_node_id(), msg);
 								}
 							}
 						},
-						events::MessageSendEvent::SendChannelReady { .. } => {
+						MessageSendEvent::SendStfu { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering stfu from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_stfu(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendTxAddInput { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering tx_add_input from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_tx_add_input(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendTxAddOutput { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering tx_add_output from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_tx_add_output(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendTxRemoveInput { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering tx_remove_input from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_tx_remove_input(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendTxRemoveOutput { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering tx_remove_output from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_tx_remove_output(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendTxComplete { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering tx_complete from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_tx_complete(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendTxAbort { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering tx_abort from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_tx_abort(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendSpliceInit { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering splice_init from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_splice_init(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendSpliceAck { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering splice_ack from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_splice_ack(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendSpliceLocked { ref node_id, ref msg } => {
+							for (idx, dest) in nodes.iter().enumerate() {
+								if dest.get_our_node_id() == *node_id {
+									out.locked_write(format!("Delivering splice_locked from node {} to node {}.\n", $node, idx).as_bytes());
+									dest.handle_splice_locked(nodes[$node].get_our_node_id(), msg);
+								}
+							}
+						},
+						MessageSendEvent::SendChannelReady { .. } => {
 							// Can be generated as a reestablish response
 						},
-						events::MessageSendEvent::SendAnnouncementSignatures { .. } => {
+						MessageSendEvent::SendAnnouncementSignatures { .. } => {
 							// Can be generated as a reestablish response
 						},
-						events::MessageSendEvent::SendChannelUpdate { ref msg, .. } => {
+						MessageSendEvent::SendChannelUpdate { ref msg, .. } => {
 							// When we reconnect we will resend a channel_update to make sure our
 							// counterparty has the latest parameters for receiving payments
 							// through us. We do, however, check that the message does not include
@@ -1247,12 +1445,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				if $counterparty_id == 0 {
 					for event in nodes[0].get_and_clear_pending_msg_events() {
 						match event {
-							events::MessageSendEvent::UpdateHTLCs { .. } => {},
-							events::MessageSendEvent::SendRevokeAndACK { .. } => {},
-							events::MessageSendEvent::SendChannelReestablish { .. } => {},
-							events::MessageSendEvent::SendChannelReady { .. } => {},
-							events::MessageSendEvent::SendAnnouncementSignatures { .. } => {},
-							events::MessageSendEvent::SendChannelUpdate { ref msg, .. } => {
+							MessageSendEvent::UpdateHTLCs { .. } => {},
+							MessageSendEvent::SendRevokeAndACK { .. } => {},
+							MessageSendEvent::SendChannelReestablish { .. } => {},
+							MessageSendEvent::SendStfu { .. } => {},
+							MessageSendEvent::SendChannelReady { .. } => {},
+							MessageSendEvent::SendAnnouncementSignatures { .. } => {},
+							MessageSendEvent::SendChannelUpdate { ref msg, .. } => {
 								assert_eq!(msg.contents.channel_flags & 2, 0); // The disable bit must never be set!
 							},
 							_ => {
@@ -1273,12 +1472,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				} else {
 					for event in nodes[2].get_and_clear_pending_msg_events() {
 						match event {
-							events::MessageSendEvent::UpdateHTLCs { .. } => {},
-							events::MessageSendEvent::SendRevokeAndACK { .. } => {},
-							events::MessageSendEvent::SendChannelReestablish { .. } => {},
-							events::MessageSendEvent::SendChannelReady { .. } => {},
-							events::MessageSendEvent::SendAnnouncementSignatures { .. } => {},
-							events::MessageSendEvent::SendChannelUpdate { ref msg, .. } => {
+							MessageSendEvent::UpdateHTLCs { .. } => {},
+							MessageSendEvent::SendRevokeAndACK { .. } => {},
+							MessageSendEvent::SendChannelReestablish { .. } => {},
+							MessageSendEvent::SendStfu { .. } => {},
+							MessageSendEvent::SendChannelReady { .. } => {},
+							MessageSendEvent::SendAnnouncementSignatures { .. } => {},
+							MessageSendEvent::SendChannelUpdate { ref msg, .. } => {
 								assert_eq!(msg.contents.channel_flags & 2, 0); // The disable bit must never be set!
 							},
 							_ => {
@@ -1307,28 +1507,6 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				// deduplicate the calls here.
 				let mut claim_set = new_hash_map();
 				let mut events = nodes[$node].get_and_clear_pending_events();
-				// Sort events so that PendingHTLCsForwardable get processed last. This avoids a
-				// case where we first process a PendingHTLCsForwardable, then claim/fail on a
-				// PaymentClaimable, claiming/failing two HTLCs, but leaving a just-generated
-				// PaymentClaimable event for the second HTLC in our pending_events (and breaking
-				// our claim_set deduplication).
-				events.sort_by(|a, b| {
-					if let events::Event::PaymentClaimable { .. } = a {
-						if let events::Event::PendingHTLCsForwardable { .. } = b {
-							Ordering::Less
-						} else {
-							Ordering::Equal
-						}
-					} else if let events::Event::PendingHTLCsForwardable { .. } = a {
-						if let events::Event::PaymentClaimable { .. } = b {
-							Ordering::Greater
-						} else {
-							Ordering::Equal
-						}
-					} else {
-						Ordering::Equal
-					}
-				});
 				let had_events = !events.is_empty();
 				for event in events.drain(..) {
 					match event {
@@ -1355,10 +1533,26 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 						},
 						events::Event::PaymentForwarded { .. } if $node == 1 => {},
 						events::Event::ChannelReady { .. } => {},
-						events::Event::PendingHTLCsForwardable { .. } => {
-							nodes[$node].process_pending_htlc_forwards();
-						},
 						events::Event::HTLCHandlingFailed { .. } => {},
+
+						events::Event::FundingTransactionReadyForSigning {
+							channel_id,
+							counterparty_node_id,
+							unsigned_transaction,
+							..
+						} => {
+							let signed_tx = wallets[$node].sign_tx(unsigned_transaction).unwrap();
+							nodes[$node]
+								.funding_transaction_signed(
+									&channel_id,
+									&counterparty_node_id,
+									signed_tx,
+								)
+								.unwrap();
+						},
+						events::Event::SplicePending { .. } => {},
+						events::Event::SpliceFailed { .. } => {},
+
 						_ => {
 							if out.may_fail.load(atomic::Ordering::Acquire) {
 								return;
@@ -1367,6 +1561,9 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 							}
 						},
 					}
+				}
+				while nodes[$node].needs_pending_htlc_processing() {
+					nodes[$node].process_pending_htlc_forwards();
 				}
 				had_events
 			}};
@@ -1399,14 +1596,14 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				}
 			};
 
-		let complete_all_monitor_updates = |monitor: &Arc<TestChainMonitor>, chan_funding| {
-			if let Some(state) = monitor.latest_monitors.lock().unwrap().get_mut(chan_funding) {
+		let complete_all_monitor_updates = |monitor: &Arc<TestChainMonitor>, chan_id| {
+			if let Some(state) = monitor.latest_monitors.lock().unwrap().get_mut(chan_id) {
 				assert!(
 					state.pending_monitors.windows(2).all(|pair| pair[0].0 < pair[1].0),
 					"updates should be sorted by id"
 				);
 				for (id, data) in state.pending_monitors.drain(..) {
-					monitor.chain_monitor.channel_monitor_updated(*chan_funding, id).unwrap();
+					monitor.chain_monitor.channel_monitor_updated(*chan_id, id).unwrap();
 					if id > state.persisted_monitor_id {
 						state.persisted_monitor_id = id;
 						state.persisted_monitor = data;
@@ -1422,47 +1619,41 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 			// bit-twiddling mutations to have similar effects. This is probably overkill, but no
 			// harm in doing so.
 			0x00 => {
-				*monitor_a.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::InProgress
+				*mon_style[0].borrow_mut() = ChannelMonitorUpdateStatus::InProgress;
 			},
 			0x01 => {
-				*monitor_b.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::InProgress
+				*mon_style[1].borrow_mut() = ChannelMonitorUpdateStatus::InProgress;
 			},
 			0x02 => {
-				*monitor_c.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::InProgress
+				*mon_style[2].borrow_mut() = ChannelMonitorUpdateStatus::InProgress;
 			},
 			0x04 => {
-				*monitor_a.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::Completed
+				*mon_style[0].borrow_mut() = ChannelMonitorUpdateStatus::Completed;
 			},
 			0x05 => {
-				*monitor_b.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::Completed
+				*mon_style[1].borrow_mut() = ChannelMonitorUpdateStatus::Completed;
 			},
 			0x06 => {
-				*monitor_c.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::Completed
+				*mon_style[2].borrow_mut() = ChannelMonitorUpdateStatus::Completed;
 			},
 
-			0x08 => complete_all_monitor_updates(&monitor_a, &chan_1_funding),
-			0x09 => complete_all_monitor_updates(&monitor_b, &chan_1_funding),
-			0x0a => complete_all_monitor_updates(&monitor_b, &chan_2_funding),
-			0x0b => complete_all_monitor_updates(&monitor_c, &chan_2_funding),
+			0x08 => complete_all_monitor_updates(&monitor_a, &chan_1_id),
+			0x09 => complete_all_monitor_updates(&monitor_b, &chan_1_id),
+			0x0a => complete_all_monitor_updates(&monitor_b, &chan_2_id),
+			0x0b => complete_all_monitor_updates(&monitor_c, &chan_2_id),
 
 			0x0c => {
 				if !chan_a_disconnected {
-					nodes[0].peer_disconnected(&nodes[1].get_our_node_id());
-					nodes[1].peer_disconnected(&nodes[0].get_our_node_id());
+					nodes[0].peer_disconnected(nodes[1].get_our_node_id());
+					nodes[1].peer_disconnected(nodes[0].get_our_node_id());
 					chan_a_disconnected = true;
 					drain_msg_events_on_disconnect!(0);
 				}
 			},
 			0x0d => {
 				if !chan_b_disconnected {
-					nodes[1].peer_disconnected(&nodes[2].get_our_node_id());
-					nodes[2].peer_disconnected(&nodes[1].get_our_node_id());
+					nodes[1].peer_disconnected(nodes[2].get_our_node_id());
+					nodes[2].peer_disconnected(nodes[1].get_our_node_id());
 					chan_b_disconnected = true;
 					drain_msg_events_on_disconnect!(2);
 				}
@@ -1474,13 +1665,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 						networks: None,
 						remote_network_address: None,
 					};
-					nodes[0].peer_connected(&nodes[1].get_our_node_id(), &init_1, true).unwrap();
+					nodes[0].peer_connected(nodes[1].get_our_node_id(), &init_1, true).unwrap();
 					let init_0 = Init {
 						features: nodes[0].init_features(),
 						networks: None,
 						remote_network_address: None,
 					};
-					nodes[1].peer_connected(&nodes[0].get_our_node_id(), &init_0, false).unwrap();
+					nodes[1].peer_connected(nodes[0].get_our_node_id(), &init_0, false).unwrap();
 					chan_a_disconnected = false;
 				}
 			},
@@ -1491,13 +1682,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 						networks: None,
 						remote_network_address: None,
 					};
-					nodes[1].peer_connected(&nodes[2].get_our_node_id(), &init_2, true).unwrap();
+					nodes[1].peer_connected(nodes[2].get_our_node_id(), &init_2, true).unwrap();
 					let init_1 = Init {
 						features: nodes[1].init_features(),
 						networks: None,
 						remote_network_address: None,
 					};
-					nodes[2].peer_connected(&nodes[1].get_our_node_id(), &init_1, false).unwrap();
+					nodes[2].peer_connected(nodes[1].get_our_node_id(), &init_1, false).unwrap();
 					chan_b_disconnected = false;
 				}
 			},
@@ -1531,59 +1722,6 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 
 			0x26 => process_ev_noret!(2, true),
 			0x27 => process_ev_noret!(2, false),
-
-			0x2c => {
-				if !chan_a_disconnected {
-					nodes[1].peer_disconnected(&nodes[0].get_our_node_id());
-					chan_a_disconnected = true;
-					push_excess_b_events!(
-						nodes[1].get_and_clear_pending_msg_events().drain(..),
-						Some(0)
-					);
-					ab_events.clear();
-					ba_events.clear();
-				}
-				let (new_node_a, new_monitor_a) =
-					reload_node!(node_a_ser, 0, monitor_a, keys_manager_a, fee_est_a);
-				nodes[0] = new_node_a;
-				monitor_a = new_monitor_a;
-			},
-			0x2d => {
-				if !chan_a_disconnected {
-					nodes[0].peer_disconnected(&nodes[1].get_our_node_id());
-					chan_a_disconnected = true;
-					nodes[0].get_and_clear_pending_msg_events();
-					ab_events.clear();
-					ba_events.clear();
-				}
-				if !chan_b_disconnected {
-					nodes[2].peer_disconnected(&nodes[1].get_our_node_id());
-					chan_b_disconnected = true;
-					nodes[2].get_and_clear_pending_msg_events();
-					bc_events.clear();
-					cb_events.clear();
-				}
-				let (new_node_b, new_monitor_b) =
-					reload_node!(node_b_ser, 1, monitor_b, keys_manager_b, fee_est_b);
-				nodes[1] = new_node_b;
-				monitor_b = new_monitor_b;
-			},
-			0x2e => {
-				if !chan_b_disconnected {
-					nodes[1].peer_disconnected(&nodes[2].get_our_node_id());
-					chan_b_disconnected = true;
-					push_excess_b_events!(
-						nodes[1].get_and_clear_pending_msg_events().drain(..),
-						Some(2)
-					);
-					bc_events.clear();
-					cb_events.clear();
-				}
-				let (new_node_c, new_monitor_c) =
-					reload_node!(node_c_ser, 2, monitor_c, keys_manager_c, fee_est_c);
-				nodes[2] = new_node_c;
-				monitor_c = new_monitor_c;
-			},
 
 			// 1/10th the channel size:
 			0x30 => send_noret(&nodes[0], &nodes[1], chan_a, 10_000_000, &mut p_id, &mut p_idx),
@@ -1719,53 +1857,316 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				nodes[2].maybe_update_chan_fees();
 			},
 
-			0xf0 => complete_monitor_update(&monitor_a, &chan_1_funding, &complete_first),
-			0xf1 => complete_monitor_update(&monitor_a, &chan_1_funding, &complete_second),
-			0xf2 => complete_monitor_update(&monitor_a, &chan_1_funding, &Vec::pop),
+			0xa0 => {
+				let input = FundingTxInput::new_p2wpkh(coinbase_tx.clone(), 0).unwrap();
+				let contribution = SpliceContribution::SpliceIn {
+					value: Amount::from_sat(10_000),
+					inputs: vec![input],
+					change_script: None,
+				};
+				let funding_feerate_sat_per_kw = fee_est_a.ret_val.load(atomic::Ordering::Acquire);
+				if let Err(e) = nodes[0].splice_channel(
+					&chan_a_id,
+					&nodes[1].get_our_node_id(),
+					contribution,
+					funding_feerate_sat_per_kw,
+					None,
+				) {
+					assert!(
+						matches!(e, APIError::APIMisuseError { ref err } if err.contains("splice pending")),
+						"{:?}",
+						e
+					);
+				}
+			},
+			0xa1 => {
+				let input = FundingTxInput::new_p2wpkh(coinbase_tx.clone(), 1).unwrap();
+				let contribution = SpliceContribution::SpliceIn {
+					value: Amount::from_sat(10_000),
+					inputs: vec![input],
+					change_script: None,
+				};
+				let funding_feerate_sat_per_kw = fee_est_b.ret_val.load(atomic::Ordering::Acquire);
+				if let Err(e) = nodes[1].splice_channel(
+					&chan_a_id,
+					&nodes[0].get_our_node_id(),
+					contribution,
+					funding_feerate_sat_per_kw,
+					None,
+				) {
+					assert!(
+						matches!(e, APIError::APIMisuseError { ref err } if err.contains("splice pending")),
+						"{:?}",
+						e
+					);
+				}
+			},
+			0xa2 => {
+				let input = FundingTxInput::new_p2wpkh(coinbase_tx.clone(), 0).unwrap();
+				let contribution = SpliceContribution::SpliceIn {
+					value: Amount::from_sat(10_000),
+					inputs: vec![input],
+					change_script: None,
+				};
+				let funding_feerate_sat_per_kw = fee_est_b.ret_val.load(atomic::Ordering::Acquire);
+				if let Err(e) = nodes[1].splice_channel(
+					&chan_b_id,
+					&nodes[2].get_our_node_id(),
+					contribution,
+					funding_feerate_sat_per_kw,
+					None,
+				) {
+					assert!(
+						matches!(e, APIError::APIMisuseError { ref err } if err.contains("splice pending")),
+						"{:?}",
+						e
+					);
+				}
+			},
+			0xa3 => {
+				let input = FundingTxInput::new_p2wpkh(coinbase_tx.clone(), 1).unwrap();
+				let contribution = SpliceContribution::SpliceIn {
+					value: Amount::from_sat(10_000),
+					inputs: vec![input],
+					change_script: None,
+				};
+				let funding_feerate_sat_per_kw = fee_est_c.ret_val.load(atomic::Ordering::Acquire);
+				if let Err(e) = nodes[2].splice_channel(
+					&chan_b_id,
+					&nodes[1].get_our_node_id(),
+					contribution,
+					funding_feerate_sat_per_kw,
+					None,
+				) {
+					assert!(
+						matches!(e, APIError::APIMisuseError { ref err } if err.contains("splice pending")),
+						"{:?}",
+						e
+					);
+				}
+			},
 
-			0xf4 => complete_monitor_update(&monitor_b, &chan_1_funding, &complete_first),
-			0xf5 => complete_monitor_update(&monitor_b, &chan_1_funding, &complete_second),
-			0xf6 => complete_monitor_update(&monitor_b, &chan_1_funding, &Vec::pop),
+			// We conditionally splice out `MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS` only when the node
+			// has double the balance required to send a payment upon a `0xff` byte. We do this to
+			// ensure there's always liquidity available for a payment to succeed then.
+			0xa4 => {
+				let outbound_capacity_msat = nodes[0]
+					.list_channels()
+					.iter()
+					.find(|chan| chan.channel_id == chan_a_id)
+					.map(|chan| chan.outbound_capacity_msat)
+					.unwrap();
+				if outbound_capacity_msat >= 20_000_000 {
+					let contribution = SpliceContribution::SpliceOut {
+						outputs: vec![TxOut {
+							value: Amount::from_sat(MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS),
+							script_pubkey: coinbase_tx.output[0].script_pubkey.clone(),
+						}],
+					};
+					let funding_feerate_sat_per_kw =
+						fee_est_a.ret_val.load(atomic::Ordering::Acquire);
+					if let Err(e) = nodes[0].splice_channel(
+						&chan_a_id,
+						&nodes[1].get_our_node_id(),
+						contribution,
+						funding_feerate_sat_per_kw,
+						None,
+					) {
+						assert!(
+							matches!(e, APIError::APIMisuseError { ref err } if err.contains("splice pending")),
+							"{:?}",
+							e
+						);
+					}
+				}
+			},
+			0xa5 => {
+				let outbound_capacity_msat = nodes[1]
+					.list_channels()
+					.iter()
+					.find(|chan| chan.channel_id == chan_a_id)
+					.map(|chan| chan.outbound_capacity_msat)
+					.unwrap();
+				if outbound_capacity_msat >= 20_000_000 {
+					let contribution = SpliceContribution::SpliceOut {
+						outputs: vec![TxOut {
+							value: Amount::from_sat(MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS),
+							script_pubkey: coinbase_tx.output[1].script_pubkey.clone(),
+						}],
+					};
+					let funding_feerate_sat_per_kw =
+						fee_est_b.ret_val.load(atomic::Ordering::Acquire);
+					if let Err(e) = nodes[1].splice_channel(
+						&chan_a_id,
+						&nodes[0].get_our_node_id(),
+						contribution,
+						funding_feerate_sat_per_kw,
+						None,
+					) {
+						assert!(
+							matches!(e, APIError::APIMisuseError { ref err } if err.contains("splice pending")),
+							"{:?}",
+							e
+						);
+					}
+				}
+			},
+			0xa6 => {
+				let outbound_capacity_msat = nodes[1]
+					.list_channels()
+					.iter()
+					.find(|chan| chan.channel_id == chan_b_id)
+					.map(|chan| chan.outbound_capacity_msat)
+					.unwrap();
+				if outbound_capacity_msat >= 20_000_000 {
+					let contribution = SpliceContribution::SpliceOut {
+						outputs: vec![TxOut {
+							value: Amount::from_sat(MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS),
+							script_pubkey: coinbase_tx.output[1].script_pubkey.clone(),
+						}],
+					};
+					let funding_feerate_sat_per_kw =
+						fee_est_b.ret_val.load(atomic::Ordering::Acquire);
+					if let Err(e) = nodes[1].splice_channel(
+						&chan_b_id,
+						&nodes[2].get_our_node_id(),
+						contribution,
+						funding_feerate_sat_per_kw,
+						None,
+					) {
+						assert!(
+							matches!(e, APIError::APIMisuseError { ref err } if err.contains("splice pending")),
+							"{:?}",
+							e
+						);
+					}
+				}
+			},
+			0xa7 => {
+				let outbound_capacity_msat = nodes[2]
+					.list_channels()
+					.iter()
+					.find(|chan| chan.channel_id == chan_b_id)
+					.map(|chan| chan.outbound_capacity_msat)
+					.unwrap();
+				if outbound_capacity_msat >= 20_000_000 {
+					let contribution = SpliceContribution::SpliceOut {
+						outputs: vec![TxOut {
+							value: Amount::from_sat(MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS),
+							script_pubkey: coinbase_tx.output[2].script_pubkey.clone(),
+						}],
+					};
+					let funding_feerate_sat_per_kw =
+						fee_est_c.ret_val.load(atomic::Ordering::Acquire);
+					if let Err(e) = nodes[2].splice_channel(
+						&chan_b_id,
+						&nodes[1].get_our_node_id(),
+						contribution,
+						funding_feerate_sat_per_kw,
+						None,
+					) {
+						assert!(
+							matches!(e, APIError::APIMisuseError { ref err } if err.contains("splice pending")),
+							"{:?}",
+							e
+						);
+					}
+				}
+			},
 
-			0xf8 => complete_monitor_update(&monitor_b, &chan_2_funding, &complete_first),
-			0xf9 => complete_monitor_update(&monitor_b, &chan_2_funding, &complete_second),
-			0xfa => complete_monitor_update(&monitor_b, &chan_2_funding, &Vec::pop),
+			0xb0 | 0xb1 | 0xb2 => {
+				// Restart node A, picking among the in-flight `ChannelMonitor`s to use based on
+				// the value of `v` we're matching.
+				if !chan_a_disconnected {
+					nodes[1].peer_disconnected(nodes[0].get_our_node_id());
+					chan_a_disconnected = true;
+					push_excess_b_events!(
+						nodes[1].get_and_clear_pending_msg_events().drain(..),
+						Some(0)
+					);
+					ab_events.clear();
+					ba_events.clear();
+				}
+				let (new_node_a, new_monitor_a) =
+					reload_node(&node_a_ser, 0, &monitor_a, v, &keys_manager_a, &fee_est_a);
+				nodes[0] = new_node_a;
+				monitor_a = new_monitor_a;
+			},
+			0xb3..=0xbb => {
+				// Restart node B, picking among the in-flight `ChannelMonitor`s to use based on
+				// the value of `v` we're matching.
+				if !chan_a_disconnected {
+					nodes[0].peer_disconnected(nodes[1].get_our_node_id());
+					chan_a_disconnected = true;
+					nodes[0].get_and_clear_pending_msg_events();
+					ab_events.clear();
+					ba_events.clear();
+				}
+				if !chan_b_disconnected {
+					nodes[2].peer_disconnected(nodes[1].get_our_node_id());
+					chan_b_disconnected = true;
+					nodes[2].get_and_clear_pending_msg_events();
+					bc_events.clear();
+					cb_events.clear();
+				}
+				let (new_node_b, new_monitor_b) =
+					reload_node(&node_b_ser, 1, &monitor_b, v, &keys_manager_b, &fee_est_b);
+				nodes[1] = new_node_b;
+				monitor_b = new_monitor_b;
+			},
+			0xbc | 0xbd | 0xbe => {
+				// Restart node C, picking among the in-flight `ChannelMonitor`s to use based on
+				// the value of `v` we're matching.
+				if !chan_b_disconnected {
+					nodes[1].peer_disconnected(nodes[2].get_our_node_id());
+					chan_b_disconnected = true;
+					push_excess_b_events!(
+						nodes[1].get_and_clear_pending_msg_events().drain(..),
+						Some(2)
+					);
+					bc_events.clear();
+					cb_events.clear();
+				}
+				let (new_node_c, new_monitor_c) =
+					reload_node(&node_c_ser, 2, &monitor_c, v, &keys_manager_c, &fee_est_c);
+				nodes[2] = new_node_c;
+				monitor_c = new_monitor_c;
+			},
 
-			0xfc => complete_monitor_update(&monitor_c, &chan_2_funding, &complete_first),
-			0xfd => complete_monitor_update(&monitor_c, &chan_2_funding, &complete_second),
-			0xfe => complete_monitor_update(&monitor_c, &chan_2_funding, &Vec::pop),
+			0xf0 => complete_monitor_update(&monitor_a, &chan_1_id, &complete_first),
+			0xf1 => complete_monitor_update(&monitor_a, &chan_1_id, &complete_second),
+			0xf2 => complete_monitor_update(&monitor_a, &chan_1_id, &Vec::pop),
+
+			0xf4 => complete_monitor_update(&monitor_b, &chan_1_id, &complete_first),
+			0xf5 => complete_monitor_update(&monitor_b, &chan_1_id, &complete_second),
+			0xf6 => complete_monitor_update(&monitor_b, &chan_1_id, &Vec::pop),
+
+			0xf8 => complete_monitor_update(&monitor_b, &chan_2_id, &complete_first),
+			0xf9 => complete_monitor_update(&monitor_b, &chan_2_id, &complete_second),
+			0xfa => complete_monitor_update(&monitor_b, &chan_2_id, &Vec::pop),
+
+			0xfc => complete_monitor_update(&monitor_c, &chan_2_id, &complete_first),
+			0xfd => complete_monitor_update(&monitor_c, &chan_2_id, &complete_second),
+			0xfe => complete_monitor_update(&monitor_c, &chan_2_id, &Vec::pop),
 
 			0xff => {
 				// Test that no channel is in a stuck state where neither party can send funds even
 				// after we resolve all pending events.
-				// First make sure there are no pending monitor updates and further update
-				// operations complete.
-				*monitor_a.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::Completed;
-				*monitor_b.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::Completed;
-				*monitor_c.persister.update_ret.lock().unwrap() =
-					ChannelMonitorUpdateStatus::Completed;
 
-				complete_all_monitor_updates(&monitor_a, &chan_1_funding);
-				complete_all_monitor_updates(&monitor_b, &chan_1_funding);
-				complete_all_monitor_updates(&monitor_b, &chan_2_funding);
-				complete_all_monitor_updates(&monitor_c, &chan_2_funding);
-
-				// Next, make sure peers are all connected to each other
+				// First, make sure peers are all connected to each other
 				if chan_a_disconnected {
 					let init_1 = Init {
 						features: nodes[1].init_features(),
 						networks: None,
 						remote_network_address: None,
 					};
-					nodes[0].peer_connected(&nodes[1].get_our_node_id(), &init_1, true).unwrap();
+					nodes[0].peer_connected(nodes[1].get_our_node_id(), &init_1, true).unwrap();
 					let init_0 = Init {
 						features: nodes[0].init_features(),
 						networks: None,
 						remote_network_address: None,
 					};
-					nodes[1].peer_connected(&nodes[0].get_our_node_id(), &init_0, false).unwrap();
+					nodes[1].peer_connected(nodes[0].get_our_node_id(), &init_0, false).unwrap();
 					chan_a_disconnected = false;
 				}
 				if chan_b_disconnected {
@@ -1774,43 +2175,70 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 						networks: None,
 						remote_network_address: None,
 					};
-					nodes[1].peer_connected(&nodes[2].get_our_node_id(), &init_2, true).unwrap();
+					nodes[1].peer_connected(nodes[2].get_our_node_id(), &init_2, true).unwrap();
 					let init_1 = Init {
 						features: nodes[1].init_features(),
 						networks: None,
 						remote_network_address: None,
 					};
-					nodes[2].peer_connected(&nodes[1].get_our_node_id(), &init_1, false).unwrap();
+					nodes[2].peer_connected(nodes[1].get_our_node_id(), &init_1, false).unwrap();
 					chan_b_disconnected = false;
 				}
 
-				for i in 0..std::usize::MAX {
-					if i == 100 {
-						panic!("It may take may iterations to settle the state, but it should not take forever");
-					}
-					// Then, make sure any current forwards make their way to their destination
-					if process_msg_events!(0, false, ProcessMessages::AllMessages) {
-						continue;
-					}
-					if process_msg_events!(1, false, ProcessMessages::AllMessages) {
-						continue;
-					}
-					if process_msg_events!(2, false, ProcessMessages::AllMessages) {
-						continue;
-					}
-					// ...making sure any pending PendingHTLCsForwardable events are handled and
-					// payments claimed.
-					if process_events!(0, false) {
-						continue;
-					}
-					if process_events!(1, false) {
-						continue;
-					}
-					if process_events!(2, false) {
-						continue;
-					}
-					break;
+				macro_rules! process_all_events {
+					() => { {
+						let mut last_pass_no_updates = false;
+						for i in 0..std::usize::MAX {
+							if i == 100 {
+								panic!("It may take may iterations to settle the state, but it should not take forever");
+							}
+							// Next, make sure no monitor updates are pending
+							complete_all_monitor_updates(&monitor_a, &chan_1_id);
+							complete_all_monitor_updates(&monitor_b, &chan_1_id);
+							complete_all_monitor_updates(&monitor_b, &chan_2_id);
+							complete_all_monitor_updates(&monitor_c, &chan_2_id);
+							// Then, make sure any current forwards make their way to their destination
+							if process_msg_events!(0, false, ProcessMessages::AllMessages) {
+								last_pass_no_updates = false;
+								continue;
+							}
+							if process_msg_events!(1, false, ProcessMessages::AllMessages) {
+								last_pass_no_updates = false;
+								continue;
+							}
+							if process_msg_events!(2, false, ProcessMessages::AllMessages) {
+								last_pass_no_updates = false;
+								continue;
+							}
+							// ...making sure any payments are claimed.
+							if process_events!(0, false) {
+								last_pass_no_updates = false;
+								continue;
+							}
+							if process_events!(1, false) {
+								last_pass_no_updates = false;
+								continue;
+							}
+							if process_events!(2, false) {
+								last_pass_no_updates = false;
+								continue;
+							}
+							if last_pass_no_updates {
+								// In some cases, we may generate a message to send in
+								// `process_msg_events`, but block sending until
+								// `complete_all_monitor_updates` gets called on the next
+								// iteration.
+								//
+								// Thus, we only exit if we manage two iterations with no messages
+								// or events to process.
+								break;
+							}
+							last_pass_no_updates = true;
+						}
+					} };
 				}
+
+				process_all_events!();
 
 				// Finally, make sure that at least one end of each channel can make a substantial payment
 				assert!(
@@ -1834,16 +2262,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 		}
 
 		if nodes[0].get_and_clear_needs_persistence() == true {
-			node_a_ser.0.clear();
-			nodes[0].write(&mut node_a_ser).unwrap();
+			node_a_ser = nodes[0].encode();
 		}
 		if nodes[1].get_and_clear_needs_persistence() == true {
-			node_b_ser.0.clear();
-			nodes[1].write(&mut node_b_ser).unwrap();
+			node_b_ser = nodes[1].encode();
 		}
 		if nodes[2].get_and_clear_needs_persistence() == true {
-			node_c_ser.0.clear();
-			nodes[2].write(&mut node_c_ser).unwrap();
+			node_c_ser = nodes[2].encode();
 		}
 	}
 }

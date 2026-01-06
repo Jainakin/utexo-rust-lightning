@@ -23,19 +23,28 @@ use bitcoin::network::Network;
 
 use rgb_lib::ContractId;
 
-use crate::events::{MessageSendEvent, MessageSendEventsProvider};
-use crate::ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 use crate::ln::msgs;
-use crate::ln::msgs::{ChannelAnnouncement, ChannelUpdate, GossipTimestampFilter, NodeAnnouncement};
-use crate::ln::msgs::{DecodeError, ErrorAction, Init, LightningError, RoutingMessageHandler, SocketAddress, MAX_VALUE_MSAT};
-use crate::ln::msgs::{QueryChannelRange, QueryShortChannelIds, ReplyChannelRange, ReplyShortChannelIdsEnd};
+use crate::ln::msgs::{
+	BaseMessageHandler, ChannelAnnouncement, ChannelUpdate, GossipTimestampFilter, NodeAnnouncement,
+};
+use crate::ln::msgs::{
+	DecodeError, ErrorAction, Init, LightningError, RoutingMessageHandler, SocketAddress,
+	MAX_VALUE_MSAT,
+};
+use crate::ln::msgs::{
+	MessageSendEvent, QueryChannelRange, QueryShortChannelIds, ReplyChannelRange,
+	ReplyShortChannelIdsEnd,
+};
 use crate::ln::types::ChannelId;
 use crate::routing::utxo::{self, UtxoLookup, UtxoResolver};
-use crate::util::indexed_map::{Entry as IndexedMapEntry, IndexedMap};
+use crate::types::features::{ChannelFeatures, InitFeatures, NodeFeatures};
+use crate::types::string::PrintableString;
+use crate::util::indexed_map::{
+	Entry as IndexedMapEntry, IndexedMap, OccupiedEntry as IndexedMapOccupiedEntry,
+};
 use crate::util::logger::{Level, Logger};
 use crate::util::scid_utils::{block_from_scid, scid_from_parts, MAX_SCID_BLOCK};
 use crate::util::ser::{MaybeReadable, Readable, ReadableArgs, RequiredWrapper, Writeable, Writer};
-use crate::util::string::PrintableString;
 
 use crate::io;
 use crate::io_extras::{copy, sink};
@@ -67,7 +76,12 @@ const MAX_EXCESS_BYTES_FOR_RELAY: usize = 1024;
 /// This value ensures a reply fits within the 65k payload limit and is consistent with other implementations.
 const MAX_SCIDS_PER_REPLY: usize = 8000;
 
-/// Represents the compressed public key of a node
+/// A compressed pubkey which a node uses to sign announcements and decode HTLCs routed through it.
+///
+/// This type stores a simple byte array which is not checked for validity (i.e. that it describes
+/// a point which lies on the secp256k1 curve), unlike [`PublicKey`], as validity checking would
+/// otherwise represent a large portion of [`NetworkGraph`] deserialization time (and RGS
+/// application).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NodeId([u8; PUBLIC_KEY_SIZE]);
 
@@ -171,7 +185,10 @@ impl FromStr for NodeId {
 }
 
 /// Represents the network as nodes and channels between them
-pub struct NetworkGraph<L: Deref> where L::Target: Logger {
+pub struct NetworkGraph<L: Deref>
+where
+	L::Target: Logger,
+{
 	secp_ctx: Secp256k1<secp256k1::VerifyOnly>,
 	last_rapid_gossip_sync_timestamp: Mutex<Option<u32>>,
 	chain_hash: ChainHash,
@@ -185,7 +202,7 @@ pub struct NetworkGraph<L: Deref> where L::Target: Logger {
 	//
 	// NOTE: In the following `removed_*` maps, we use seconds since UNIX epoch to track time instead
 	// of `std::time::Instant`s for a few reasons:
-	//   * We want it to be possible to do tracking in no-std environments where we can compare
+	//   * We want it to be possible to do tracking in non-`std` environments where we can compare
 	//     a provided current UNIX timestamp with the time at which we started tracking.
 	//   * In the future, if we decide to persist these maps, they will already be serializable.
 	//   * Although we lose out on the platform's monotonic clock, the system clock in a std
@@ -234,7 +251,7 @@ pub enum NetworkUpdate {
 		/// Whether the node should be permanently removed from consideration or can be restored
 		/// when a new `channel_update` message is received.
 		is_permanent: bool,
-	}
+	},
 }
 
 impl Writeable for NetworkUpdate {
@@ -253,7 +270,7 @@ impl Writeable for NetworkUpdate {
 					(0, node_id, required),
 					(2, is_permanent, required),
 				});
-			}
+			},
 		}
 		Ok(())
 	}
@@ -272,7 +289,7 @@ impl MaybeReadable for NetworkUpdate {
 				});
 				Ok(Some(Self::ChannelFailure {
 					short_channel_id: msg.0.unwrap().contents.short_channel_id,
-					is_permanent: false
+					is_permanent: false,
 				}))
 			},
 			2 => {
@@ -294,7 +311,7 @@ impl MaybeReadable for NetworkUpdate {
 					node_id: node_id.0.unwrap(),
 					is_permanent: is_permanent.0.unwrap(),
 				}))
-			}
+			},
 			t if t % 2 == 0 => Err(DecodeError::UnknownRequiredFeature),
 			_ => Ok(None),
 		}
@@ -306,8 +323,10 @@ impl MaybeReadable for NetworkUpdate {
 /// This network graph is then used for routing payments.
 /// Provides interface to help with initial routing sync by
 /// serving historical announcements.
-pub struct P2PGossipSync<G: Deref<Target=NetworkGraph<L>>, U: Deref, L: Deref>
-where U::Target: UtxoLookup, L::Target: Logger
+pub struct P2PGossipSync<G: Deref<Target = NetworkGraph<L>>, U: Deref, L: Deref>
+where
+	U::Target: UtxoLookup,
+	L::Target: Logger,
 {
 	network_graph: G,
 	utxo_lookup: RwLock<Option<U>>,
@@ -316,8 +335,10 @@ where U::Target: UtxoLookup, L::Target: Logger
 	logger: L,
 }
 
-impl<G: Deref<Target=NetworkGraph<L>>, U: Deref, L: Deref> P2PGossipSync<G, U, L>
-where U::Target: UtxoLookup, L::Target: Logger
+impl<G: Deref<Target = NetworkGraph<L>>, U: Deref, L: Deref> P2PGossipSync<G, U, L>
+where
+	U::Target: UtxoLookup,
+	L::Target: Logger,
 {
 	/// Creates a new tracker of the actual state of the network of channels and nodes,
 	/// assuming an existing [`NetworkGraph`].
@@ -366,20 +387,25 @@ where U::Target: UtxoLookup, L::Target: Logger
 	pub(super) fn forward_gossip_msg(&self, mut ev: MessageSendEvent) {
 		match &mut ev {
 			MessageSendEvent::BroadcastChannelAnnouncement { msg, ref mut update_msg } => {
-				if msg.contents.excess_data.len() > MAX_EXCESS_BYTES_FOR_RELAY { return; }
-				if update_msg.as_ref()
-					.map(|msg| msg.contents.excess_data.len()).unwrap_or(0) > MAX_EXCESS_BYTES_FOR_RELAY
+				if msg.contents.excess_data.len() > MAX_EXCESS_BYTES_FOR_RELAY {
+					return;
+				}
+				if update_msg.as_ref().map(|msg| msg.contents.excess_data.len()).unwrap_or(0)
+					> MAX_EXCESS_BYTES_FOR_RELAY
 				{
 					*update_msg = None;
 				}
 			},
 			MessageSendEvent::BroadcastChannelUpdate { msg } => {
-				if msg.contents.excess_data.len() > MAX_EXCESS_BYTES_FOR_RELAY { return; }
+				if msg.contents.excess_data.len() > MAX_EXCESS_BYTES_FOR_RELAY {
+					return;
+				}
 			},
 			MessageSendEvent::BroadcastNodeAnnouncement { msg } => {
-				if msg.contents.excess_data.len() >  MAX_EXCESS_BYTES_FOR_RELAY ||
-				   msg.contents.excess_address_data.len() > MAX_EXCESS_BYTES_FOR_RELAY ||
-				   msg.contents.excess_data.len() + msg.contents.excess_address_data.len() > MAX_EXCESS_BYTES_FOR_RELAY
+				if msg.contents.excess_data.len() > MAX_EXCESS_BYTES_FOR_RELAY
+					|| msg.contents.excess_address_data.len() > MAX_EXCESS_BYTES_FOR_RELAY
+					|| msg.contents.excess_data.len() + msg.contents.excess_address_data.len()
+						> MAX_EXCESS_BYTES_FOR_RELAY
 				{
 					return;
 				}
@@ -390,7 +416,10 @@ where U::Target: UtxoLookup, L::Target: Logger
 	}
 }
 
-impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
+impl<L: Deref> NetworkGraph<L>
+where
+	L::Target: Logger,
+{
 	/// Handles any network updates originating from [`Event`]s.
 	///
 	/// [`Event`]: crate::events::Event
@@ -398,14 +427,21 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 		match *network_update {
 			NetworkUpdate::ChannelFailure { short_channel_id, is_permanent } => {
 				if is_permanent {
-					log_debug!(self.logger, "Removing channel graph entry for {} due to a payment failure.", short_channel_id);
+					log_debug!(
+						self.logger,
+						"Removing channel graph entry for {} due to a payment failure.",
+						short_channel_id
+					);
 					self.channel_failed_permanent(short_channel_id);
 				}
 			},
 			NetworkUpdate::NodeFailure { ref node_id, is_permanent } => {
 				if is_permanent {
-					log_debug!(self.logger,
-						"Removed node graph entry for {} due to a payment failure.", log_pubkey!(node_id));
+					log_debug!(
+						self.logger,
+						"Removed node graph entry for {} due to a payment failure.",
+						log_pubkey!(node_id)
+					);
 					self.node_failed_permanent(node_id);
 				};
 			},
@@ -440,18 +476,17 @@ macro_rules! secp_verify_sig {
 
 macro_rules! get_pubkey_from_node_id {
 	( $node_id: expr, $msg_type: expr ) => {
-		PublicKey::from_slice($node_id.as_slice())
-			.map_err(|_| LightningError {
-				err: format!("Invalid public key on {} message", $msg_type),
-				action: ErrorAction::SendWarningMessage {
-					msg: msgs::WarningMessage {
-						channel_id: ChannelId::new_zero(),
-						data: format!("Invalid public key on {} message", $msg_type),
-					},
-					log_level: Level::Trace
-				}
-			})?
-	}
+		PublicKey::from_slice($node_id.as_slice()).map_err(|_| LightningError {
+			err: format!("Invalid public key on {} message", $msg_type),
+			action: ErrorAction::SendWarningMessage {
+				msg: msgs::WarningMessage {
+					channel_id: ChannelId::new_zero(),
+					data: format!("Invalid public key on {} message", $msg_type),
+				},
+				log_level: Level::Trace,
+			},
+		})?
+	};
 }
 
 fn message_sha256d_hash<M: Writeable>(msg: &M) -> Sha256dHash {
@@ -463,9 +498,17 @@ fn message_sha256d_hash<M: Writeable>(msg: &M) -> Sha256dHash {
 /// Verifies the signature of a [`NodeAnnouncement`].
 ///
 /// Returns an error if it is invalid.
-pub fn verify_node_announcement<C: Verification>(msg: &NodeAnnouncement, secp_ctx: &Secp256k1<C>) -> Result<(), LightningError> {
+pub fn verify_node_announcement<C: Verification>(
+	msg: &NodeAnnouncement, secp_ctx: &Secp256k1<C>,
+) -> Result<(), LightningError> {
 	let msg_hash = hash_to_message!(&message_sha256d_hash(&msg.contents)[..]);
-	secp_verify_sig!(secp_ctx, &msg_hash, &msg.signature, &get_pubkey_from_node_id!(msg.contents.node_id, "node_announcement"), "node_announcement");
+	secp_verify_sig!(
+		secp_ctx,
+		&msg_hash,
+		&msg.signature,
+		&get_pubkey_from_node_id!(msg.contents.node_id, "node_announcement"),
+		"node_announcement"
+	);
 
 	Ok(())
 }
@@ -473,37 +516,56 @@ pub fn verify_node_announcement<C: Verification>(msg: &NodeAnnouncement, secp_ct
 /// Verifies all signatures included in a [`ChannelAnnouncement`].
 ///
 /// Returns an error if one of the signatures is invalid.
-pub fn verify_channel_announcement<C: Verification>(msg: &ChannelAnnouncement, secp_ctx: &Secp256k1<C>) -> Result<(), LightningError> {
+pub fn verify_channel_announcement<C: Verification>(
+	msg: &ChannelAnnouncement, secp_ctx: &Secp256k1<C>,
+) -> Result<(), LightningError> {
 	let msg_hash = hash_to_message!(&message_sha256d_hash(&msg.contents)[..]);
-	secp_verify_sig!(secp_ctx, &msg_hash, &msg.node_signature_1, &get_pubkey_from_node_id!(msg.contents.node_id_1, "channel_announcement"), "channel_announcement");
-	secp_verify_sig!(secp_ctx, &msg_hash, &msg.node_signature_2, &get_pubkey_from_node_id!(msg.contents.node_id_2, "channel_announcement"), "channel_announcement");
-	secp_verify_sig!(secp_ctx, &msg_hash, &msg.bitcoin_signature_1, &get_pubkey_from_node_id!(msg.contents.bitcoin_key_1, "channel_announcement"), "channel_announcement");
-	secp_verify_sig!(secp_ctx, &msg_hash, &msg.bitcoin_signature_2, &get_pubkey_from_node_id!(msg.contents.bitcoin_key_2, "channel_announcement"), "channel_announcement");
+	let node_a = get_pubkey_from_node_id!(msg.contents.node_id_1, "channel_announcement");
+	secp_verify_sig!(secp_ctx, &msg_hash, &msg.node_signature_1, &node_a, "channel_announcement");
+	let node_b = get_pubkey_from_node_id!(msg.contents.node_id_2, "channel_announcement");
+	secp_verify_sig!(secp_ctx, &msg_hash, &msg.node_signature_2, &node_b, "channel_announcement");
+	let btc_a = get_pubkey_from_node_id!(msg.contents.bitcoin_key_1, "channel_announcement");
+	secp_verify_sig!(secp_ctx, &msg_hash, &msg.bitcoin_signature_1, &btc_a, "channel_announcement");
+	let btc_b = get_pubkey_from_node_id!(msg.contents.bitcoin_key_2, "channel_announcement");
+	secp_verify_sig!(secp_ctx, &msg_hash, &msg.bitcoin_signature_2, &btc_b, "channel_announcement");
 
 	Ok(())
 }
 
-impl<G: Deref<Target=NetworkGraph<L>>, U: Deref, L: Deref> RoutingMessageHandler for P2PGossipSync<G, U, L>
-where U::Target: UtxoLookup, L::Target: Logger
+impl<G: Deref<Target = NetworkGraph<L>>, U: Deref, L: Deref> RoutingMessageHandler
+	for P2PGossipSync<G, U, L>
+where
+	U::Target: UtxoLookup,
+	L::Target: Logger,
 {
-	fn handle_node_announcement(&self, msg: &msgs::NodeAnnouncement) -> Result<bool, LightningError> {
+	fn handle_node_announcement(
+		&self, _their_node_id: Option<PublicKey>, msg: &msgs::NodeAnnouncement,
+	) -> Result<bool, LightningError> {
 		self.network_graph.update_node_from_announcement(msg)?;
-		Ok(msg.contents.excess_data.len() <=  MAX_EXCESS_BYTES_FOR_RELAY &&
-		   msg.contents.excess_address_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY &&
-		   msg.contents.excess_data.len() + msg.contents.excess_address_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY)
+		Ok(msg.contents.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
+			&& msg.contents.excess_address_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
+			&& msg.contents.excess_data.len() + msg.contents.excess_address_data.len()
+				<= MAX_EXCESS_BYTES_FOR_RELAY)
 	}
 
-	fn handle_channel_announcement(&self, msg: &msgs::ChannelAnnouncement) -> Result<bool, LightningError> {
-		self.network_graph.update_channel_from_announcement(msg, &*self.utxo_lookup.read().unwrap())?;
+	fn handle_channel_announcement(
+		&self, _their_node_id: Option<PublicKey>, msg: &msgs::ChannelAnnouncement,
+	) -> Result<bool, LightningError> {
+		self.network_graph
+			.update_channel_from_announcement(msg, &*self.utxo_lookup.read().unwrap())?;
 		Ok(msg.contents.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY)
 	}
 
-	fn handle_channel_update(&self, msg: &msgs::ChannelUpdate) -> Result<bool, LightningError> {
+	fn handle_channel_update(
+		&self, _their_node_id: Option<PublicKey>, msg: &msgs::ChannelUpdate,
+	) -> Result<bool, LightningError> {
 		self.network_graph.update_channel(msg)?;
 		Ok(msg.contents.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY)
 	}
 
-	fn get_next_channel_announcement(&self, starting_point: u64) -> Option<(ChannelAnnouncement, Option<ChannelUpdate>, Option<ChannelUpdate>)> {
+	fn get_next_channel_announcement(
+		&self, starting_point: u64,
+	) -> Option<(ChannelAnnouncement, Option<ChannelUpdate>, Option<ChannelUpdate>)> {
 		let mut channels = self.network_graph.channels.write().unwrap();
 		for (_, ref chan) in channels.range(starting_point..) {
 			if chan.announcement_message.is_some() {
@@ -525,13 +587,15 @@ where U::Target: UtxoLookup, L::Target: Logger
 		None
 	}
 
-	fn get_next_node_announcement(&self, starting_point: Option<&NodeId>) -> Option<NodeAnnouncement> {
+	fn get_next_node_announcement(
+		&self, starting_point: Option<&NodeId>,
+	) -> Option<NodeAnnouncement> {
 		let mut nodes = self.network_graph.nodes.write().unwrap();
 		let iter = if let Some(node_id) = starting_point {
-				nodes.range((Bound::Excluded(node_id), Bound::Unbounded))
-			} else {
-				nodes.range(..)
-			};
+			nodes.range((Bound::Excluded(node_id), Bound::Unbounded))
+		} else {
+			nodes.range(..)
+		};
 		for (_, ref node) in iter {
 			if let Some(node_info) = node.announcement_info.as_ref() {
 				if let NodeAnnouncementInfo::Relayed(announcement) = node_info {
@@ -542,6 +606,164 @@ where U::Target: UtxoLookup, L::Target: Logger
 		None
 	}
 
+	fn handle_reply_channel_range(
+		&self, _their_node_id: PublicKey, _msg: ReplyChannelRange,
+	) -> Result<(), LightningError> {
+		// We don't make queries, so should never receive replies. If, in the future, the set
+		// reconciliation extensions to gossip queries become broadly supported, we should revert
+		// this code to its state pre-0.0.106.
+		Ok(())
+	}
+
+	fn handle_reply_short_channel_ids_end(
+		&self, _their_node_id: PublicKey, _msg: ReplyShortChannelIdsEnd,
+	) -> Result<(), LightningError> {
+		// We don't make queries, so should never receive replies. If, in the future, the set
+		// reconciliation extensions to gossip queries become broadly supported, we should revert
+		// this code to its state pre-0.0.106.
+		Ok(())
+	}
+
+	/// Processes a query from a peer by finding announced/public channels whose funding UTXOs
+	/// are in the specified block range. Due to message size limits, large range
+	/// queries may result in several reply messages. This implementation enqueues
+	/// all reply messages into pending events. Each message will allocate just under 65KiB. A full
+	/// sync of the public routing table with 128k channels will generated 16 messages and allocate ~1MB.
+	/// Logic can be changed to reduce allocation if/when a full sync of the routing table impacts
+	/// memory constrained systems.
+	fn handle_query_channel_range(
+		&self, their_node_id: PublicKey, msg: QueryChannelRange,
+	) -> Result<(), LightningError> {
+		log_debug!(
+			self.logger,
+			"Handling query_channel_range peer={}, first_blocknum={}, number_of_blocks={}",
+			log_pubkey!(their_node_id),
+			msg.first_blocknum,
+			msg.number_of_blocks
+		);
+
+		let inclusive_start_scid = scid_from_parts(msg.first_blocknum as u64, 0, 0);
+
+		// We might receive valid queries with end_blocknum that would overflow SCID conversion.
+		// If so, we manually cap the ending block to avoid this overflow.
+		let exclusive_end_scid =
+			scid_from_parts(cmp::min(msg.end_blocknum() as u64, MAX_SCID_BLOCK), 0, 0);
+
+		// Per spec, we must reply to a query. Send an empty message when things are invalid.
+		if msg.chain_hash != self.network_graph.chain_hash
+			|| inclusive_start_scid.is_err()
+			|| exclusive_end_scid.is_err()
+			|| msg.number_of_blocks == 0
+		{
+			let mut pending_events = self.pending_events.lock().unwrap();
+			pending_events.push(MessageSendEvent::SendReplyChannelRange {
+				node_id: their_node_id.clone(),
+				msg: ReplyChannelRange {
+					chain_hash: msg.chain_hash.clone(),
+					first_blocknum: msg.first_blocknum,
+					number_of_blocks: msg.number_of_blocks,
+					sync_complete: true,
+					short_channel_ids: vec![],
+				},
+			});
+			return Err(LightningError {
+				err: String::from("query_channel_range could not be processed"),
+				action: ErrorAction::IgnoreError,
+			});
+		}
+
+		// Creates channel batches. We are not checking if the channel is routable
+		// (has at least one update). A peer may still want to know the channel
+		// exists even if its not yet routable.
+		let mut batches: Vec<Vec<u64>> = vec![Vec::with_capacity(MAX_SCIDS_PER_REPLY)];
+		let mut channels = self.network_graph.channels.write().unwrap();
+		for (_, ref chan) in
+			channels.range(inclusive_start_scid.unwrap()..exclusive_end_scid.unwrap())
+		{
+			if let Some(chan_announcement) = &chan.announcement_message {
+				// Construct a new batch if last one is full
+				if batches.last().unwrap().len() == batches.last().unwrap().capacity() {
+					batches.push(Vec::with_capacity(MAX_SCIDS_PER_REPLY));
+				}
+
+				let batch = batches.last_mut().unwrap();
+				batch.push(chan_announcement.contents.short_channel_id);
+			}
+		}
+		drop(channels);
+
+		let mut pending_events = self.pending_events.lock().unwrap();
+		let batch_count = batches.len();
+		let mut prev_batch_endblock = msg.first_blocknum;
+		for (batch_index, batch) in batches.into_iter().enumerate() {
+			// Per spec, the initial `first_blocknum` needs to be <= the query's `first_blocknum`
+			// and subsequent `first_blocknum`s must be >= the prior reply's `first_blocknum`.
+			//
+			// Additionally, c-lightning versions < 0.10 require that the `first_blocknum` of each
+			// reply is >= the previous reply's `first_blocknum` and either exactly the previous
+			// reply's `first_blocknum + number_of_blocks` or exactly one greater. This is a
+			// significant diversion from the requirements set by the spec, and, in case of blocks
+			// with no channel opens (e.g. empty blocks), requires that we use the previous value
+			// and *not* derive the first_blocknum from the actual first block of the reply.
+			let first_blocknum = prev_batch_endblock;
+
+			// Each message carries the number of blocks (from the `first_blocknum`) its contents
+			// fit in. Though there is no requirement that we use exactly the number of blocks its
+			// contents are from, except for the bogus requirements c-lightning enforces, above.
+			//
+			// Per spec, the last end block (ie `first_blocknum + number_of_blocks`) needs to be
+			// >= the query's end block. Thus, for the last reply, we calculate the difference
+			// between the query's end block and the start of the reply.
+			//
+			// Overflow safe since end_blocknum=msg.first_block_num+msg.number_of_blocks and
+			// first_blocknum will be either msg.first_blocknum or a higher block height.
+			let (sync_complete, number_of_blocks) = if batch_index == batch_count - 1 {
+				(true, msg.end_blocknum() - first_blocknum)
+			}
+			// Prior replies should use the number of blocks that fit into the reply. Overflow
+			// safe since first_blocknum is always <= last SCID's block.
+			else {
+				(false, block_from_scid(*batch.last().unwrap()) - first_blocknum)
+			};
+
+			prev_batch_endblock = first_blocknum + number_of_blocks;
+
+			pending_events.push(MessageSendEvent::SendReplyChannelRange {
+				node_id: their_node_id.clone(),
+				msg: ReplyChannelRange {
+					chain_hash: msg.chain_hash.clone(),
+					first_blocknum,
+					number_of_blocks,
+					sync_complete,
+					short_channel_ids: batch,
+				},
+			});
+		}
+
+		Ok(())
+	}
+
+	fn handle_query_short_channel_ids(
+		&self, _their_node_id: PublicKey, _msg: QueryShortChannelIds,
+	) -> Result<(), LightningError> {
+		// TODO
+		Err(LightningError {
+			err: String::from("Not implemented"),
+			action: ErrorAction::IgnoreError,
+		})
+	}
+
+	fn processing_queue_high(&self) -> bool {
+		self.network_graph.pending_checks.too_many_checks_pending()
+	}
+}
+
+impl<G: Deref<Target = NetworkGraph<L>>, U: Deref, L: Deref> BaseMessageHandler
+	for P2PGossipSync<G, U, L>
+where
+	U::Target: UtxoLookup,
+	L::Target: Logger,
+{
 	/// Initiates a stateless sync of routing gossip information with a peer
 	/// using [`gossip_queries`]. The default strategy used by this implementation
 	/// is to sync the full block range with several peers.
@@ -557,7 +779,9 @@ where U::Target: UtxoLookup, L::Target: Logger
 	/// [`query_channel_range`]: msgs::QueryChannelRange
 	/// [`query_scid`]: msgs::QueryShortChannelIds
 	/// [`reply_scids_end`]: msgs::ReplyShortChannelIdsEnd
-	fn peer_connected(&self, their_node_id: &PublicKey, init_msg: &Init, _inbound: bool) -> Result<(), ()> {
+	fn peer_connected(
+		&self, their_node_id: PublicKey, init_msg: &Init, _inbound: bool,
+	) -> Result<(), ()> {
 		// We will only perform a sync with peers that support gossip_queries.
 		if !init_msg.features.supports_gossip_queries() {
 			// Don't disconnect peers for not supporting gossip queries. We may wish to have
@@ -614,14 +838,17 @@ where U::Target: UtxoLookup, L::Target: Logger
 		// our peers and never receiving gossip from peers at all, we send all of our peers a
 		// `gossip_timestamp_filter`, with the filter time set either two weeks ago or an hour ago.
 		//
-		// For no-std builds, we bury our head in the sand and do a full sync on each connection.
+		// For non-`std` builds, we bury our head in the sand and do a full sync on each connection.
 		#[allow(unused_mut, unused_assignments)]
 		let mut gossip_start_time = 0;
 		#[allow(unused)]
 		let should_sync = self.should_request_full_sync();
 		#[cfg(feature = "std")]
 		{
-			gossip_start_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
+			gossip_start_time = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("Time must be > 1970")
+				.as_secs();
 			if should_sync {
 				gossip_start_time -= 60 * 60 * 24 * 7 * 2; // 2 weeks ago
 			} else {
@@ -641,131 +868,7 @@ where U::Target: UtxoLookup, L::Target: Logger
 		Ok(())
 	}
 
-	fn handle_reply_channel_range(&self, _their_node_id: &PublicKey, _msg: ReplyChannelRange) -> Result<(), LightningError> {
-		// We don't make queries, so should never receive replies. If, in the future, the set
-		// reconciliation extensions to gossip queries become broadly supported, we should revert
-		// this code to its state pre-0.0.106.
-		Ok(())
-	}
-
-	fn handle_reply_short_channel_ids_end(&self, _their_node_id: &PublicKey, _msg: ReplyShortChannelIdsEnd) -> Result<(), LightningError> {
-		// We don't make queries, so should never receive replies. If, in the future, the set
-		// reconciliation extensions to gossip queries become broadly supported, we should revert
-		// this code to its state pre-0.0.106.
-		Ok(())
-	}
-
-	/// Processes a query from a peer by finding announced/public channels whose funding UTXOs
-	/// are in the specified block range. Due to message size limits, large range
-	/// queries may result in several reply messages. This implementation enqueues
-	/// all reply messages into pending events. Each message will allocate just under 65KiB. A full
-	/// sync of the public routing table with 128k channels will generated 16 messages and allocate ~1MB.
-	/// Logic can be changed to reduce allocation if/when a full sync of the routing table impacts
-	/// memory constrained systems.
-	fn handle_query_channel_range(&self, their_node_id: &PublicKey, msg: QueryChannelRange) -> Result<(), LightningError> {
-		log_debug!(self.logger, "Handling query_channel_range peer={}, first_blocknum={}, number_of_blocks={}", log_pubkey!(their_node_id), msg.first_blocknum, msg.number_of_blocks);
-
-		let inclusive_start_scid = scid_from_parts(msg.first_blocknum as u64, 0, 0);
-
-		// We might receive valid queries with end_blocknum that would overflow SCID conversion.
-		// If so, we manually cap the ending block to avoid this overflow.
-		let exclusive_end_scid = scid_from_parts(cmp::min(msg.end_blocknum() as u64, MAX_SCID_BLOCK), 0, 0);
-
-		// Per spec, we must reply to a query. Send an empty message when things are invalid.
-		if msg.chain_hash != self.network_graph.chain_hash || inclusive_start_scid.is_err() || exclusive_end_scid.is_err() || msg.number_of_blocks == 0 {
-			let mut pending_events = self.pending_events.lock().unwrap();
-			pending_events.push(MessageSendEvent::SendReplyChannelRange {
-				node_id: their_node_id.clone(),
-				msg: ReplyChannelRange {
-					chain_hash: msg.chain_hash.clone(),
-					first_blocknum: msg.first_blocknum,
-					number_of_blocks: msg.number_of_blocks,
-					sync_complete: true,
-					short_channel_ids: vec![],
-				}
-			});
-			return Err(LightningError {
-				err: String::from("query_channel_range could not be processed"),
-				action: ErrorAction::IgnoreError,
-			});
-		}
-
-		// Creates channel batches. We are not checking if the channel is routable
-		// (has at least one update). A peer may still want to know the channel
-		// exists even if its not yet routable.
-		let mut batches: Vec<Vec<u64>> = vec![Vec::with_capacity(MAX_SCIDS_PER_REPLY)];
-		let mut channels = self.network_graph.channels.write().unwrap();
-		for (_, ref chan) in channels.range(inclusive_start_scid.unwrap()..exclusive_end_scid.unwrap()) {
-			if let Some(chan_announcement) = &chan.announcement_message {
-				// Construct a new batch if last one is full
-				if batches.last().unwrap().len() == batches.last().unwrap().capacity() {
-					batches.push(Vec::with_capacity(MAX_SCIDS_PER_REPLY));
-				}
-
-				let batch = batches.last_mut().unwrap();
-				batch.push(chan_announcement.contents.short_channel_id);
-			}
-		}
-		drop(channels);
-
-		let mut pending_events = self.pending_events.lock().unwrap();
-		let batch_count = batches.len();
-		let mut prev_batch_endblock = msg.first_blocknum;
-		for (batch_index, batch) in batches.into_iter().enumerate() {
-			// Per spec, the initial `first_blocknum` needs to be <= the query's `first_blocknum`
-			// and subsequent `first_blocknum`s must be >= the prior reply's `first_blocknum`.
-			//
-			// Additionally, c-lightning versions < 0.10 require that the `first_blocknum` of each
-			// reply is >= the previous reply's `first_blocknum` and either exactly the previous
-			// reply's `first_blocknum + number_of_blocks` or exactly one greater. This is a
-			// significant diversion from the requirements set by the spec, and, in case of blocks
-			// with no channel opens (e.g. empty blocks), requires that we use the previous value
-			// and *not* derive the first_blocknum from the actual first block of the reply.
-			let first_blocknum = prev_batch_endblock;
-
-			// Each message carries the number of blocks (from the `first_blocknum`) its contents
-			// fit in. Though there is no requirement that we use exactly the number of blocks its
-			// contents are from, except for the bogus requirements c-lightning enforces, above.
-			//
-			// Per spec, the last end block (ie `first_blocknum + number_of_blocks`) needs to be
-			// >= the query's end block. Thus, for the last reply, we calculate the difference
-			// between the query's end block and the start of the reply.
-			//
-			// Overflow safe since end_blocknum=msg.first_block_num+msg.number_of_blocks and
-			// first_blocknum will be either msg.first_blocknum or a higher block height.
-			let (sync_complete, number_of_blocks) = if batch_index == batch_count-1 {
-				(true, msg.end_blocknum() - first_blocknum)
-			}
-			// Prior replies should use the number of blocks that fit into the reply. Overflow
-			// safe since first_blocknum is always <= last SCID's block.
-			else {
-				(false, block_from_scid(*batch.last().unwrap()) - first_blocknum)
-			};
-
-			prev_batch_endblock = first_blocknum + number_of_blocks;
-
-			pending_events.push(MessageSendEvent::SendReplyChannelRange {
-				node_id: their_node_id.clone(),
-				msg: ReplyChannelRange {
-					chain_hash: msg.chain_hash.clone(),
-					first_blocknum,
-					number_of_blocks,
-					sync_complete,
-					short_channel_ids: batch,
-				}
-			});
-		}
-
-		Ok(())
-	}
-
-	fn handle_query_short_channel_ids(&self, _their_node_id: &PublicKey, _msg: QueryShortChannelIds) -> Result<(), LightningError> {
-		// TODO
-		Err(LightningError {
-			err: String::from("Not implemented"),
-			action: ErrorAction::IgnoreError,
-		})
-	}
+	fn peer_disconnected(&self, _their_node_id: PublicKey) {}
 
 	fn provided_node_features(&self) -> NodeFeatures {
 		let mut features = NodeFeatures::empty();
@@ -773,22 +876,12 @@ where U::Target: UtxoLookup, L::Target: Logger
 		features
 	}
 
-	fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures {
+	fn provided_init_features(&self, _their_node_id: PublicKey) -> InitFeatures {
 		let mut features = InitFeatures::empty();
 		features.set_gossip_queries_optional();
 		features
 	}
 
-	fn processing_queue_high(&self) -> bool {
-		self.network_graph.pending_checks.too_many_checks_pending()
-	}
-}
-
-impl<G: Deref<Target=NetworkGraph<L>>, U: Deref, L: Deref> MessageSendEventsProvider for P2PGossipSync<G, U, L>
-where
-	U::Target: UtxoLookup,
-	L::Target: Logger,
-{
 	fn get_and_clear_pending_msg_events(&self) -> Vec<MessageSendEvent> {
 		let mut ret = Vec::new();
 		let mut pending_events = self.pending_events.lock().unwrap();
@@ -834,7 +927,15 @@ pub struct ChannelUpdateInfo {
 
 impl fmt::Display for ChannelUpdateInfo {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		write!(f, "last_update {}, enabled {}, cltv_expiry_delta {}, htlc_minimum_msat {}, fees {:?}", self.last_update, self.enabled, self.cltv_expiry_delta, self.htlc_minimum_msat, self.fees)?;
+		write!(
+			f,
+			"last_update {}, enabled {}, cltv_expiry_delta {}, htlc_minimum_msat {}, fees {:?}",
+			self.last_update,
+			self.enabled,
+			self.cltv_expiry_delta,
+			self.htlc_minimum_msat,
+			self.fees
+		)?;
 		Ok(())
 	}
 }
@@ -942,7 +1043,7 @@ pub struct ChannelInfo {
 	/// Not stored if contains excess data to prevent DoS.
 	pub announcement_message: Option<ChannelAnnouncement>,
 	/// The timestamp when we received the announcement, if we are running with feature = "std"
-	/// (which we can probably assume we are - no-std environments probably won't have a full
+	/// (which we can probably assume we are - non-`std` environments probably won't have a full
 	/// network graph in memory!).
 	announcement_received_time: u64,
 	/// RGB contract ID
@@ -951,22 +1052,24 @@ pub struct ChannelInfo {
 
 impl PartialEq for ChannelInfo {
 	fn eq(&self, o: &ChannelInfo) -> bool {
-		self.features == o.features &&
-			self.node_one == o.node_one &&
-			self.one_to_two == o.one_to_two &&
-			self.node_two == o.node_two &&
-			self.two_to_one == o.two_to_one &&
-			self.capacity_sats == o.capacity_sats &&
-			self.announcement_message == o.announcement_message &&
-			self.announcement_received_time == o.announcement_received_time
+		self.features == o.features
+			&& self.node_one == o.node_one
+			&& self.one_to_two == o.one_to_two
+			&& self.node_two == o.node_two
+			&& self.two_to_one == o.two_to_one
+			&& self.capacity_sats == o.capacity_sats
+			&& self.announcement_message == o.announcement_message
+			&& self.announcement_received_time == o.announcement_received_time
 	}
 }
 
 impl ChannelInfo {
 	/// Returns a [`DirectedChannelInfo`] for the channel directed to the given `target` from a
 	/// returned `source`, or `None` if `target` is not one of the channel's counterparties.
-	pub fn as_directed_to(&self, target: &NodeId) -> Option<(DirectedChannelInfo, &NodeId)> {
-		if self.one_to_two.is_none() || self.two_to_one.is_none() { return None; }
+	pub fn as_directed_to(&self, target: &NodeId) -> Option<(DirectedChannelInfo<'_>, &NodeId)> {
+		if self.one_to_two.is_none() || self.two_to_one.is_none() {
+			return None;
+		}
 		let (direction, source, outbound) = {
 			if target == &self.node_one {
 				(self.two_to_one.as_ref(), &self.node_two, false)
@@ -982,8 +1085,10 @@ impl ChannelInfo {
 
 	/// Returns a [`DirectedChannelInfo`] for the channel directed from the given `source` to a
 	/// returned `target`, or `None` if `source` is not one of the channel's counterparties.
-	pub fn as_directed_from(&self, source: &NodeId) -> Option<(DirectedChannelInfo, &NodeId)> {
-		if self.one_to_two.is_none() || self.two_to_one.is_none() { return None; }
+	pub fn as_directed_from(&self, source: &NodeId) -> Option<(DirectedChannelInfo<'_>, &NodeId)> {
+		if self.one_to_two.is_none() || self.two_to_one.is_none() {
+			return None;
+		}
 		let (direction, target, outbound) = {
 			if source == &self.node_one {
 				(self.one_to_two.as_ref(), &self.node_two, true)
@@ -1010,8 +1115,15 @@ impl ChannelInfo {
 
 impl fmt::Display for ChannelInfo {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		write!(f, "features: {}, node_one: {}, one_to_two: {:?}, node_two: {}, two_to_one: {:?}",
-		   log_bytes!(self.features.encode()), &self.node_one, self.one_to_two, &self.node_two, self.two_to_one)?;
+		write!(
+			f,
+			"features: {}, node_one: {}, one_to_two: {:?}, node_two: {}, two_to_one: {:?}",
+			log_bytes!(self.features.encode()),
+			&self.node_one,
+			self.one_to_two,
+			&self.node_two,
+			self.two_to_one
+		)?;
 		Ok(())
 	}
 }
@@ -1082,7 +1194,10 @@ impl Readable for ChannelInfo {
 			two_to_one: two_to_one_wrap.map(|w| w.0).unwrap_or(None),
 			capacity_sats: _init_tlv_based_struct_field!(capacity_sats, required),
 			announcement_message: _init_tlv_based_struct_field!(announcement_message, required),
-			announcement_received_time: _init_tlv_based_struct_field!(announcement_received_time, (default_value, 0)),
+			announcement_received_time: _init_tlv_based_struct_field!(
+				announcement_received_time,
+				(default_value, 0)
+			),
 			node_one_counter: u32::max_value(),
 			node_two_counter: u32::max_value(),
 			contract_id: _init_tlv_based_struct_field!(contract_id, option),
@@ -1105,7 +1220,9 @@ pub struct DirectedChannelInfo<'a> {
 
 impl<'a> DirectedChannelInfo<'a> {
 	#[inline]
-	fn new(channel: &'a ChannelInfo, direction: &'a ChannelUpdateInfo, from_node_one: bool) -> Self {
+	fn new(
+		channel: &'a ChannelInfo, direction: &'a ChannelUpdateInfo, from_node_one: bool,
+	) -> Self {
 		let (source_counter, target_counter) = if from_node_one {
 			(channel.node_one_counter, channel.node_two_counter)
 		} else {
@@ -1116,7 +1233,9 @@ impl<'a> DirectedChannelInfo<'a> {
 
 	/// Returns information for the channel.
 	#[inline]
-	pub fn channel(&self) -> &'a ChannelInfo { self.channel }
+	pub fn channel(&self) -> &'a ChannelInfo {
+		self.channel
+	}
 
 	/// Returns the [`EffectiveCapacity`] of the channel in the direction.
 	///
@@ -1145,34 +1264,50 @@ impl<'a> DirectedChannelInfo<'a> {
 
 	/// Returns information for the direction.
 	#[inline]
-	pub(super) fn direction(&self) -> &'a ChannelUpdateInfo { self.direction }
+	pub(super) fn direction(&self) -> &'a ChannelUpdateInfo {
+		self.direction
+	}
 
 	/// Returns the `node_id` of the source hop.
 	///
 	/// Refers to the `node_id` forwarding the payment to the next hop.
 	#[inline]
-	pub fn source(&self) -> &'a NodeId { if self.from_node_one { &self.channel.node_one } else { &self.channel.node_two } }
+	pub fn source(&self) -> &'a NodeId {
+		if self.from_node_one {
+			&self.channel.node_one
+		} else {
+			&self.channel.node_two
+		}
+	}
 
 	/// Returns the `node_id` of the target hop.
 	///
 	/// Refers to the `node_id` receiving the payment from the previous hop.
 	#[inline]
-	pub fn target(&self) -> &'a NodeId { if self.from_node_one { &self.channel.node_two } else { &self.channel.node_one } }
+	pub fn target(&self) -> &'a NodeId {
+		if self.from_node_one {
+			&self.channel.node_two
+		} else {
+			&self.channel.node_one
+		}
+	}
 
 	/// Returns the source node's counter
 	#[inline(always)]
-	pub(super) fn source_counter(&self) -> u32 { self.source_counter }
+	pub(super) fn source_counter(&self) -> u32 {
+		self.source_counter
+	}
 
 	/// Returns the target node's counter
 	#[inline(always)]
-	pub(super) fn target_counter(&self) -> u32 { self.target_counter }
+	pub(super) fn target_counter(&self) -> u32 {
+		self.target_counter
+	}
 }
 
 impl<'a> fmt::Debug for DirectedChannelInfo<'a> {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		f.debug_struct("DirectedChannelInfo")
-			.field("channel", &self.channel)
-			.finish()
+		f.debug_struct("DirectedChannelInfo").field("channel", &self.channel).finish()
 	}
 }
 
@@ -1199,7 +1334,7 @@ pub enum EffectiveCapacity {
 		/// The funding amount denominated in millisatoshi.
 		capacity_msat: u64,
 		/// The maximum HTLC amount denominated in millisatoshi.
-		htlc_maximum_msat: u64
+		htlc_maximum_msat: u64,
 	},
 	/// A capacity sufficient to route any payment, typically used for private channels provided by
 	/// an invoice.
@@ -1272,16 +1407,11 @@ pub enum NodeAnnouncementInfo {
 }
 
 impl NodeAnnouncementInfo {
-
 	/// Protocol features the node announced support for
 	pub fn features(&self) -> &NodeFeatures {
 		match self {
-			NodeAnnouncementInfo::Relayed(relayed) => {
-				&relayed.contents.features
-			}
-			NodeAnnouncementInfo::Local(local) => {
-				&local.features
-			}
+			NodeAnnouncementInfo::Relayed(relayed) => &relayed.contents.features,
+			NodeAnnouncementInfo::Local(local) => &local.features,
 		}
 	}
 
@@ -1290,24 +1420,16 @@ impl NodeAnnouncementInfo {
 	/// Value may or may not be a timestamp, depending on the policy of the origin node.
 	pub fn last_update(&self) -> u32 {
 		match self {
-			NodeAnnouncementInfo::Relayed(relayed) => {
-				relayed.contents.timestamp
-			}
-			NodeAnnouncementInfo::Local(local) => {
-				local.last_update
-			}
+			NodeAnnouncementInfo::Relayed(relayed) => relayed.contents.timestamp,
+			NodeAnnouncementInfo::Local(local) => local.last_update,
 		}
 	}
 
 	/// Color assigned to the node
 	pub fn rgb(&self) -> [u8; 3] {
 		match self {
-			NodeAnnouncementInfo::Relayed(relayed) => {
-				relayed.contents.rgb
-			}
-			NodeAnnouncementInfo::Local(local) => {
-				local.rgb
-			}
+			NodeAnnouncementInfo::Relayed(relayed) => relayed.contents.rgb,
+			NodeAnnouncementInfo::Local(local) => local.rgb,
 		}
 	}
 
@@ -1316,24 +1438,16 @@ impl NodeAnnouncementInfo {
 	/// May be invalid or malicious (eg control chars), should not be exposed to the user.
 	pub fn alias(&self) -> &NodeAlias {
 		match self {
-			NodeAnnouncementInfo::Relayed(relayed) => {
-				&relayed.contents.alias
-			}
-			NodeAnnouncementInfo::Local(local) => {
-				&local.alias
-			}
+			NodeAnnouncementInfo::Relayed(relayed) => &relayed.contents.alias,
+			NodeAnnouncementInfo::Local(local) => &local.alias,
 		}
 	}
 
 	/// Internet-level addresses via which one can connect to the node
 	pub fn addresses(&self) -> &[SocketAddress] {
 		match self {
-			NodeAnnouncementInfo::Relayed(relayed) => {
-				&relayed.contents.addresses
-			}
-			NodeAnnouncementInfo::Local(local) => {
-				&local.addresses
-			}
+			NodeAnnouncementInfo::Relayed(relayed) => &relayed.contents.addresses,
+			NodeAnnouncementInfo::Local(local) => &local.addresses,
 		}
 	}
 
@@ -1342,12 +1456,8 @@ impl NodeAnnouncementInfo {
 	/// Not stored if contains excess data to prevent DoS.
 	pub fn announcement_message(&self) -> Option<&NodeAnnouncement> {
 		match self {
-			NodeAnnouncementInfo::Relayed(announcement) => {
-				Some(announcement)
-			}
-			NodeAnnouncementInfo::Local(_) => {
-				None
-			}
+			NodeAnnouncementInfo::Relayed(announcement) => Some(announcement),
+			NodeAnnouncementInfo::Local(_) => None,
 		}
 	}
 }
@@ -1473,8 +1583,12 @@ impl NodeInfo {
 
 impl fmt::Display for NodeInfo {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		write!(f, " channels: {:?}, announcement_info: {:?}",
-			&self.channels[..], self.announcement_info)?;
+		write!(
+			f,
+			" channels: {:?}, announcement_info: {:?}",
+			&self.channels[..],
+			self.announcement_info
+		)?;
 		Ok(())
 	}
 }
@@ -1502,7 +1616,7 @@ impl MaybeReadable for NodeAnnouncementInfoDeserWrapper {
 			Ok(node_announcement_info) => return Ok(Some(Self(node_announcement_info))),
 			Err(_) => {
 				copy(reader, &mut sink()).unwrap();
-				return Ok(None)
+				return Ok(None);
 			},
 		};
 	}
@@ -1521,7 +1635,8 @@ impl Readable for NodeInfo {
 			(4, channels, required_vec),
 		});
 		let _: Option<RoutingFees> = _lowest_inbound_channel_fees;
-		let announcement_info_wrap: Option<NodeAnnouncementInfoDeserWrapper> = announcement_info_wrap;
+		let announcement_info_wrap: Option<NodeAnnouncementInfoDeserWrapper> =
+			announcement_info_wrap;
 
 		Ok(NodeInfo {
 			announcement_info: announcement_info_wrap.map(|w| w.0),
@@ -1534,7 +1649,10 @@ impl Readable for NodeInfo {
 const SERIALIZATION_VERSION: u8 = 1;
 const MIN_SERIALIZATION_VERSION: u8 = 1;
 
-impl<L: Deref> Writeable for NetworkGraph<L> where L::Target: Logger {
+impl<L: Deref> Writeable for NetworkGraph<L>
+where
+	L::Target: Logger,
+{
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
 		self.test_node_counter_consistency();
 
@@ -1562,14 +1680,16 @@ impl<L: Deref> Writeable for NetworkGraph<L> where L::Target: Logger {
 	}
 }
 
-impl<L: Deref> ReadableArgs<L> for NetworkGraph<L> where L::Target: Logger {
+impl<L: Deref> ReadableArgs<L> for NetworkGraph<L>
+where
+	L::Target: Logger,
+{
 	fn read<R: io::Read>(reader: &mut R, logger: L) -> Result<NetworkGraph<L>, DecodeError> {
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
 		let chain_hash: ChainHash = Readable::read(reader)?;
 		let channels_count: u64 = Readable::read(reader)?;
-		// In Nov, 2023 there were about 15,000 nodes; we cap allocations to 1.5x that.
-		let mut channels = IndexedMap::with_capacity(cmp::min(channels_count as usize, 22500));
+		let mut channels = IndexedMap::with_capacity(CHAN_COUNT_ESTIMATE);
 		for _ in 0..channels_count {
 			let chan_id: u64 = Readable::read(reader)?;
 			let chan_info: ChannelInfo = Readable::read(reader)?;
@@ -1578,9 +1698,10 @@ impl<L: Deref> ReadableArgs<L> for NetworkGraph<L> where L::Target: Logger {
 		let nodes_count: u64 = Readable::read(reader)?;
 		// There shouldn't be anywhere near `u32::MAX` nodes, and we need some headroom to insert
 		// new nodes during sync, so reject any graphs claiming more than `u32::MAX / 2` nodes.
-		if nodes_count > u32::max_value() as u64 / 2 { return Err(DecodeError::InvalidValue); }
-		// In Nov, 2023 there were about 69K channels; we cap allocations to 1.5x that.
-		let mut nodes = IndexedMap::with_capacity(cmp::min(nodes_count as usize, 103500));
+		if nodes_count > u32::max_value() as u64 / 2 {
+			return Err(DecodeError::InvalidValue);
+		}
+		let mut nodes = IndexedMap::with_capacity(NODE_COUNT_ESTIMATE);
 		for i in 0..nodes_count {
 			let node_id = Readable::read(reader)?;
 			let mut node_info: NodeInfo = Readable::read(reader)?;
@@ -1616,7 +1737,10 @@ impl<L: Deref> ReadableArgs<L> for NetworkGraph<L> where L::Target: Logger {
 	}
 }
 
-impl<L: Deref> fmt::Display for NetworkGraph<L> where L::Target: Logger {
+impl<L: Deref> fmt::Display for NetworkGraph<L>
+where
+	L::Target: Logger,
+{
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
 		writeln!(f, "Network map\n[Channels]")?;
 		for (key, val) in self.channels.read().unwrap().unordered_iter() {
@@ -1631,28 +1755,49 @@ impl<L: Deref> fmt::Display for NetworkGraph<L> where L::Target: Logger {
 }
 
 impl<L: Deref> Eq for NetworkGraph<L> where L::Target: Logger {}
-impl<L: Deref> PartialEq for NetworkGraph<L> where L::Target: Logger {
+impl<L: Deref> PartialEq for NetworkGraph<L>
+where
+	L::Target: Logger,
+{
 	fn eq(&self, other: &Self) -> bool {
 		// For a total lockorder, sort by position in memory and take the inner locks in that order.
 		// (Assumes that we can't move within memory while a lock is held).
 		let ord = ((self as *const _) as usize) < ((other as *const _) as usize);
 		let a = if ord { (&self.channels, &self.nodes) } else { (&other.channels, &other.nodes) };
 		let b = if ord { (&other.channels, &other.nodes) } else { (&self.channels, &self.nodes) };
-		let (channels_a, channels_b) = (a.0.unsafe_well_ordered_double_lock_self(), b.0.unsafe_well_ordered_double_lock_self());
-		let (nodes_a, nodes_b) = (a.1.unsafe_well_ordered_double_lock_self(), b.1.unsafe_well_ordered_double_lock_self());
+		let (channels_a, channels_b) = (
+			a.0.unsafe_well_ordered_double_lock_self(),
+			b.0.unsafe_well_ordered_double_lock_self(),
+		);
+		let (nodes_a, nodes_b) = (
+			a.1.unsafe_well_ordered_double_lock_self(),
+			b.1.unsafe_well_ordered_double_lock_self(),
+		);
 		self.chain_hash.eq(&other.chain_hash) && channels_a.eq(&channels_b) && nodes_a.eq(&nodes_b)
 	}
 }
 
-impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
+// In Jan, 2025 there were about 49K channels.
+// We over-allocate by a bit because 20% more is better than the double we get if we're slightly
+// too low
+const CHAN_COUNT_ESTIMATE: usize = 60_000;
+// In Jan, 2025 there were about 15K nodes
+// We over-allocate by a bit because 33% more is better than the double we get if we're slightly
+// too low
+const NODE_COUNT_ESTIMATE: usize = 20_000;
+
+impl<L: Deref> NetworkGraph<L>
+where
+	L::Target: Logger,
+{
 	/// Creates a new, empty, network graph.
 	pub fn new(network: Network, logger: L) -> NetworkGraph<L> {
 		Self {
 			secp_ctx: Secp256k1::verification_only(),
 			chain_hash: ChainHash::using_genesis_block(network),
 			logger,
-			channels: RwLock::new(IndexedMap::new()),
-			nodes: RwLock::new(IndexedMap::new()),
+			channels: RwLock::new(IndexedMap::with_capacity(CHAN_COUNT_ESTIMATE)),
+			nodes: RwLock::new(IndexedMap::with_capacity(NODE_COUNT_ESTIMATE)),
 			next_node_counter: AtomicUsize::new(0),
 			removed_node_counters: Mutex::new(Vec::new()),
 			last_rapid_gossip_sync_timestamp: Mutex::new(None),
@@ -1663,7 +1808,8 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	}
 
 	fn test_node_counter_consistency(&self) {
-		#[cfg(debug_assertions)] {
+		#[cfg(any(test, fuzzing))]
+		{
 			let channels = self.channels.read().unwrap();
 			let nodes = self.nodes.read().unwrap();
 			let removed_node_counters = self.removed_node_counters.lock().unwrap();
@@ -1708,7 +1854,8 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 		ReadOnlyNetworkGraph {
 			channels,
 			nodes,
-			max_node_counter: (self.next_node_counter.load(Ordering::Acquire) as u32).saturating_sub(1),
+			max_node_counter: (self.next_node_counter.load(Ordering::Acquire) as u32)
+				.saturating_sub(1),
 		}
 	}
 
@@ -1721,7 +1868,10 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// Update the unix timestamp provided by the most recent rapid gossip sync.
 	/// This should be done automatically by the rapid sync process after every sync completion.
 	pub fn set_last_rapid_gossip_sync_timestamp(&self, last_rapid_gossip_sync_timestamp: u32) {
-		self.last_rapid_gossip_sync_timestamp.lock().unwrap().replace(last_rapid_gossip_sync_timestamp);
+		self.last_rapid_gossip_sync_timestamp
+			.lock()
+			.unwrap()
+			.replace(last_rapid_gossip_sync_timestamp);
 	}
 
 	/// Clears the `NodeAnnouncementInfo` field for all nodes in the `NetworkGraph` for testing
@@ -1739,7 +1889,21 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// You probably don't want to call this directly, instead relying on a P2PGossipSync's
 	/// RoutingMessageHandler implementation to call it indirectly. This may be useful to accept
 	/// routing messages from a source using a protocol other than the lightning P2P protocol.
-	pub fn update_node_from_announcement(&self, msg: &msgs::NodeAnnouncement) -> Result<(), LightningError> {
+	pub fn update_node_from_announcement(
+		&self, msg: &msgs::NodeAnnouncement,
+	) -> Result<(), LightningError> {
+		// First check if we have the announcement already to avoid the CPU cost of validating a
+		// redundant announcement.
+		if let Some(node) = self.nodes.read().unwrap().get(&msg.contents.node_id) {
+			if let Some(node_info) = node.announcement_info.as_ref() {
+				if node_info.last_update() == msg.contents.timestamp {
+					return Err(LightningError {
+						err: "Update had the same timestamp as last processed update".to_owned(),
+						action: ErrorAction::IgnoreDuplicateGossip,
+					});
+				}
+			}
+		}
 		verify_node_announcement(msg, &self.secp_ctx)?;
 		self.update_node_from_announcement_intern(&msg.contents, Some(&msg))
 	}
@@ -1748,49 +1912,64 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// given node announcement without verifying the associated signatures. Because we aren't
 	/// given the associated signatures here we cannot relay the node announcement to any of our
 	/// peers.
-	pub fn update_node_from_unsigned_announcement(&self, msg: &msgs::UnsignedNodeAnnouncement) -> Result<(), LightningError> {
+	pub fn update_node_from_unsigned_announcement(
+		&self, msg: &msgs::UnsignedNodeAnnouncement,
+	) -> Result<(), LightningError> {
 		self.update_node_from_announcement_intern(msg, None)
 	}
 
-	fn update_node_from_announcement_intern(&self, msg: &msgs::UnsignedNodeAnnouncement, full_msg: Option<&msgs::NodeAnnouncement>) -> Result<(), LightningError> {
+	fn update_node_from_announcement_intern(
+		&self, msg: &msgs::UnsignedNodeAnnouncement, full_msg: Option<&msgs::NodeAnnouncement>,
+	) -> Result<(), LightningError> {
 		let mut nodes = self.nodes.write().unwrap();
 		match nodes.get_mut(&msg.node_id) {
 			None => {
 				core::mem::drop(nodes);
 				self.pending_checks.check_hold_pending_node_announcement(msg, full_msg)?;
-				Err(LightningError{err: "No existing channels for node_announcement".to_owned(), action: ErrorAction::IgnoreError})
+				Err(LightningError {
+					err: "No existing channels for node_announcement".to_owned(),
+					action: ErrorAction::IgnoreError,
+				})
 			},
 			Some(node) => {
 				if let Some(node_info) = node.announcement_info.as_ref() {
 					// The timestamp field is somewhat of a misnomer - the BOLTs use it to order
 					// updates to ensure you always have the latest one, only vaguely suggesting
 					// that it be at least the current time.
-					if node_info.last_update()  > msg.timestamp {
-						return Err(LightningError{err: "Update older than last processed update".to_owned(), action: ErrorAction::IgnoreDuplicateGossip});
-					} else if node_info.last_update()  == msg.timestamp {
-						return Err(LightningError{err: "Update had the same timestamp as last processed update".to_owned(), action: ErrorAction::IgnoreDuplicateGossip});
+					if node_info.last_update() > msg.timestamp {
+						return Err(LightningError {
+							err: "Update older than last processed update".to_owned(),
+							action: ErrorAction::IgnoreDuplicateGossip,
+						});
+					} else if node_info.last_update() == msg.timestamp {
+						return Err(LightningError {
+							err: "Update had the same timestamp as last processed update"
+								.to_owned(),
+							action: ErrorAction::IgnoreDuplicateGossip,
+						});
 					}
 				}
 
-				let should_relay =
-					msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY &&
-						msg.excess_address_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY &&
-						msg.excess_data.len() + msg.excess_address_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY;
+				let should_relay = msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
+					&& msg.excess_address_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
+					&& msg.excess_data.len() + msg.excess_address_data.len()
+						<= MAX_EXCESS_BYTES_FOR_RELAY;
 
-				node.announcement_info = if let (Some(signed_announcement), true) = (full_msg, should_relay) {
-					Some(NodeAnnouncementInfo::Relayed(signed_announcement.clone()))
-				} else {
-					Some(NodeAnnouncementInfo::Local(NodeAnnouncementDetails {
-						features: msg.features.clone(),
-						last_update: msg.timestamp,
-						rgb: msg.rgb,
-						alias: msg.alias,
-						addresses: msg.addresses.clone(),
-					}))
-				};
+				node.announcement_info =
+					if let (Some(signed_announcement), true) = (full_msg, should_relay) {
+						Some(NodeAnnouncementInfo::Relayed(signed_announcement.clone()))
+					} else {
+						Some(NodeAnnouncementInfo::Local(NodeAnnouncementDetails {
+							features: msg.features.clone(),
+							last_update: msg.timestamp,
+							rgb: msg.rgb,
+							alias: msg.alias,
+							addresses: msg.addresses.clone(),
+						}))
+					};
 
 				Ok(())
-			}
+			},
 		}
 	}
 
@@ -1808,6 +1987,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	where
 		U::Target: UtxoLookup,
 	{
+		self.pre_channel_announcement_validation_check(&msg.contents, utxo_lookup)?;
 		verify_channel_announcement(msg, &self.secp_ctx)?;
 		self.update_channel_from_unsigned_announcement_intern(&msg.contents, Some(msg), utxo_lookup)
 	}
@@ -1820,7 +2000,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	///
 	/// This will skip verification of if the channel is actually on-chain.
 	pub fn update_channel_from_announcement_no_lookup(
-		&self, msg: &ChannelAnnouncement
+		&self, msg: &ChannelAnnouncement,
 	) -> Result<(), LightningError> {
 		self.update_channel_from_announcement::<&UtxoResolver>(msg, &None)
 	}
@@ -1832,11 +2012,12 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// If a [`UtxoLookup`] object is provided via `utxo_lookup`, it will be called to verify
 	/// the corresponding UTXO exists on chain and is correctly-formatted.
 	pub fn update_channel_from_unsigned_announcement<U: Deref>(
-		&self, msg: &msgs::UnsignedChannelAnnouncement, utxo_lookup: &Option<U>
+		&self, msg: &msgs::UnsignedChannelAnnouncement, utxo_lookup: &Option<U>,
 	) -> Result<(), LightningError>
 	where
 		U::Target: UtxoLookup,
 	{
+		self.pre_channel_announcement_validation_check(&msg, utxo_lookup)?;
 		self.update_channel_from_unsigned_announcement_intern(msg, None, utxo_lookup)
 	}
 
@@ -1846,20 +2027,24 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// rapid gossip sync server)
 	///
 	/// All other parameters as used in [`msgs::UnsignedChannelAnnouncement`] fields.
-	pub fn add_channel_from_partial_announcement(&self, short_channel_id: u64, timestamp: u64, features: ChannelFeatures, node_id_1: PublicKey, node_id_2: PublicKey) -> Result<(), LightningError> {
+	pub fn add_channel_from_partial_announcement(
+		&self, short_channel_id: u64, capacity_sats: Option<u64>, timestamp: u64,
+		features: ChannelFeatures, node_id_1: NodeId, node_id_2: NodeId,
+	) -> Result<(), LightningError> {
 		if node_id_1 == node_id_2 {
-			return Err(LightningError{err: "Channel announcement node had a channel with itself".to_owned(), action: ErrorAction::IgnoreError});
+			return Err(LightningError {
+				err: "Channel announcement node had a channel with itself".to_owned(),
+				action: ErrorAction::IgnoreError,
+			});
 		};
 
-		let node_1 = NodeId::from_pubkey(&node_id_1);
-		let node_2 = NodeId::from_pubkey(&node_id_2);
 		let channel_info = ChannelInfo {
 			features,
-			node_one: node_1.clone(),
+			node_one: node_id_1,
 			one_to_two: None,
-			node_two: node_2.clone(),
+			node_two: node_id_2,
 			two_to_one: None,
-			capacity_sats: None,
+			capacity_sats,
 			announcement_message: None,
 			announcement_received_time: timestamp,
 			node_one_counter: u32::max_value(),
@@ -1870,14 +2055,22 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 		self.add_channel_between_nodes(short_channel_id, channel_info, None)
 	}
 
-	fn add_channel_between_nodes(&self, short_channel_id: u64, channel_info: ChannelInfo, utxo_value: Option<Amount>) -> Result<(), LightningError> {
+	fn add_channel_between_nodes(
+		&self, short_channel_id: u64, channel_info: ChannelInfo, utxo_value: Option<Amount>,
+	) -> Result<(), LightningError> {
 		let mut channels = self.channels.write().unwrap();
 		let mut nodes = self.nodes.write().unwrap();
 
 		let node_id_a = channel_info.node_one.clone();
 		let node_id_b = channel_info.node_two.clone();
 
-		log_gossip!(self.logger, "Adding channel {} between nodes {} and {}", short_channel_id, node_id_a, node_id_b);
+		log_gossip!(
+			self.logger,
+			"Adding channel {} between nodes {} and {}",
+			short_channel_id,
+			node_id_a,
+			node_id_b
+		);
 
 		let channel_info = match channels.entry(short_channel_id) {
 			IndexedMapEntry::Occupied(mut entry) => {
@@ -1897,17 +2090,18 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 					*entry.get_mut() = channel_info;
 					entry.into_mut()
 				} else {
-					return Err(LightningError{err: "Already have knowledge of channel".to_owned(), action: ErrorAction::IgnoreDuplicateGossip});
+					return Err(LightningError {
+						err: "Already have knowledge of channel".to_owned(),
+						action: ErrorAction::IgnoreDuplicateGossip,
+					});
 				}
 			},
-			IndexedMapEntry::Vacant(entry) => {
-				entry.insert(channel_info)
-			}
+			IndexedMapEntry::Vacant(entry) => entry.insert(channel_info),
 		};
 
 		let mut node_counter_id = [
 			(&mut channel_info.node_one_counter, node_id_a),
-			(&mut channel_info.node_two_counter, node_id_b)
+			(&mut channel_info.node_two_counter, node_id_b),
 		];
 		for (chan_info_node_counter, current_node_id) in node_counter_id.iter_mut() {
 			match nodes.entry(current_node_id.clone()) {
@@ -1918,30 +2112,86 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 				},
 				IndexedMapEntry::Vacant(node_entry) => {
 					let mut removed_node_counters = self.removed_node_counters.lock().unwrap();
-					**chan_info_node_counter = removed_node_counters.pop()
-						.unwrap_or_else(|| {
-							self.next_node_counter.fetch_add(1, Ordering::Relaxed) as u32
-						});
+					**chan_info_node_counter = removed_node_counters.pop().unwrap_or_else(|| {
+						self.next_node_counter.fetch_add(1, Ordering::Relaxed) as u32
+					});
 					node_entry.insert(NodeInfo {
-						channels: vec!(short_channel_id),
+						channels: vec![short_channel_id],
 						announcement_info: None,
 						node_counter: **chan_info_node_counter,
 					});
-				}
+				},
 			};
-		};
+		}
+
+		core::mem::drop(nodes);
+		core::mem::drop(channels);
+		self.test_node_counter_consistency();
 
 		Ok(())
 	}
 
+	/// If we already have all the information for a channel that we're gonna get, there's no
+	/// reason to redundantly process it.
+	///
+	/// In those cases, this will return an `Err` that we can return immediately. Otherwise it will
+	/// return an `Ok(())`.
+	fn pre_channel_announcement_validation_check<U: Deref>(
+		&self, msg: &msgs::UnsignedChannelAnnouncement, utxo_lookup: &Option<U>,
+	) -> Result<(), LightningError>
+	where
+		U::Target: UtxoLookup,
+	{
+		let channels = self.channels.read().unwrap();
+
+		if let Some(chan) = channels.get(&msg.short_channel_id) {
+			if chan.capacity_sats.is_some() {
+				// If we'd previously looked up the channel on-chain and checked the script
+				// against what appears on-chain, ignore the duplicate announcement.
+				//
+				// Because a reorg could replace one channel with another at the same SCID, if
+				// the channel appears to be different, we re-validate. This doesn't expose us
+				// to any more DoS risk than not, as a peer can always flood us with
+				// randomly-generated SCID values anyway.
+				//
+				// We use the Node IDs rather than the bitcoin_keys to check for "equivalence"
+				// as we didn't (necessarily) store the bitcoin keys, and we only really care
+				// if the peers on the channel changed anyway.
+				if msg.node_id_1 == chan.node_one && msg.node_id_2 == chan.node_two {
+					return Err(LightningError {
+						err: "Already have chain-validated channel".to_owned(),
+						action: ErrorAction::IgnoreDuplicateGossip,
+					});
+				}
+			} else if utxo_lookup.is_none() {
+				// Similarly, if we can't check the chain right now anyway, ignore the
+				// duplicate announcement without bothering to take the channels write lock.
+				return Err(LightningError {
+					err: "Already have non-chain-validated channel".to_owned(),
+					action: ErrorAction::IgnoreDuplicateGossip,
+				});
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Update channel information from a received announcement.
+	///
+	/// Generally [`Self::pre_channel_announcement_validation_check`] should have been called
+	/// first.
 	fn update_channel_from_unsigned_announcement_intern<U: Deref>(
-		&self, msg: &msgs::UnsignedChannelAnnouncement, full_msg: Option<&msgs::ChannelAnnouncement>, utxo_lookup: &Option<U>
+		&self, msg: &msgs::UnsignedChannelAnnouncement,
+		full_msg: Option<&msgs::ChannelAnnouncement>, utxo_lookup: &Option<U>,
 	) -> Result<(), LightningError>
 	where
 		U::Target: UtxoLookup,
 	{
 		if msg.node_id_1 == msg.node_id_2 || msg.bitcoin_key_1 == msg.bitcoin_key_2 {
-			return Err(LightningError{err: "Channel announcement node had a channel with itself".to_owned(), action: ErrorAction::IgnoreError});
+			return Err(LightningError {
+				err: "Channel announcement node had a channel with itself".to_owned(),
+				action: ErrorAction::IgnoreError,
+			});
 		}
 
 		if msg.chain_hash != self.chain_hash {
@@ -1952,58 +2202,29 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 		}
 
 		{
-			let channels = self.channels.read().unwrap();
-
-			if let Some(chan) = channels.get(&msg.short_channel_id) {
-				if chan.capacity_sats.is_some() {
-					// If we'd previously looked up the channel on-chain and checked the script
-					// against what appears on-chain, ignore the duplicate announcement.
-					//
-					// Because a reorg could replace one channel with another at the same SCID, if
-					// the channel appears to be different, we re-validate. This doesn't expose us
-					// to any more DoS risk than not, as a peer can always flood us with
-					// randomly-generated SCID values anyway.
-					//
-					// We use the Node IDs rather than the bitcoin_keys to check for "equivalence"
-					// as we didn't (necessarily) store the bitcoin keys, and we only really care
-					// if the peers on the channel changed anyway.
-					if msg.node_id_1 == chan.node_one && msg.node_id_2 == chan.node_two {
-						return Err(LightningError {
-							err: "Already have chain-validated channel".to_owned(),
-							action: ErrorAction::IgnoreDuplicateGossip
-						});
-					}
-				} else if utxo_lookup.is_none() {
-					// Similarly, if we can't check the chain right now anyway, ignore the
-					// duplicate announcement without bothering to take the channels write lock.
-					return Err(LightningError {
-						err: "Already have non-chain-validated channel".to_owned(),
-						action: ErrorAction::IgnoreDuplicateGossip
-					});
-				}
-			}
-		}
-
-		{
 			let removed_channels = self.removed_channels.lock().unwrap();
 			let removed_nodes = self.removed_nodes.lock().unwrap();
-			if removed_channels.contains_key(&msg.short_channel_id) ||
-				removed_nodes.contains_key(&msg.node_id_1) ||
-				removed_nodes.contains_key(&msg.node_id_2) {
+			if removed_channels.contains_key(&msg.short_channel_id)
+				|| removed_nodes.contains_key(&msg.node_id_1)
+				|| removed_nodes.contains_key(&msg.node_id_2)
+			{
 				return Err(LightningError{
 					err: format!("Channel with SCID {} or one of its nodes was removed from our network graph recently", &msg.short_channel_id),
 					action: ErrorAction::IgnoreAndLog(Level::Gossip)});
 			}
 		}
 
-		let utxo_value = self.pending_checks.check_channel_announcement(
-			utxo_lookup, msg, full_msg)?;
+		let utxo_value =
+			self.pending_checks.check_channel_announcement(utxo_lookup, msg, full_msg)?;
 
 		#[allow(unused_mut, unused_assignments)]
 		let mut announcement_received_time = 0;
 		#[cfg(feature = "std")]
 		{
-			announcement_received_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
+			announcement_received_time = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("Time must be > 1970")
+				.as_secs();
 		}
 
 		let chan_info = ChannelInfo {
@@ -2013,8 +2234,11 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			node_two: msg.node_id_2,
 			two_to_one: None,
 			capacity_sats: utxo_value.map(|a| a.to_sat()),
-			announcement_message: if msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
-				{ full_msg.cloned() } else { None },
+			announcement_message: if msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY {
+				full_msg.cloned()
+			} else {
+				None
+			},
 			announcement_received_time,
 			node_one_counter: u32::max_value(),
 			node_two_counter: u32::max_value(),
@@ -2023,7 +2247,12 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 
 		self.add_channel_between_nodes(msg.short_channel_id, chan_info, utxo_value)?;
 
-		log_gossip!(self.logger, "Added channel_announcement for {}{}", msg.short_channel_id, if !msg.excess_data.is_empty() { " with excess uninterpreted data!" } else { "" });
+		log_gossip!(
+			self.logger,
+			"Added channel_announcement for {}{}",
+			msg.short_channel_id,
+			if !msg.excess_data.is_empty() { " with excess uninterpreted data!" } else { "" }
+		);
 		Ok(())
 	}
 
@@ -2032,7 +2261,9 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// The channel and any node for which this was their last channel are removed from the graph.
 	pub fn channel_failed_permanent(&self, short_channel_id: u64) {
 		#[cfg(feature = "std")]
-		let current_time_unix = Some(SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs());
+		let current_time_unix = Some(
+			SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs(),
+		);
 		#[cfg(not(feature = "std"))]
 		let current_time_unix = None;
 
@@ -2042,7 +2273,9 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// Marks a channel in the graph as failed permanently.
 	///
 	/// The channel and any node for which this was their last channel are removed from the graph.
-	fn channel_failed_permanent_with_time(&self, short_channel_id: u64, current_time_unix: Option<u64>) {
+	fn channel_failed_permanent_with_time(
+		&self, short_channel_id: u64, current_time_unix: Option<u64>,
+	) {
 		let mut channels = self.channels.write().unwrap();
 		if let Some(chan) = channels.remove(&short_channel_id) {
 			let mut nodes = self.nodes.write().unwrap();
@@ -2055,7 +2288,9 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// from local storage.
 	pub fn node_failed_permanent(&self, node_id: &PublicKey) {
 		#[cfg(feature = "std")]
-		let current_time_unix = Some(SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs());
+		let current_time_unix = Some(
+			SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs(),
+		);
 		#[cfg(not(feature = "std"))]
 		let current_time_unix = None;
 
@@ -2069,11 +2304,15 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			let mut removed_node_counters = self.removed_node_counters.lock().unwrap();
 			for scid in node.channels.iter() {
 				if let Some(chan_info) = channels.remove(scid) {
-					let other_node_id = if node_id == chan_info.node_one { chan_info.node_two } else { chan_info.node_one };
-					if let IndexedMapEntry::Occupied(mut other_node_entry) = nodes.entry(other_node_id) {
-						other_node_entry.get_mut().channels.retain(|chan_id| {
-							*scid != *chan_id
-						});
+					let other_node_id = if node_id == chan_info.node_one {
+						chan_info.node_two
+					} else {
+						chan_info.node_one
+					};
+					if let IndexedMapEntry::Occupied(mut other_node_entry) =
+						nodes.entry(other_node_id)
+					{
+						other_node_entry.get_mut().channels.retain(|chan_id| *scid != *chan_id);
 						if other_node_entry.get().channels.is_empty() {
 							removed_node_counters.push(other_node_entry.get().node_counter);
 							other_node_entry.remove_entry();
@@ -2105,9 +2344,10 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// in the map for a while so that these can be resynced from gossip in the future.
 	///
 	/// This method is only available with the `std` feature. See
-	/// [`NetworkGraph::remove_stale_channels_and_tracking_with_time`] for `no-std` use.
+	/// [`NetworkGraph::remove_stale_channels_and_tracking_with_time`] for non-`std` use.
 	pub fn remove_stale_channels_and_tracking(&self) {
-		let time = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
+		let time =
+			SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
 		self.remove_stale_channels_and_tracking_with_time(time);
 	}
 
@@ -2121,25 +2361,37 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	///
 	/// This method will also cause us to stop tracking removed nodes and channels if they have been
 	/// in the map for a while so that these can be resynced from gossip in the future.
-	///
-	/// This function takes the current unix time as an argument. For users with the `std` feature
-	/// enabled, [`NetworkGraph::remove_stale_channels_and_tracking`] may be preferable.
+	#[cfg_attr(feature = "std", doc = "")]
+	#[cfg_attr(
+		feature = "std",
+		doc = "This function takes the current unix time as an argument. For users with the `std` feature"
+	)]
+	#[cfg_attr(
+		feature = "std",
+		doc = "enabled, [`NetworkGraph::remove_stale_channels_and_tracking`] may be preferable."
+	)]
 	pub fn remove_stale_channels_and_tracking_with_time(&self, current_time_unix: u64) {
 		let mut channels = self.channels.write().unwrap();
 		// Time out if we haven't received an update in at least 14 days.
-		if current_time_unix > u32::max_value() as u64 { return; } // Remove by 2106
-		if current_time_unix < STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS { return; }
+		if current_time_unix > u32::max_value() as u64 {
+			return;
+		} // Remove by 2106
+		if current_time_unix < STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS {
+			return;
+		}
 		let min_time_unix: u32 = (current_time_unix - STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS) as u32;
-		// Sadly BTreeMap::retain was only stabilized in 1.53 so we can't switch to it for some
-		// time.
-		let mut scids_to_remove = Vec::new();
+		let mut scids_to_remove = new_hash_set();
 		for (scid, info) in channels.unordered_iter_mut() {
-			if info.one_to_two.is_some() && info.one_to_two.as_ref().unwrap().last_update < min_time_unix {
+			if info.one_to_two.is_some()
+				&& info.one_to_two.as_ref().unwrap().last_update < min_time_unix
+			{
 				log_gossip!(self.logger, "Removing directional update one_to_two (0) for channel {} due to its timestamp {} being below {}",
 					scid, info.one_to_two.as_ref().unwrap().last_update, min_time_unix);
 				info.one_to_two = None;
 			}
-			if info.two_to_one.is_some() && info.two_to_one.as_ref().unwrap().last_update < min_time_unix {
+			if info.two_to_one.is_some()
+				&& info.two_to_one.as_ref().unwrap().last_update < min_time_unix
+			{
 				log_gossip!(self.logger, "Removing directional update two_to_one (1) for channel {} due to its timestamp {} being below {}",
 					scid, info.two_to_one.as_ref().unwrap().last_update, min_time_unix);
 				info.two_to_one = None;
@@ -2152,24 +2404,31 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 				if announcement_received_timestamp < min_time_unix as u64 {
 					log_gossip!(self.logger, "Removing channel {} because both directional updates are missing and its announcement timestamp {} being below {}",
 						scid, announcement_received_timestamp, min_time_unix);
-					scids_to_remove.push(*scid);
+					scids_to_remove.insert(*scid);
 				}
 			}
 		}
 		if !scids_to_remove.is_empty() {
 			let mut nodes = self.nodes.write().unwrap();
-			for scid in scids_to_remove {
-				let info = channels.remove(&scid).expect("We just accessed this scid, it should be present");
-				self.remove_channel_in_nodes(&mut nodes, &info, scid);
-				self.removed_channels.lock().unwrap().insert(scid, Some(current_time_unix));
+			let mut removed_channels_lck = self.removed_channels.lock().unwrap();
+
+			let channels_removed_bulk = channels.remove_fetch_bulk(&scids_to_remove);
+			self.removed_node_counters.lock().unwrap().reserve(channels_removed_bulk.len());
+			let mut nodes_to_remove = hash_set_with_capacity(channels_removed_bulk.len());
+			for (scid, info) in channels_removed_bulk {
+				self.remove_channel_in_nodes_callback(&mut nodes, &info, scid, |e| {
+					nodes_to_remove.insert(*e.key());
+				});
+				removed_channels_lck.insert(scid, Some(current_time_unix));
 			}
+			nodes.remove_bulk(&nodes_to_remove);
 		}
 
 		let should_keep_tracking = |time: &mut Option<u64>| {
 			if let Some(time) = time {
 				current_time_unix.saturating_sub(*time) < REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS
 			} else {
-				// NOTE: In the case of no-std, we won't have access to the current UNIX time at the time of removal,
+				// NOTE: In the case of non-`std`, we won't have access to the current UNIX time at the time of removal,
 				// so we'll just set the removal time here to the current UNIX time on the very next invocation
 				// of this function.
 				#[cfg(not(feature = "std"))]
@@ -2180,7 +2439,8 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 				}
 				#[allow(unreachable_code)]
 				false
-			}};
+			}
+		};
 
 		self.removed_channels.lock().unwrap().retain(|_, time| should_keep_tracking(time));
 		self.removed_nodes.lock().unwrap().retain(|_, time| should_keep_tracking(time));
@@ -2193,7 +2453,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// [`RoutingMessageHandler`] implementation to call it indirectly. This may be useful to accept
 	/// routing messages from a source using a protocol other than the lightning P2P protocol.
 	///
-	/// If built with `no-std`, any updates with a timestamp more than two weeks in the past or
+	/// If not built with `std`, any updates with a timestamp more than two weeks in the past or
 	/// materially in the future will be rejected.
 	pub fn update_channel(&self, msg: &msgs::ChannelUpdate) -> Result<(), LightningError> {
 		self.update_channel_internal(&msg.contents, Some(&msg), Some(&msg.signature), false)
@@ -2203,9 +2463,11 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// of the channel without verifying the associated signatures. Because we aren't given the
 	/// associated signatures here we cannot relay the channel update to any of our peers.
 	///
-	/// If built with `no-std`, any updates with a timestamp more than two weeks in the past or
+	/// If not built with `std`, any updates with a timestamp more than two weeks in the past or
 	/// materially in the future will be rejected.
-	pub fn update_channel_unsigned(&self, msg: &msgs::UnsignedChannelUpdate) -> Result<(), LightningError> {
+	pub fn update_channel_unsigned(
+		&self, msg: &msgs::UnsignedChannelUpdate,
+	) -> Result<(), LightningError> {
 		self.update_channel_internal(msg, None, None, false)
 	}
 
@@ -2213,16 +2475,16 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	///
 	/// This checks whether the update currently is applicable by [`Self::update_channel`].
 	///
-	/// If built with `no-std`, any updates with a timestamp more than two weeks in the past or
+	/// If not built with `std`, any updates with a timestamp more than two weeks in the past or
 	/// materially in the future will be rejected.
 	pub fn verify_channel_update(&self, msg: &msgs::ChannelUpdate) -> Result<(), LightningError> {
 		self.update_channel_internal(&msg.contents, Some(&msg), Some(&msg.signature), true)
 	}
 
-	fn update_channel_internal(&self, msg: &msgs::UnsignedChannelUpdate,
-		full_msg: Option<&msgs::ChannelUpdate>, sig: Option<&secp256k1::ecdsa::Signature>,
-		only_verify: bool) -> Result<(), LightningError>
-	{
+	fn update_channel_internal(
+		&self, msg: &msgs::UnsignedChannelUpdate, full_msg: Option<&msgs::ChannelUpdate>,
+		sig: Option<&secp256k1::ecdsa::Signature>, only_verify: bool,
+	) -> Result<(), LightningError> {
 		let chan_enabled = msg.channel_flags & (1 << 1) != (1 << 1);
 
 		if msg.chain_hash != self.chain_hash {
@@ -2236,12 +2498,21 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 		{
 			// Note that many tests rely on being able to set arbitrarily old timestamps, thus we
 			// disable this check during tests!
-			let time = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
+			let time = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("Time must be > 1970")
+				.as_secs();
 			if (msg.timestamp as u64) < time - STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS {
-				return Err(LightningError{err: "channel_update is older than two weeks old".to_owned(), action: ErrorAction::IgnoreAndLog(Level::Gossip)});
+				return Err(LightningError {
+					err: "channel_update is older than two weeks old".to_owned(),
+					action: ErrorAction::IgnoreAndLog(Level::Gossip),
+				});
 			}
 			if msg.timestamp as u64 > time + 60 * 60 * 24 {
-				return Err(LightningError{err: "channel_update has a timestamp more than a day in the future".to_owned(), action: ErrorAction::IgnoreAndLog(Level::Gossip)});
+				return Err(LightningError {
+					err: "channel_update has a timestamp more than a day in the future".to_owned(),
+					action: ErrorAction::IgnoreAndLog(Level::Gossip),
+				});
 			}
 		}
 
@@ -2253,121 +2524,173 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			msg.timestamp
 		);
 
-		let mut channels = self.channels.write().unwrap();
-		match channels.get_mut(&msg.short_channel_id) {
-			None => {
-				core::mem::drop(channels);
-				self.pending_checks.check_hold_pending_channel_update(msg, full_msg)?;
-				return Err(LightningError {
-					err: "Couldn't find channel for update".to_owned(),
-					action: ErrorAction::IgnoreAndLog(Level::Gossip),
-				});
-			},
-			Some(channel) => {
-				if msg.htlc_maximum_msat > MAX_VALUE_MSAT {
-					return Err(LightningError{err:
-						"htlc_maximum_msat is larger than maximum possible msats".to_owned(),
-						action: ErrorAction::IgnoreError});
-				}
+		if msg.htlc_maximum_msat > MAX_VALUE_MSAT {
+			return Err(LightningError {
+				err: "htlc_maximum_msat is larger than maximum possible msats".to_owned(),
+				action: ErrorAction::IgnoreError,
+			});
+		}
 
+		let check_update_latest =
+			|target: &Option<ChannelUpdateInfo>| -> Result<(), LightningError> {
+				if let Some(existing_chan_info) = target {
+					// The timestamp field is somewhat of a misnomer - the BOLTs use it to
+					// order updates to ensure you always have the latest one, only
+					// suggesting  that it be at least the current time. For
+					// channel_updates specifically, the BOLTs discuss the possibility of
+					// pruning based on the timestamp field being more than two weeks old,
+					// but only in the non-normative section.
+					if existing_chan_info.last_update > msg.timestamp {
+						return Err(LightningError {
+							err: "Update older than last processed update".to_owned(),
+							action: ErrorAction::IgnoreDuplicateGossip,
+						});
+					} else if existing_chan_info.last_update == msg.timestamp {
+						return Err(LightningError {
+							err: "Update had same timestamp as last processed update".to_owned(),
+							action: ErrorAction::IgnoreDuplicateGossip,
+						});
+					}
+				}
+				Ok(())
+			};
+
+		let check_msg_sanity =
+			|channel: &ChannelInfo| -> Result<(), LightningError> {
 				if let Some(capacity_sats) = channel.capacity_sats {
 					// It's possible channel capacity is available now, although it wasn't available at announcement (so the field is None).
 					// Don't query UTXO set here to reduce DoS risks.
-					if capacity_sats > MAX_VALUE_MSAT / 1000 || msg.htlc_maximum_msat > capacity_sats * 1000 {
+					if capacity_sats > MAX_VALUE_MSAT / 1000
+						|| msg.htlc_maximum_msat > capacity_sats * 1000
+					{
 						return Err(LightningError{err:
-							"htlc_maximum_msat is larger than channel capacity or capacity is bogus".to_owned(),
-							action: ErrorAction::IgnoreError});
-					}
-				}
-				macro_rules! check_update_latest {
-					($target: expr) => {
-						if let Some(existing_chan_info) = $target.as_ref() {
-							// The timestamp field is somewhat of a misnomer - the BOLTs use it to
-							// order updates to ensure you always have the latest one, only
-							// suggesting  that it be at least the current time. For
-							// channel_updates specifically, the BOLTs discuss the possibility of
-							// pruning based on the timestamp field being more than two weeks old,
-							// but only in the non-normative section.
-							if existing_chan_info.last_update > msg.timestamp {
-								return Err(LightningError{err: "Update older than last processed update".to_owned(), action: ErrorAction::IgnoreDuplicateGossip});
-							} else if existing_chan_info.last_update == msg.timestamp {
-								return Err(LightningError{err: "Update had same timestamp as last processed update".to_owned(), action: ErrorAction::IgnoreDuplicateGossip});
-							}
-						}
+						"htlc_maximum_msat is larger than channel capacity or capacity is bogus".to_owned(),
+						action: ErrorAction::IgnoreError});
 					}
 				}
 
-				macro_rules! get_new_channel_info {
-					() => { {
-						let last_update_message = if msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
-							{ full_msg.cloned() } else { None };
-
-						let updated_channel_update_info = ChannelUpdateInfo {
-							enabled: chan_enabled,
-							last_update: msg.timestamp,
-							cltv_expiry_delta: msg.cltv_expiry_delta,
-							htlc_minimum_msat: msg.htlc_minimum_msat,
-							htlc_maximum_msat: msg.htlc_maximum_msat,
-							fees: RoutingFees {
-								base_msat: msg.fee_base_msat,
-								proportional_millionths: msg.fee_proportional_millionths,
-							},
-							last_update_message,
-							htlc_maximum_rgb: msg.htlc_maximum_rgb,
-						};
-						Some(updated_channel_update_info)
-					} }
-				}
-
-				let msg_hash = hash_to_message!(&message_sha256d_hash(&msg)[..]);
 				if msg.channel_flags & 1 == 1 {
-					check_update_latest!(channel.two_to_one);
-					if let Some(sig) = sig {
-						secp_verify_sig!(self.secp_ctx, &msg_hash, &sig, &PublicKey::from_slice(channel.node_two.as_slice()).map_err(|_| LightningError{
-							err: "Couldn't parse source node pubkey".to_owned(),
-							action: ErrorAction::IgnoreAndLog(Level::Debug)
-						})?, "channel_update");
-					}
-					if !only_verify {
-						channel.two_to_one = get_new_channel_info!();
-					}
+					check_update_latest(&channel.two_to_one)
 				} else {
-					check_update_latest!(channel.one_to_two);
-					if let Some(sig) = sig {
-						secp_verify_sig!(self.secp_ctx, &msg_hash, &sig, &PublicKey::from_slice(channel.node_one.as_slice()).map_err(|_| LightningError{
-							err: "Couldn't parse destination node pubkey".to_owned(),
-							action: ErrorAction::IgnoreAndLog(Level::Debug)
-						})?, "channel_update");
-					}
-					if !only_verify {
-						channel.one_to_two = get_new_channel_info!();
-					}
+					check_update_latest(&channel.one_to_two)
 				}
+			};
+
+		let mut node_pubkey = None;
+		{
+			let channels = self.channels.read().unwrap();
+			match channels.get(&msg.short_channel_id) {
+				None => {
+					core::mem::drop(channels);
+					self.pending_checks.check_hold_pending_channel_update(msg, full_msg)?;
+					return Err(LightningError {
+						err: "Couldn't find channel for update".to_owned(),
+						action: ErrorAction::IgnoreAndLog(Level::Gossip),
+					});
+				},
+				Some(channel) => {
+					check_msg_sanity(channel)?;
+					let node_id = if msg.channel_flags & 1 == 1 {
+						channel.node_two.as_slice()
+					} else {
+						channel.node_one.as_slice()
+					};
+					if sig.is_some() {
+						// PublicKey parsing isn't entirely trivial as it requires that we check
+						// that the provided point is on the curve. Thus, if we don't have a
+						// signature to verify, we want to skip the parsing step entirely.
+						// This represents a substantial speedup in applying RGS snapshots.
+						node_pubkey =
+							Some(PublicKey::from_slice(node_id).map_err(|_| LightningError {
+								err: "Couldn't parse source node pubkey".to_owned(),
+								action: ErrorAction::IgnoreAndLog(Level::Debug),
+							})?);
+					}
+				},
+			}
+		}
+
+		if let Some(sig) = sig {
+			let msg_hash = hash_to_message!(&message_sha256d_hash(&msg)[..]);
+			let node_pubkey = if let Some(pubkey) = node_pubkey {
+				pubkey
+			} else {
+				debug_assert!(false, "node_pubkey should have been decoded above");
+				let err = "node_pubkey wasn't decoded but we need it to check a sig".to_owned();
+				let action = ErrorAction::IgnoreAndLog(Level::Error);
+				return Err(LightningError { err, action });
+			};
+			secp_verify_sig!(self.secp_ctx, &msg_hash, &sig, &node_pubkey, "channel_update");
+		}
+
+		if only_verify {
+			return Ok(());
+		}
+
+		let mut channels = self.channels.write().unwrap();
+		if let Some(channel) = channels.get_mut(&msg.short_channel_id) {
+			check_msg_sanity(channel)?;
+
+			let last_update_message = if msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY {
+				full_msg.cloned()
+			} else {
+				None
+			};
+
+			let new_channel_info = Some(ChannelUpdateInfo {
+				enabled: chan_enabled,
+				last_update: msg.timestamp,
+				cltv_expiry_delta: msg.cltv_expiry_delta,
+				htlc_minimum_msat: msg.htlc_minimum_msat,
+				htlc_maximum_msat: msg.htlc_maximum_msat,
+				fees: RoutingFees {
+					base_msat: msg.fee_base_msat,
+					proportional_millionths: msg.fee_proportional_millionths,
+				},
+				last_update_message,
+				htlc_maximum_rgb: msg.htlc_maximum_rgb,
+			});
+
+			if msg.channel_flags & 1 == 1 {
+				channel.two_to_one = new_channel_info;
+			} else {
+				channel.one_to_two = new_channel_info;
 			}
 		}
 
 		Ok(())
 	}
 
-	fn remove_channel_in_nodes(&self, nodes: &mut IndexedMap<NodeId, NodeInfo>, chan: &ChannelInfo, short_channel_id: u64) {
+	fn remove_channel_in_nodes_callback<RM: FnMut(IndexedMapOccupiedEntry<NodeId, NodeInfo>)>(
+		&self, nodes: &mut IndexedMap<NodeId, NodeInfo>, chan: &ChannelInfo, short_channel_id: u64,
+		mut remove_node: RM,
+	) {
 		macro_rules! remove_from_node {
 			($node_id: expr) => {
 				if let IndexedMapEntry::Occupied(mut entry) = nodes.entry($node_id) {
-					entry.get_mut().channels.retain(|chan_id| {
-						short_channel_id != *chan_id
-					});
+					entry.get_mut().channels.retain(|chan_id| short_channel_id != *chan_id);
 					if entry.get().channels.is_empty() {
 						self.removed_node_counters.lock().unwrap().push(entry.get().node_counter);
-						entry.remove_entry();
+						remove_node(entry);
 					}
 				} else {
-					panic!("Had channel that pointed to unknown node (ie inconsistent network map)!");
+					panic!(
+						"Had channel that pointed to unknown node (ie inconsistent network map)!"
+					);
 				}
-			}
+			};
 		}
 
 		remove_from_node!(chan.node_one);
 		remove_from_node!(chan.node_two);
+	}
+
+	fn remove_channel_in_nodes(
+		&self, nodes: &mut IndexedMap<NodeId, NodeInfo>, chan: &ChannelInfo, short_channel_id: u64,
+	) {
+		self.remove_channel_in_nodes_callback(nodes, chan, short_channel_id, |e| {
+			e.remove_entry();
+		});
 	}
 }
 
@@ -2412,7 +2735,8 @@ impl ReadOnlyNetworkGraph<'_> {
 	/// Returns None if the requested node is completely unknown,
 	/// or if node announcement for the node was never received.
 	pub fn get_addresses(&self, pubkey: &PublicKey) -> Option<Vec<SocketAddress>> {
-		self.nodes.get(&NodeId::from_pubkey(&pubkey))
+		self.nodes
+			.get(&NodeId::from_pubkey(&pubkey))
 			.and_then(|node| node.announcement_info.as_ref().map(|ann| ann.addresses().to_vec()))
 	}
 
@@ -2425,49 +2749,61 @@ impl ReadOnlyNetworkGraph<'_> {
 /*
 #[cfg(test)]
 pub(crate) mod tests {
-	use crate::events::{MessageSendEvent, MessageSendEventsProvider};
-	use crate::ln::channelmanager;
 	use crate::ln::chan_utils::make_funding_redeemscript;
-	#[cfg(feature = "std")]
-	use crate::ln::features::InitFeatures;
-	use crate::ln::msgs::SocketAddress;
-	use crate::routing::gossip::{P2PGossipSync, NetworkGraph, NetworkUpdate, NodeAlias, MAX_EXCESS_BYTES_FOR_RELAY, NodeId, RoutingFees, ChannelUpdateInfo, ChannelInfo, NodeAnnouncementInfo, NodeInfo};
+	use crate::ln::channelmanager;
+	use crate::ln::msgs::{BaseMessageHandler, MessageSendEvent, SocketAddress};
+	use crate::ln::msgs::{
+		ChannelAnnouncement, ChannelUpdate, NodeAnnouncement, QueryChannelRange,
+		QueryShortChannelIds, ReplyChannelRange, RoutingMessageHandler,
+		UnsignedChannelAnnouncement, UnsignedChannelUpdate, UnsignedNodeAnnouncement,
+		MAX_VALUE_MSAT,
+	};
+	use crate::routing::gossip::{
+		ChannelInfo, ChannelUpdateInfo, NetworkGraph, NetworkUpdate, NodeAlias,
+		NodeAnnouncementInfo, NodeId, NodeInfo, P2PGossipSync, RoutingFees,
+		MAX_EXCESS_BYTES_FOR_RELAY,
+	};
 	use crate::routing::utxo::{UtxoLookupError, UtxoResult};
-	use crate::ln::msgs::{RoutingMessageHandler, UnsignedNodeAnnouncement, NodeAnnouncement,
-		UnsignedChannelAnnouncement, ChannelAnnouncement, UnsignedChannelUpdate, ChannelUpdate,
-		ReplyChannelRange, QueryChannelRange, QueryShortChannelIds, MAX_VALUE_MSAT};
+	#[cfg(feature = "std")]
+	use crate::types::features::InitFeatures;
 	use crate::util::config::UserConfig;
-	use crate::util::test_utils;
-	use crate::util::ser::{Hostname, ReadableArgs, Readable, Writeable};
 	use crate::util::scid_utils::scid_from_parts;
+	use crate::util::ser::{Hostname, LengthReadable, Readable, ReadableArgs, Writeable};
+	use crate::util::test_utils;
 
-	use crate::routing::gossip::REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS;
 	use super::STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS;
+	use crate::routing::gossip::REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS;
 
+	use bitcoin::amount::Amount;
+	use bitcoin::constants::ChainHash;
 	use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 	use bitcoin::hashes::Hash;
 	use bitcoin::hex::FromHex;
 	use bitcoin::network::Network;
-	use bitcoin::amount::Amount;
-	use bitcoin::constants::ChainHash;
 	use bitcoin::script::ScriptBuf;
-	use bitcoin::transaction::TxOut;
-	use bitcoin::secp256k1::{PublicKey, SecretKey};
 	use bitcoin::secp256k1::{All, Secp256k1};
+	use bitcoin::secp256k1::{PublicKey, SecretKey};
+	use bitcoin::transaction::TxOut;
 
 	use crate::io;
-	use bitcoin::secp256k1;
 	use crate::prelude::*;
 	use crate::sync::Arc;
+	use bitcoin::secp256k1;
 
 	fn create_network_graph() -> NetworkGraph<Arc<test_utils::TestLogger>> {
 		let logger = Arc::new(test_utils::TestLogger::new());
 		NetworkGraph::new(Network::Testnet, logger)
 	}
 
-	fn create_gossip_sync(network_graph: &NetworkGraph<Arc<test_utils::TestLogger>>) -> (
-		Secp256k1<All>, P2PGossipSync<&NetworkGraph<Arc<test_utils::TestLogger>>,
-		Arc<test_utils::TestChainSource>, Arc<test_utils::TestLogger>>
+	fn create_gossip_sync(
+		network_graph: &NetworkGraph<Arc<test_utils::TestLogger>>,
+	) -> (
+		Secp256k1<All>,
+		P2PGossipSync<
+			&NetworkGraph<Arc<test_utils::TestLogger>>,
+			Arc<test_utils::TestChainSource>,
+			Arc<test_utils::TestLogger>,
+		>,
 	) {
 		let secp_ctx = Secp256k1::new();
 		let logger = Arc::new(test_utils::TestLogger::new());
@@ -2488,7 +2824,9 @@ pub(crate) mod tests {
 		assert!(!gossip_sync.should_request_full_sync());
 	}
 
-	pub(crate) fn get_signed_node_announcement<F: Fn(&mut UnsignedNodeAnnouncement)>(f: F, node_key: &SecretKey, secp_ctx: &Secp256k1<secp256k1::All>) -> NodeAnnouncement {
+	pub(crate) fn get_signed_node_announcement<F: Fn(&mut UnsignedNodeAnnouncement)>(
+		f: F, node_key: &SecretKey, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> NodeAnnouncement {
 		let node_id = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_key));
 		let mut unsigned_announcement = UnsignedNodeAnnouncement {
 			features: channelmanager::provided_node_features(&UserConfig::default()),
@@ -2504,11 +2842,13 @@ pub(crate) mod tests {
 		let msghash = hash_to_message!(&Sha256dHash::hash(&unsigned_announcement.encode()[..])[..]);
 		NodeAnnouncement {
 			signature: secp_ctx.sign_ecdsa(&msghash, node_key),
-			contents: unsigned_announcement
+			contents: unsigned_announcement,
 		}
 	}
 
-	pub(crate) fn get_signed_channel_announcement<F: Fn(&mut UnsignedChannelAnnouncement)>(f: F, node_1_key: &SecretKey, node_2_key: &SecretKey, secp_ctx: &Secp256k1<secp256k1::All>) -> ChannelAnnouncement {
+	pub(crate) fn get_signed_channel_announcement<F: Fn(&mut UnsignedChannelAnnouncement)>(
+		f: F, node_1_key: &SecretKey, node_2_key: &SecretKey, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> ChannelAnnouncement {
 		let node_id_1 = PublicKey::from_secret_key(&secp_ctx, node_1_key);
 		let node_id_2 = PublicKey::from_secret_key(&secp_ctx, node_2_key);
 		let node_1_btckey = &SecretKey::from_slice(&[40; 32]).unwrap();
@@ -2520,8 +2860,14 @@ pub(crate) mod tests {
 			short_channel_id: 0,
 			node_id_1: NodeId::from_pubkey(&node_id_1),
 			node_id_2: NodeId::from_pubkey(&node_id_2),
-			bitcoin_key_1: NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_1_btckey)),
-			bitcoin_key_2: NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_2_btckey)),
+			bitcoin_key_1: NodeId::from_pubkey(&PublicKey::from_secret_key(
+				&secp_ctx,
+				node_1_btckey,
+			)),
+			bitcoin_key_2: NodeId::from_pubkey(&PublicKey::from_secret_key(
+				&secp_ctx,
+				node_2_btckey,
+			)),
 			excess_data: Vec::new(),
 		};
 		f(&mut unsigned_announcement);
@@ -2538,11 +2884,16 @@ pub(crate) mod tests {
 	pub(crate) fn get_channel_script(secp_ctx: &Secp256k1<secp256k1::All>) -> ScriptBuf {
 		let node_1_btckey = SecretKey::from_slice(&[40; 32]).unwrap();
 		let node_2_btckey = SecretKey::from_slice(&[39; 32]).unwrap();
-		make_funding_redeemscript(&PublicKey::from_secret_key(secp_ctx, &node_1_btckey),
-			&PublicKey::from_secret_key(secp_ctx, &node_2_btckey)).to_p2wsh()
+		make_funding_redeemscript(
+			&PublicKey::from_secret_key(secp_ctx, &node_1_btckey),
+			&PublicKey::from_secret_key(secp_ctx, &node_2_btckey),
+		)
+		.to_p2wsh()
 	}
 
-	pub(crate) fn get_signed_channel_update<F: Fn(&mut UnsignedChannelUpdate)>(f: F, node_key: &SecretKey, secp_ctx: &Secp256k1<secp256k1::All>) -> ChannelUpdate {
+	pub(crate) fn get_signed_channel_update<F: Fn(&mut UnsignedChannelUpdate)>(
+		f: F, node_key: &SecretKey, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> ChannelUpdate {
 		let mut unsigned_channel_update = UnsignedChannelUpdate {
 			chain_hash: ChainHash::using_genesis_block(Network::Testnet),
 			short_channel_id: 0,
@@ -2554,13 +2905,14 @@ pub(crate) mod tests {
 			htlc_maximum_msat: 1_000_000,
 			fee_base_msat: 10_000,
 			fee_proportional_millionths: 20,
-			excess_data: Vec::new()
+			excess_data: Vec::new(),
 		};
 		f(&mut unsigned_channel_update);
-		let msghash = hash_to_message!(&Sha256dHash::hash(&unsigned_channel_update.encode()[..])[..]);
+		let msghash =
+			hash_to_message!(&Sha256dHash::hash(&unsigned_channel_update.encode()[..])[..]);
 		ChannelUpdate {
 			signature: secp_ctx.sign_ecdsa(&msghash, node_key),
-			contents: unsigned_channel_update
+			contents: unsigned_channel_update,
 		}
 	}
 
@@ -2570,57 +2922,70 @@ pub(crate) mod tests {
 		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
 
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 		let zero_hash = Sha256dHash::hash(&[0; 32]);
 
 		let valid_announcement = get_signed_node_announcement(|_| {}, node_1_privkey, &secp_ctx);
-		match gossip_sync.handle_node_announcement(&valid_announcement) {
+		match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &valid_announcement) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!("No existing channels for node_announcement", e.err)
+			Err(e) => assert_eq!("No existing channels for node_announcement", e.err),
 		};
 
 		{
 			// Announce a channel to add a corresponding node.
-			let valid_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
-			match gossip_sync.handle_channel_announcement(&valid_announcement) {
+			let valid_announcement =
+				get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+			match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement)
+			{
 				Ok(res) => assert!(res),
-				_ => panic!()
+				_ => panic!(),
 			};
 		}
 
-		match gossip_sync.handle_node_announcement(&valid_announcement) {
-			Ok(res) => assert!(res),
-			Err(_) => panic!()
-		};
-
 		let fake_msghash = hash_to_message!(zero_hash.as_byte_array());
 		match gossip_sync.handle_node_announcement(
+			Some(node_1_pubkey),
 			&NodeAnnouncement {
 				signature: secp_ctx.sign_ecdsa(&fake_msghash, node_1_privkey),
-				contents: valid_announcement.contents.clone()
-		}) {
+				contents: valid_announcement.contents.clone(),
+			},
+		) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Invalid signature on node_announcement message")
+			Err(e) => assert_eq!(e.err, "Invalid signature on node_announcement message"),
 		};
 
-		let announcement_with_data = get_signed_node_announcement(|unsigned_announcement| {
-			unsigned_announcement.timestamp += 1000;
-			unsigned_announcement.excess_data.resize(MAX_EXCESS_BYTES_FOR_RELAY + 1, 0);
-		}, node_1_privkey, &secp_ctx);
+		match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &valid_announcement) {
+			Ok(res) => assert!(res),
+			Err(_) => panic!(),
+		};
+
+		let announcement_with_data = get_signed_node_announcement(
+			|unsigned_announcement| {
+				unsigned_announcement.timestamp += 1000;
+				unsigned_announcement.excess_data.resize(MAX_EXCESS_BYTES_FOR_RELAY + 1, 0);
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
 		// Return false because contains excess data.
-		match gossip_sync.handle_node_announcement(&announcement_with_data) {
+		match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &announcement_with_data) {
 			Ok(res) => assert!(!res),
-			Err(_) => panic!()
+			Err(_) => panic!(),
 		};
 
 		// Even though previous announcement was not relayed further, we still accepted it,
 		// so we now won't accept announcements before the previous one.
-		let outdated_announcement = get_signed_node_announcement(|unsigned_announcement| {
-			unsigned_announcement.timestamp += 1000 - 10;
-		}, node_1_privkey, &secp_ctx);
-		match gossip_sync.handle_node_announcement(&outdated_announcement) {
+		let outdated_announcement = get_signed_node_announcement(
+			|unsigned_announcement| {
+				unsigned_announcement.timestamp += 1000 - 10;
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &outdated_announcement) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Update older than last processed update")
+			Err(e) => assert_eq!(e.err, "Update older than last processed update"),
 		};
 	}
 
@@ -2630,31 +2995,32 @@ pub(crate) mod tests {
 		let logger = test_utils::TestLogger::new();
 
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 
 		let good_script = get_channel_script(&secp_ctx);
-		let valid_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+		let valid_announcement =
+			get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
 
 		// Test if the UTXO lookups were not supported
 		let network_graph = NetworkGraph::new(Network::Testnet, &logger);
 		let mut gossip_sync = P2PGossipSync::new(&network_graph, None, &logger);
-		match gossip_sync.handle_channel_announcement(&valid_announcement) {
+		match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement) {
 			Ok(res) => assert!(res),
-			_ => panic!()
+			_ => panic!(),
 		};
 
-		{
-			match network_graph.read_only().channels().get(&valid_announcement.contents.short_channel_id) {
-				None => panic!(),
-				Some(_) => ()
-			};
-		}
+		let scid = valid_announcement.contents.short_channel_id;
+		match network_graph.read_only().channels().get(&scid) {
+			None => panic!(),
+			Some(_) => (),
+		};
 
 		// If we receive announcement for the same channel (with UTXO lookups disabled),
 		// drop new one on the floor, since we can't see any changes.
-		match gossip_sync.handle_channel_announcement(&valid_announcement) {
+		match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Already have non-chain-validated channel")
+			Err(e) => assert_eq!(e.err, "Already have non-chain-validated channel"),
 		};
 
 		// Test if an associated transaction were not on-chain (or not confirmed).
@@ -2663,98 +3029,141 @@ pub(crate) mod tests {
 		let network_graph = NetworkGraph::new(Network::Testnet, &logger);
 		gossip_sync = P2PGossipSync::new(&network_graph, Some(&chain_source), &logger);
 
-		let valid_announcement = get_signed_channel_announcement(|unsigned_announcement| {
-			unsigned_announcement.short_channel_id += 1;
-		}, node_1_privkey, node_2_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_announcement(&valid_announcement) {
+		let valid_announcement = get_signed_channel_announcement(
+			|unsigned_announcement| {
+				unsigned_announcement.short_channel_id += 1;
+			},
+			node_1_privkey,
+			node_2_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Channel announced without corresponding UTXO entry")
+			Err(e) => assert_eq!(e.err, "Channel announced without corresponding UTXO entry"),
 		};
 
 		// Now test if the transaction is found in the UTXO set and the script is correct.
 		*chain_source.utxo_ret.lock().unwrap() =
 			UtxoResult::Sync(Ok(TxOut { value: Amount::ZERO, script_pubkey: good_script.clone() }));
-		let valid_announcement = get_signed_channel_announcement(|unsigned_announcement| {
-			unsigned_announcement.short_channel_id += 2;
-		}, node_1_privkey, node_2_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_announcement(&valid_announcement) {
+		let valid_announcement = get_signed_channel_announcement(
+			|unsigned_announcement| {
+				unsigned_announcement.short_channel_id += 2;
+			},
+			node_1_privkey,
+			node_2_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement) {
 			Ok(res) => assert!(res),
-			_ => panic!()
+			_ => panic!(),
 		};
 
-		{
-			match network_graph.read_only().channels().get(&valid_announcement.contents.short_channel_id) {
-				None => panic!(),
-				Some(_) => ()
-			};
-		}
+		let scid = valid_announcement.contents.short_channel_id;
+		match network_graph.read_only().channels().get(&scid) {
+			None => panic!(),
+			Some(_) => (),
+		};
 
 		// If we receive announcement for the same channel, once we've validated it against the
 		// chain, we simply ignore all new (duplicate) announcements.
 		*chain_source.utxo_ret.lock().unwrap() =
 			UtxoResult::Sync(Ok(TxOut { value: Amount::ZERO, script_pubkey: good_script }));
-		match gossip_sync.handle_channel_announcement(&valid_announcement) {
+		match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Already have chain-validated channel")
+			Err(e) => assert_eq!(e.err, "Already have chain-validated channel"),
 		};
 
 		#[cfg(feature = "std")]
 		{
 			use std::time::{SystemTime, UNIX_EPOCH};
 
-			let tracking_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
+			let tracking_time = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("Time must be > 1970")
+				.as_secs();
 			// Mark a node as permanently failed so it's tracked as removed.
-			gossip_sync.network_graph().node_failed_permanent(&PublicKey::from_secret_key(&secp_ctx, node_1_privkey));
+			let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
+			gossip_sync.network_graph().node_failed_permanent(&node_1_pubkey);
 
 			// Return error and ignore valid channel announcement if one of the nodes has been tracked as removed.
-			let valid_announcement = get_signed_channel_announcement(|unsigned_announcement| {
-				unsigned_announcement.short_channel_id += 3;
-			}, node_1_privkey, node_2_privkey, &secp_ctx);
-			match gossip_sync.handle_channel_announcement(&valid_announcement) {
+			let valid_announcement = get_signed_channel_announcement(
+				|unsigned_announcement| {
+					unsigned_announcement.short_channel_id += 3;
+				},
+				node_1_privkey,
+				node_2_privkey,
+				&secp_ctx,
+			);
+			match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement) {
 				Ok(_) => panic!(),
 				Err(e) => assert_eq!(e.err, "Channel with SCID 3 or one of its nodes was removed from our network graph recently")
 			}
 
-			gossip_sync.network_graph().remove_stale_channels_and_tracking_with_time(tracking_time + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS);
+			gossip_sync.network_graph().remove_stale_channels_and_tracking_with_time(
+				tracking_time + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS,
+			);
 
 			// The above channel announcement should be handled as per normal now.
-			match gossip_sync.handle_channel_announcement(&valid_announcement) {
+			match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement)
+			{
 				Ok(res) => assert!(res),
-				_ => panic!()
+				_ => panic!(),
 			}
 		}
 
-		// Don't relay valid channels with excess data
-		let valid_announcement = get_signed_channel_announcement(|unsigned_announcement| {
-			unsigned_announcement.short_channel_id += 4;
-			unsigned_announcement.excess_data.resize(MAX_EXCESS_BYTES_FOR_RELAY + 1, 0);
-		}, node_1_privkey, node_2_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_announcement(&valid_announcement) {
-			Ok(res) => assert!(!res),
-			_ => panic!()
-		};
+		let valid_excess_data_announcement = get_signed_channel_announcement(
+			|unsigned_announcement| {
+				unsigned_announcement.short_channel_id += 4;
+				unsigned_announcement.excess_data.resize(MAX_EXCESS_BYTES_FOR_RELAY + 1, 0);
+			},
+			node_1_privkey,
+			node_2_privkey,
+			&secp_ctx,
+		);
 
-		let mut invalid_sig_announcement = valid_announcement.clone();
+		let mut invalid_sig_announcement = valid_excess_data_announcement.clone();
 		invalid_sig_announcement.contents.excess_data = Vec::new();
-		match gossip_sync.handle_channel_announcement(&invalid_sig_announcement) {
+		match gossip_sync
+			.handle_channel_announcement(Some(node_1_pubkey), &invalid_sig_announcement)
+		{
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Invalid signature on channel_announcement message")
+			Err(e) => assert_eq!(e.err, "Invalid signature on channel_announcement message"),
 		};
 
-		let channel_to_itself_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_1_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_announcement(&channel_to_itself_announcement) {
+		// Don't relay valid channels with excess data
+		match gossip_sync
+			.handle_channel_announcement(Some(node_1_pubkey), &valid_excess_data_announcement)
+		{
+			Ok(res) => assert!(!res),
+			_ => panic!(),
+		};
+
+		let channel_to_itself_announcement =
+			get_signed_channel_announcement(|_| {}, node_1_privkey, node_1_privkey, &secp_ctx);
+		match gossip_sync
+			.handle_channel_announcement(Some(node_1_pubkey), &channel_to_itself_announcement)
+		{
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Channel announcement node had a channel with itself")
+			Err(e) => assert_eq!(e.err, "Channel announcement node had a channel with itself"),
 		};
 
 		// Test that channel announcements with the wrong chain hash are ignored (network graph is testnet,
 		// announcement is mainnet).
-		let incorrect_chain_announcement = get_signed_channel_announcement(|unsigned_announcement| {
-			unsigned_announcement.chain_hash = ChainHash::using_genesis_block(Network::Bitcoin);
-		}, node_1_privkey, node_2_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_announcement(&incorrect_chain_announcement) {
+		let incorrect_chain_announcement = get_signed_channel_announcement(
+			|unsigned_announcement| {
+				unsigned_announcement.chain_hash = ChainHash::using_genesis_block(Network::Bitcoin);
+			},
+			node_1_privkey,
+			node_2_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync
+			.handle_channel_announcement(Some(node_1_pubkey), &incorrect_chain_announcement)
+		{
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Channel announcement chain hash does not match genesis hash")
+			Err(e) => {
+				assert_eq!(e.err, "Channel announcement chain hash does not match genesis hash")
+			},
 		};
 	}
 
@@ -2767,6 +3176,7 @@ pub(crate) mod tests {
 		let gossip_sync = P2PGossipSync::new(&network_graph, Some(&chain_source), &logger);
 
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 
 		let amount_sats = Amount::from_sat(1000_000);
@@ -2775,21 +3185,25 @@ pub(crate) mod tests {
 		{
 			// Announce a channel we will update
 			let good_script = get_channel_script(&secp_ctx);
-			*chain_source.utxo_ret.lock().unwrap() =
-				UtxoResult::Sync(Ok(TxOut { value: amount_sats, script_pubkey: good_script.clone() }));
+			*chain_source.utxo_ret.lock().unwrap() = UtxoResult::Sync(Ok(TxOut {
+				value: amount_sats,
+				script_pubkey: good_script.clone(),
+			}));
 
-			let valid_channel_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+			let valid_channel_announcement =
+				get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
 			short_channel_id = valid_channel_announcement.contents.short_channel_id;
-			match gossip_sync.handle_channel_announcement(&valid_channel_announcement) {
+			match gossip_sync
+				.handle_channel_announcement(Some(node_1_pubkey), &valid_channel_announcement)
+			{
 				Ok(_) => (),
-				Err(_) => panic!()
+				Err(_) => panic!(),
 			};
-
 		}
 
 		let valid_channel_update = get_signed_channel_update(|_| {}, node_1_privkey, &secp_ctx);
 		network_graph.verify_channel_update(&valid_channel_update).unwrap();
-		match gossip_sync.handle_channel_update(&valid_channel_update) {
+		match gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update) {
 			Ok(res) => assert!(res),
 			_ => panic!(),
 		};
@@ -2800,77 +3214,109 @@ pub(crate) mod tests {
 				Some(channel_info) => {
 					assert_eq!(channel_info.one_to_two.as_ref().unwrap().cltv_expiry_delta, 144);
 					assert!(channel_info.two_to_one.is_none());
-				}
+				},
 			};
 		}
 
-		let valid_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-			unsigned_channel_update.timestamp += 100;
-			unsigned_channel_update.excess_data.resize(MAX_EXCESS_BYTES_FOR_RELAY + 1, 0);
-		}, node_1_privkey, &secp_ctx);
+		let valid_channel_update = get_signed_channel_update(
+			|unsigned_channel_update| {
+				unsigned_channel_update.timestamp += 100;
+				unsigned_channel_update.excess_data.resize(MAX_EXCESS_BYTES_FOR_RELAY + 1, 0);
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
 		// Return false because contains excess data
-		match gossip_sync.handle_channel_update(&valid_channel_update) {
+		match gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update) {
 			Ok(res) => assert!(!res),
-			_ => panic!()
+			_ => panic!(),
 		};
 
-		let valid_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-			unsigned_channel_update.timestamp += 110;
-			unsigned_channel_update.short_channel_id += 1;
-		}, node_1_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_update(&valid_channel_update) {
+		let valid_channel_update = get_signed_channel_update(
+			|unsigned_channel_update| {
+				unsigned_channel_update.timestamp += 110;
+				unsigned_channel_update.short_channel_id += 1;
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Couldn't find channel for update")
+			Err(e) => assert_eq!(e.err, "Couldn't find channel for update"),
 		};
 
-		let valid_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-			unsigned_channel_update.htlc_maximum_msat = MAX_VALUE_MSAT + 1;
-			unsigned_channel_update.timestamp += 110;
-		}, node_1_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_update(&valid_channel_update) {
+		let valid_channel_update = get_signed_channel_update(
+			|unsigned_channel_update| {
+				unsigned_channel_update.htlc_maximum_msat = MAX_VALUE_MSAT + 1;
+				unsigned_channel_update.timestamp += 110;
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "htlc_maximum_msat is larger than maximum possible msats")
+			Err(e) => assert_eq!(e.err, "htlc_maximum_msat is larger than maximum possible msats"),
 		};
 
-		let valid_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-			unsigned_channel_update.htlc_maximum_msat = amount_sats.to_sat() * 1000 + 1;
-			unsigned_channel_update.timestamp += 110;
-		}, node_1_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_update(&valid_channel_update) {
+		let valid_channel_update = get_signed_channel_update(
+			|unsigned_channel_update| {
+				unsigned_channel_update.htlc_maximum_msat = amount_sats.to_sat() * 1000 + 1;
+				unsigned_channel_update.timestamp += 110;
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "htlc_maximum_msat is larger than channel capacity or capacity is bogus")
+			Err(e) => assert_eq!(
+				e.err,
+				"htlc_maximum_msat is larger than channel capacity or capacity is bogus"
+			),
 		};
 
 		// Even though previous update was not relayed further, we still accepted it,
 		// so we now won't accept update before the previous one.
-		let valid_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-			unsigned_channel_update.timestamp += 100;
-		}, node_1_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_update(&valid_channel_update) {
+		let valid_channel_update = get_signed_channel_update(
+			|unsigned_channel_update| {
+				unsigned_channel_update.timestamp += 100;
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Update had same timestamp as last processed update")
+			Err(e) => assert_eq!(e.err, "Update had same timestamp as last processed update"),
 		};
 
-		let mut invalid_sig_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-			unsigned_channel_update.timestamp += 500;
-		}, node_1_privkey, &secp_ctx);
+		let mut invalid_sig_channel_update = get_signed_channel_update(
+			|unsigned_channel_update| {
+				unsigned_channel_update.timestamp += 500;
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
 		let zero_hash = Sha256dHash::hash(&[0; 32]);
 		let fake_msghash = hash_to_message!(zero_hash.as_byte_array());
 		invalid_sig_channel_update.signature = secp_ctx.sign_ecdsa(&fake_msghash, node_1_privkey);
-		match gossip_sync.handle_channel_update(&invalid_sig_channel_update) {
+		match gossip_sync.handle_channel_update(Some(node_1_pubkey), &invalid_sig_channel_update) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Invalid signature on channel_update message")
+			Err(e) => assert_eq!(e.err, "Invalid signature on channel_update message"),
 		};
 
 		// Test that channel updates with the wrong chain hash are ignored (network graph is testnet, channel
 		// update is mainet).
-		let incorrect_chain_update = get_signed_channel_update(|unsigned_channel_update| {
-			unsigned_channel_update.chain_hash = ChainHash::using_genesis_block(Network::Bitcoin);
-		}, node_1_privkey, &secp_ctx);
+		let incorrect_chain_update = get_signed_channel_update(
+			|unsigned_channel_update| {
+				unsigned_channel_update.chain_hash =
+					ChainHash::using_genesis_block(Network::Bitcoin);
+			},
+			node_1_privkey,
+			&secp_ctx,
+		);
 
-		match gossip_sync.handle_channel_update(&incorrect_chain_update) {
+		match gossip_sync.handle_channel_update(Some(node_1_pubkey), &incorrect_chain_update) {
 			Ok(_) => panic!(),
-			Err(e) => assert_eq!(e.err, "Channel update chain hash does not match genesis hash")
+			Err(e) => assert_eq!(e.err, "Channel update chain hash does not match genesis hash"),
 		};
 	}
 
@@ -2882,54 +3328,58 @@ pub(crate) mod tests {
 
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
-		let node_2_id = PublicKey::from_secret_key(&secp_ctx, node_2_privkey);
+		let node_2_pk = PublicKey::from_secret_key(&secp_ctx, node_2_privkey);
+		let node_2_id = NodeId::from_pubkey(&node_2_pk);
 
 		{
 			// There is no nodes in the table at the beginning.
 			assert_eq!(network_graph.read_only().nodes().len(), 0);
 		}
 
-		let short_channel_id;
+		let scid;
 		{
 			// Check that we can manually apply a channel update.
-			let valid_channel_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
-			short_channel_id = valid_channel_announcement.contents.short_channel_id;
+			let valid_channel_announcement =
+				get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+			scid = valid_channel_announcement.contents.short_channel_id;
 			let chain_source: Option<&test_utils::TestChainSource> = None;
-			assert!(network_graph.update_channel_from_announcement(&valid_channel_announcement, &chain_source).is_ok());
-			assert!(network_graph.read_only().channels().get(&short_channel_id).is_some());
+			assert!(network_graph
+				.update_channel_from_announcement(&valid_channel_announcement, &chain_source)
+				.is_ok());
+			assert!(network_graph.read_only().channels().get(&scid).is_some());
 
 			let valid_channel_update = get_signed_channel_update(|_| {}, node_1_privkey, &secp_ctx);
 
-			assert!(network_graph.read_only().channels().get(&short_channel_id).unwrap().one_to_two.is_none());
+			assert!(network_graph.read_only().channels().get(&scid).unwrap().one_to_two.is_none());
 			network_graph.update_channel(&valid_channel_update).unwrap();
-			assert!(network_graph.read_only().channels().get(&short_channel_id).unwrap().one_to_two.is_some());
+			assert!(network_graph.read_only().channels().get(&scid).unwrap().one_to_two.is_some());
 		}
 
 		// Non-permanent failure doesn't touch the channel at all
 		{
-			match network_graph.read_only().channels().get(&short_channel_id) {
+			match network_graph.read_only().channels().get(&scid) {
 				None => panic!(),
 				Some(channel_info) => {
 					assert!(channel_info.one_to_two.as_ref().unwrap().enabled);
-				}
+				},
 			};
 
 			network_graph.handle_network_update(&NetworkUpdate::ChannelFailure {
-				short_channel_id,
+				short_channel_id: scid,
 				is_permanent: false,
 			});
 
-			match network_graph.read_only().channels().get(&short_channel_id) {
+			match network_graph.read_only().channels().get(&scid) {
 				None => panic!(),
 				Some(channel_info) => {
 					assert!(channel_info.one_to_two.as_ref().unwrap().enabled);
-				}
+				},
 			};
 		}
 
 		// Permanent closing deletes a channel
 		network_graph.handle_network_update(&NetworkUpdate::ChannelFailure {
-			short_channel_id,
+			short_channel_id: scid,
 			is_permanent: true,
 		});
 
@@ -2942,24 +3392,27 @@ pub(crate) mod tests {
 			let network_graph = NetworkGraph::new(Network::Testnet, &logger);
 
 			// Announce a channel to test permanent node failure
-			let valid_channel_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+			let valid_channel_announcement =
+				get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
 			let short_channel_id = valid_channel_announcement.contents.short_channel_id;
 			let chain_source: Option<&test_utils::TestChainSource> = None;
-			assert!(network_graph.update_channel_from_announcement(&valid_channel_announcement, &chain_source).is_ok());
+			assert!(network_graph
+				.update_channel_from_announcement(&valid_channel_announcement, &chain_source)
+				.is_ok());
 			assert!(network_graph.read_only().channels().get(&short_channel_id).is_some());
 
 			// Non-permanent node failure does not delete any nodes or channels
 			network_graph.handle_network_update(&NetworkUpdate::NodeFailure {
-				node_id: node_2_id,
+				node_id: node_2_pk,
 				is_permanent: false,
 			});
 
 			assert!(network_graph.read_only().channels().get(&short_channel_id).is_some());
-			assert!(network_graph.read_only().nodes().get(&NodeId::from_pubkey(&node_2_id)).is_some());
+			assert!(network_graph.read_only().nodes().get(&node_2_id).is_some());
 
 			// Permanent node failure deletes node and its channels
 			network_graph.handle_network_update(&NetworkUpdate::NodeFailure {
-				node_id: node_2_id,
+				node_id: node_2_pk,
 				is_permanent: true,
 			});
 
@@ -2979,34 +3432,52 @@ pub(crate) mod tests {
 		let secp_ctx = Secp256k1::new();
 
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 
-		let valid_channel_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
-		let short_channel_id = valid_channel_announcement.contents.short_channel_id;
+		let valid_channel_announcement =
+			get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+		let scid = valid_channel_announcement.contents.short_channel_id;
 		let chain_source: Option<&test_utils::TestChainSource> = None;
-		assert!(network_graph.update_channel_from_announcement(&valid_channel_announcement, &chain_source).is_ok());
-		assert!(network_graph.read_only().channels().get(&short_channel_id).is_some());
+		assert!(network_graph
+			.update_channel_from_announcement(&valid_channel_announcement, &chain_source)
+			.is_ok());
+		assert!(network_graph.read_only().channels().get(&scid).is_some());
 
 		// Submit two channel updates for each channel direction (update.flags bit).
 		let valid_channel_update = get_signed_channel_update(|_| {}, node_1_privkey, &secp_ctx);
-		assert!(gossip_sync.handle_channel_update(&valid_channel_update).is_ok());
-		assert!(network_graph.read_only().channels().get(&short_channel_id).unwrap().one_to_two.is_some());
+		assert!(gossip_sync
+			.handle_channel_update(Some(node_1_pubkey), &valid_channel_update)
+			.is_ok());
+		assert!(network_graph.read_only().channels().get(&scid).unwrap().one_to_two.is_some());
 
-		let valid_channel_update_2 = get_signed_channel_update(|update| {update.channel_flags |=1;}, node_2_privkey, &secp_ctx);
-		gossip_sync.handle_channel_update(&valid_channel_update_2).unwrap();
-		assert!(network_graph.read_only().channels().get(&short_channel_id).unwrap().two_to_one.is_some());
+		let valid_channel_update_2 = get_signed_channel_update(
+			|update| {
+				update.channel_flags |= 1;
+			},
+			node_2_privkey,
+			&secp_ctx,
+		);
+		gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update_2).unwrap();
+		assert!(network_graph.read_only().channels().get(&scid).unwrap().two_to_one.is_some());
 
-		network_graph.remove_stale_channels_and_tracking_with_time(100 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS);
+		network_graph.remove_stale_channels_and_tracking_with_time(
+			100 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS,
+		);
 		assert_eq!(network_graph.read_only().channels().len(), 1);
 		assert_eq!(network_graph.read_only().nodes().len(), 2);
 
-		network_graph.remove_stale_channels_and_tracking_with_time(101 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS);
-		#[cfg(not(feature = "std"))] {
+		network_graph.remove_stale_channels_and_tracking_with_time(
+			101 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS,
+		);
+		#[cfg(not(feature = "std"))]
+		{
 			// Make sure removed channels are tracked.
 			assert_eq!(network_graph.removed_channels.lock().unwrap().len(), 1);
 		}
-		network_graph.remove_stale_channels_and_tracking_with_time(101 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS +
-			REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS);
+		network_graph.remove_stale_channels_and_tracking_with_time(
+			101 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS,
+		);
 
 		#[cfg(feature = "std")]
 		{
@@ -3019,20 +3490,35 @@ pub(crate) mod tests {
 			// Note that the directional channel information will have been removed already..
 			// We want to check that this will work even if *one* of the channel updates is recent,
 			// so we should add it with a recent timestamp.
-			assert!(network_graph.read_only().channels().get(&short_channel_id).unwrap().one_to_two.is_none());
+			assert!(network_graph.read_only().channels().get(&scid).unwrap().one_to_two.is_none());
 			use std::time::{SystemTime, UNIX_EPOCH};
-			let announcement_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
-			let valid_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-				unsigned_channel_update.timestamp = (announcement_time + 1 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS) as u32;
-			}, node_1_privkey, &secp_ctx);
-			assert!(gossip_sync.handle_channel_update(&valid_channel_update).is_ok());
-			assert!(network_graph.read_only().channels().get(&short_channel_id).unwrap().one_to_two.is_some());
-			network_graph.remove_stale_channels_and_tracking_with_time(announcement_time + 1 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS);
+			let announcement_time = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("Time must be > 1970")
+				.as_secs();
+			let valid_channel_update = get_signed_channel_update(
+				|unsigned_channel_update| {
+					unsigned_channel_update.timestamp =
+						(announcement_time + 1 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS) as u32;
+				},
+				node_1_privkey,
+				&secp_ctx,
+			);
+			assert!(gossip_sync
+				.handle_channel_update(Some(node_1_pubkey), &valid_channel_update)
+				.is_ok());
+			assert!(network_graph.read_only().channels().get(&scid).unwrap().one_to_two.is_some());
+			network_graph.remove_stale_channels_and_tracking_with_time(
+				announcement_time + 1 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS,
+			);
 			// Make sure removed channels are tracked.
 			assert_eq!(network_graph.removed_channels.lock().unwrap().len(), 1);
 			// Provide a later time so that sufficient time has passed
-			network_graph.remove_stale_channels_and_tracking_with_time(announcement_time + 1 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS +
-				REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS);
+			network_graph.remove_stale_channels_and_tracking_with_time(
+				announcement_time
+					+ 1 + STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS
+					+ REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS,
+			);
 		}
 
 		assert_eq!(network_graph.read_only().channels().len(), 0);
@@ -3043,7 +3529,10 @@ pub(crate) mod tests {
 		{
 			use std::time::{SystemTime, UNIX_EPOCH};
 
-			let tracking_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
+			let tracking_time = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("Time must be > 1970")
+				.as_secs();
 
 			// Clear tracked nodes and channels for clean slate
 			network_graph.removed_channels.lock().unwrap().clear();
@@ -3051,23 +3540,39 @@ pub(crate) mod tests {
 
 			// Add a channel and nodes from channel announcement. So our network graph will
 			// now only consist of two nodes and one channel between them.
-			assert!(network_graph.update_channel_from_announcement(
-				&valid_channel_announcement, &chain_source).is_ok());
+			assert!(network_graph
+				.update_channel_from_announcement(&valid_channel_announcement, &chain_source)
+				.is_ok());
 
 			// Mark the channel as permanently failed. This will also remove the two nodes
 			// and all of the entries will be tracked as removed.
-			network_graph.channel_failed_permanent_with_time(short_channel_id, Some(tracking_time));
+			network_graph.channel_failed_permanent_with_time(scid, Some(tracking_time));
 
 			// Should not remove from tracking if insufficient time has passed
 			network_graph.remove_stale_channels_and_tracking_with_time(
-				tracking_time + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS - 1);
-			assert_eq!(network_graph.removed_channels.lock().unwrap().len(), 1, "Removed channel count ≠ 1 with tracking_time {}", tracking_time);
+				tracking_time + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS - 1,
+			);
+			assert_eq!(
+				network_graph.removed_channels.lock().unwrap().len(),
+				1,
+				"Removed channel count ≠ 1 with tracking_time {}",
+				tracking_time
+			);
 
 			// Provide a later time so that sufficient time has passed
 			network_graph.remove_stale_channels_and_tracking_with_time(
-				tracking_time + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS);
-			assert!(network_graph.removed_channels.lock().unwrap().is_empty(), "Unexpectedly removed channels with tracking_time {}", tracking_time);
-			assert!(network_graph.removed_nodes.lock().unwrap().is_empty(), "Unexpectedly removed nodes with tracking_time {}", tracking_time);
+				tracking_time + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS,
+			);
+			assert!(
+				network_graph.removed_channels.lock().unwrap().is_empty(),
+				"Unexpectedly removed channels with tracking_time {}",
+				tracking_time
+			);
+			assert!(
+				network_graph.removed_nodes.lock().unwrap().is_empty(),
+				"Unexpectedly removed nodes with tracking_time {}",
+				tracking_time
+			);
 		}
 
 		#[cfg(not(feature = "std"))]
@@ -3084,12 +3589,13 @@ pub(crate) mod tests {
 
 			// Add a channel and nodes from channel announcement. So our network graph will
 			// now only consist of two nodes and one channel between them.
-			assert!(network_graph.update_channel_from_announcement(
-				&valid_channel_announcement, &chain_source).is_ok());
+			assert!(network_graph
+				.update_channel_from_announcement(&valid_channel_announcement, &chain_source)
+				.is_ok());
 
 			// Mark the channel as permanently failed. This will also remove the two nodes
 			// and all of the entries will be tracked as removed.
-			network_graph.channel_failed_permanent(short_channel_id);
+			network_graph.channel_failed_permanent(scid);
 
 			// The first time we call the following, the channel will have a removal time assigned.
 			network_graph.remove_stale_channels_and_tracking_with_time(removal_time);
@@ -3097,7 +3603,8 @@ pub(crate) mod tests {
 
 			// Provide a later time so that sufficient time has passed
 			network_graph.remove_stale_channels_and_tracking_with_time(
-				removal_time + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS);
+				removal_time + REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS,
+			);
 			assert!(network_graph.removed_channels.lock().unwrap().is_empty());
 			assert!(network_graph.removed_nodes.lock().unwrap().is_empty());
 		}
@@ -3108,6 +3615,7 @@ pub(crate) mod tests {
 		let network_graph = create_network_graph();
 		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 
 		// Channels were not announced yet.
@@ -3117,16 +3625,20 @@ pub(crate) mod tests {
 		let short_channel_id;
 		{
 			// Announce a channel we will update
-			let valid_channel_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+			let valid_channel_announcement =
+				get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
 			short_channel_id = valid_channel_announcement.contents.short_channel_id;
-			match gossip_sync.handle_channel_announcement(&valid_channel_announcement) {
+			match gossip_sync
+				.handle_channel_announcement(Some(node_1_pubkey), &valid_channel_announcement)
+			{
 				Ok(_) => (),
-				Err(_) => panic!()
+				Err(_) => panic!(),
 			};
 		}
 
 		// Contains initial channel announcement now.
-		let channels_with_announcements = gossip_sync.get_next_channel_announcement(short_channel_id);
+		let channels_with_announcements =
+			gossip_sync.get_next_channel_announcement(short_channel_id);
 		if let Some(channel_announcements) = channels_with_announcements {
 			let (_, ref update_1, ref update_2) = channel_announcements;
 			assert_eq!(update_1, &None);
@@ -3137,17 +3649,22 @@ pub(crate) mod tests {
 
 		{
 			// Valid channel update
-			let valid_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-				unsigned_channel_update.timestamp = 101;
-			}, node_1_privkey, &secp_ctx);
-			match gossip_sync.handle_channel_update(&valid_channel_update) {
+			let valid_channel_update = get_signed_channel_update(
+				|unsigned_channel_update| {
+					unsigned_channel_update.timestamp = 101;
+				},
+				node_1_privkey,
+				&secp_ctx,
+			);
+			match gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update) {
 				Ok(_) => (),
-				Err(_) => panic!()
+				Err(_) => panic!(),
 			};
 		}
 
 		// Now contains an initial announcement and an update.
-		let channels_with_announcements = gossip_sync.get_next_channel_announcement(short_channel_id);
+		let channels_with_announcements =
+			gossip_sync.get_next_channel_announcement(short_channel_id);
 		if let Some(channel_announcements) = channels_with_announcements {
 			let (_, ref update_1, ref update_2) = channel_announcements;
 			assert_ne!(update_1, &None);
@@ -3158,18 +3675,24 @@ pub(crate) mod tests {
 
 		{
 			// Channel update with excess data.
-			let valid_channel_update = get_signed_channel_update(|unsigned_channel_update| {
-				unsigned_channel_update.timestamp = 102;
-				unsigned_channel_update.excess_data = [1; MAX_EXCESS_BYTES_FOR_RELAY + 1].to_vec();
-			}, node_1_privkey, &secp_ctx);
-			match gossip_sync.handle_channel_update(&valid_channel_update) {
+			let valid_channel_update = get_signed_channel_update(
+				|unsigned_channel_update| {
+					unsigned_channel_update.timestamp = 102;
+					unsigned_channel_update.excess_data =
+						[1; MAX_EXCESS_BYTES_FOR_RELAY + 1].to_vec();
+				},
+				node_1_privkey,
+				&secp_ctx,
+			);
+			match gossip_sync.handle_channel_update(Some(node_1_pubkey), &valid_channel_update) {
 				Ok(_) => (),
-				Err(_) => panic!()
+				Err(_) => panic!(),
 			};
 		}
 
 		// Test that announcements with excess data won't be returned
-		let channels_with_announcements = gossip_sync.get_next_channel_announcement(short_channel_id);
+		let channels_with_announcements =
+			gossip_sync.get_next_channel_announcement(short_channel_id);
 		if let Some(channel_announcements) = channels_with_announcements {
 			let (_, ref update_1, ref update_2) = channel_announcements;
 			assert_eq!(update_1, &None);
@@ -3179,7 +3702,8 @@ pub(crate) mod tests {
 		}
 
 		// Further starting point have no channels after it
-		let channels_with_announcements = gossip_sync.get_next_channel_announcement(short_channel_id + 1000);
+		let channels_with_announcements =
+			gossip_sync.get_next_channel_announcement(short_channel_id + 1000);
 		assert!(channels_with_announcements.is_none());
 	}
 
@@ -3188,6 +3712,7 @@ pub(crate) mod tests {
 		let network_graph = create_network_graph();
 		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 		let node_id_1 = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_1_privkey));
 
@@ -3197,10 +3722,13 @@ pub(crate) mod tests {
 
 		{
 			// Announce a channel to add 2 nodes
-			let valid_channel_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
-			match gossip_sync.handle_channel_announcement(&valid_channel_announcement) {
+			let valid_channel_announcement =
+				get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+			match gossip_sync
+				.handle_channel_announcement(Some(node_1_pubkey), &valid_channel_announcement)
+			{
 				Ok(_) => (),
-				Err(_) => panic!()
+				Err(_) => panic!(),
 			};
 		}
 
@@ -3209,16 +3737,18 @@ pub(crate) mod tests {
 		assert!(next_announcements.is_none());
 
 		{
-			let valid_announcement = get_signed_node_announcement(|_| {}, node_1_privkey, &secp_ctx);
-			match gossip_sync.handle_node_announcement(&valid_announcement) {
+			let valid_announcement =
+				get_signed_node_announcement(|_| {}, node_1_privkey, &secp_ctx);
+			match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &valid_announcement) {
 				Ok(_) => (),
-				Err(_) => panic!()
+				Err(_) => panic!(),
 			};
 
-			let valid_announcement = get_signed_node_announcement(|_| {}, node_2_privkey, &secp_ctx);
-			match gossip_sync.handle_node_announcement(&valid_announcement) {
+			let valid_announcement =
+				get_signed_node_announcement(|_| {}, node_2_privkey, &secp_ctx);
+			match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &valid_announcement) {
 				Ok(_) => (),
-				Err(_) => panic!()
+				Err(_) => panic!(),
 			};
 		}
 
@@ -3231,13 +3761,18 @@ pub(crate) mod tests {
 
 		{
 			// Later announcement which should not be relayed (excess data) prevent us from sharing a node
-			let valid_announcement = get_signed_node_announcement(|unsigned_announcement| {
-				unsigned_announcement.timestamp += 10;
-				unsigned_announcement.excess_data = [1; MAX_EXCESS_BYTES_FOR_RELAY + 1].to_vec();
-			}, node_2_privkey, &secp_ctx);
-			match gossip_sync.handle_node_announcement(&valid_announcement) {
+			let valid_announcement = get_signed_node_announcement(
+				|unsigned_announcement| {
+					unsigned_announcement.timestamp += 10;
+					unsigned_announcement.excess_data =
+						[1; MAX_EXCESS_BYTES_FOR_RELAY + 1].to_vec();
+				},
+				node_2_privkey,
+				&secp_ctx,
+			);
+			match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &valid_announcement) {
 				Ok(res) => assert!(!res),
-				Err(_) => panic!()
+				Err(_) => panic!(),
 			};
 		}
 
@@ -3251,19 +3786,21 @@ pub(crate) mod tests {
 		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
 
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 
 		// Announce a channel to add a corresponding node.
-		let valid_announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
-		match gossip_sync.handle_channel_announcement(&valid_announcement) {
+		let valid_announcement =
+			get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+		match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement) {
 			Ok(res) => assert!(res),
-			_ => panic!()
+			_ => panic!(),
 		};
 
 		let valid_announcement = get_signed_node_announcement(|_| {}, node_1_privkey, &secp_ctx);
-		match gossip_sync.handle_node_announcement(&valid_announcement) {
+		match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &valid_announcement) {
 			Ok(_) => (),
-			Err(_) => panic!()
+			Err(_) => panic!(),
 		};
 
 		let mut w = test_utils::TestVecWriter(Vec::new());
@@ -3272,7 +3809,9 @@ pub(crate) mod tests {
 		network_graph.write(&mut w).unwrap();
 
 		let logger = Arc::new(test_utils::TestLogger::new());
-		assert!(<NetworkGraph<_>>::read(&mut io::Cursor::new(&w.0), logger).unwrap() == network_graph);
+		assert!(
+			<NetworkGraph<_>>::read(&mut io::Cursor::new(&w.0), logger).unwrap() == network_graph
+		);
 	}
 
 	#[test]
@@ -3284,7 +3823,8 @@ pub(crate) mod tests {
 		network_graph.write(&mut w).unwrap();
 
 		let logger = Arc::new(test_utils::TestLogger::new());
-		let reassembled_network_graph: NetworkGraph<_> = ReadableArgs::read(&mut io::Cursor::new(&w.0), logger).unwrap();
+		let reassembled_network_graph: NetworkGraph<_> =
+			ReadableArgs::read(&mut io::Cursor::new(&w.0), logger).unwrap();
 		assert!(reassembled_network_graph == network_graph);
 		assert_eq!(reassembled_network_graph.get_last_rapid_gossip_sync_timestamp().unwrap(), 42);
 	}
@@ -3292,8 +3832,8 @@ pub(crate) mod tests {
 	#[test]
 	#[cfg(feature = "std")]
 	fn calling_sync_routing_table() {
-		use std::time::{SystemTime, UNIX_EPOCH};
 		use crate::ln::msgs::Init;
+		use std::time::{SystemTime, UNIX_EPOCH};
 
 		let network_graph = create_network_graph();
 		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
@@ -3304,8 +3844,12 @@ pub(crate) mod tests {
 
 		// It should ignore if gossip_queries feature is not enabled
 		{
-			let init_msg = Init { features: InitFeatures::empty(), networks: None, remote_network_address: None };
-			gossip_sync.peer_connected(&node_id_1, &init_msg, true).unwrap();
+			let init_msg = Init {
+				features: InitFeatures::empty(),
+				networks: None,
+				remote_network_address: None,
+			};
+			gossip_sync.peer_connected(node_id_1, &init_msg, true).unwrap();
 			let events = gossip_sync.get_and_clear_pending_msg_events();
 			assert_eq!(events.len(), 0);
 		}
@@ -3315,19 +3859,27 @@ pub(crate) mod tests {
 			let mut features = InitFeatures::empty();
 			features.set_gossip_queries_optional();
 			let init_msg = Init { features, networks: None, remote_network_address: None };
-			gossip_sync.peer_connected(&node_id_1, &init_msg, true).unwrap();
+			gossip_sync.peer_connected(node_id_1, &init_msg, true).unwrap();
 			let events = gossip_sync.get_and_clear_pending_msg_events();
 			assert_eq!(events.len(), 1);
 			match &events[0] {
-				MessageSendEvent::SendGossipTimestampFilter{ node_id, msg } => {
+				MessageSendEvent::SendGossipTimestampFilter { node_id, msg } => {
 					assert_eq!(node_id, &node_id_1);
 					assert_eq!(msg.chain_hash, chain_hash);
-					let expected_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs();
-					assert!((msg.first_timestamp as u64) >= expected_timestamp - 60*60*24*7*2);
-					assert!((msg.first_timestamp as u64) < expected_timestamp - 60*60*24*7*2 + 10);
+					let expected_timestamp = SystemTime::now()
+						.duration_since(UNIX_EPOCH)
+						.expect("Time must be > 1970")
+						.as_secs();
+					assert!(
+						(msg.first_timestamp as u64) >= expected_timestamp - 60 * 60 * 24 * 7 * 2
+					);
+					assert!(
+						(msg.first_timestamp as u64)
+							< expected_timestamp - 60 * 60 * 24 * 7 * 2 + 10
+					);
 					assert_eq!(msg.timestamp_range, u32::max_value());
 				},
-				_ => panic!("Expected MessageSendEvent::SendChannelRangeQuery")
+				_ => panic!("Expected MessageSendEvent::SendChannelRangeQuery"),
 			};
 		}
 	}
@@ -3339,6 +3891,7 @@ pub(crate) mod tests {
 
 		let chain_hash = ChainHash::using_genesis_block(Network::Testnet);
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 		let node_id_2 = PublicKey::from_secret_key(&secp_ctx, node_2_privkey);
 
@@ -3356,12 +3909,18 @@ pub(crate) mod tests {
 		scids.push(scid_from_parts(108001, 1, 0).unwrap());
 
 		for scid in scids {
-			let valid_announcement = get_signed_channel_announcement(|unsigned_announcement| {
-				unsigned_announcement.short_channel_id = scid;
-			}, node_1_privkey, node_2_privkey, &secp_ctx);
-			match gossip_sync.handle_channel_announcement(&valid_announcement) {
+			let valid_announcement = get_signed_channel_announcement(
+				|unsigned_announcement| {
+					unsigned_announcement.short_channel_id = scid;
+				},
+				node_1_privkey,
+				node_2_privkey,
+				&secp_ctx,
+			);
+			match gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &valid_announcement)
+			{
 				Ok(_) => (),
-				_ => panic!()
+				_ => panic!(),
 			};
 		}
 
@@ -3380,8 +3939,8 @@ pub(crate) mod tests {
 				first_blocknum: 0,
 				number_of_blocks: 0,
 				sync_complete: true,
-				short_channel_ids: vec![]
-			}]
+				short_channel_ids: vec![],
+			}],
 		);
 
 		// Error when wrong chain
@@ -3400,7 +3959,7 @@ pub(crate) mod tests {
 				number_of_blocks: 0xffff_ffff,
 				sync_complete: true,
 				short_channel_ids: vec![],
-			}]
+			}],
 		);
 
 		// Error when first_blocknum > 0xffffff
@@ -3418,8 +3977,8 @@ pub(crate) mod tests {
 				first_blocknum: 0x01000000,
 				number_of_blocks: 0xffff_ffff,
 				sync_complete: true,
-				short_channel_ids: vec![]
-			}]
+				short_channel_ids: vec![],
+			}],
 		);
 
 		// Empty reply when max valid SCID block num
@@ -3432,15 +3991,13 @@ pub(crate) mod tests {
 				number_of_blocks: 1,
 			},
 			true,
-			vec![
-				ReplyChannelRange {
-					chain_hash: chain_hash.clone(),
-					first_blocknum: 0xffffff,
-					number_of_blocks: 1,
-					sync_complete: true,
-					short_channel_ids: vec![]
-				},
-			]
+			vec![ReplyChannelRange {
+				chain_hash: chain_hash.clone(),
+				first_blocknum: 0xffffff,
+				number_of_blocks: 1,
+				sync_complete: true,
+				short_channel_ids: vec![],
+			}],
 		);
 
 		// No results in valid query range
@@ -3453,15 +4010,13 @@ pub(crate) mod tests {
 				number_of_blocks: 1000,
 			},
 			true,
-			vec![
-				ReplyChannelRange {
-					chain_hash: chain_hash.clone(),
-					first_blocknum: 1000,
-					number_of_blocks: 1000,
-					sync_complete: true,
-					short_channel_ids: vec![],
-				}
-			]
+			vec![ReplyChannelRange {
+				chain_hash: chain_hash.clone(),
+				first_blocknum: 1000,
+				number_of_blocks: 1000,
+				sync_complete: true,
+				short_channel_ids: vec![],
+			}],
 		);
 
 		// Overflow first_blocknum + number_of_blocks
@@ -3474,17 +4029,15 @@ pub(crate) mod tests {
 				number_of_blocks: 0xffffffff,
 			},
 			true,
-			vec![
-				ReplyChannelRange {
-					chain_hash: chain_hash.clone(),
-					first_blocknum: 0xfe0000,
-					number_of_blocks: 0xffffffff - 0xfe0000,
-					sync_complete: true,
-					short_channel_ids: vec![
-						0xfffffe_ffffff_ffff, // max
-					]
-				}
-			]
+			vec![ReplyChannelRange {
+				chain_hash: chain_hash.clone(),
+				first_blocknum: 0xfe0000,
+				number_of_blocks: 0xffffffff - 0xfe0000,
+				sync_complete: true,
+				short_channel_ids: vec![
+					0xfffffe_ffffff_ffff, // max
+				],
+			}],
 		);
 
 		// Single block exactly full
@@ -3497,17 +4050,15 @@ pub(crate) mod tests {
 				number_of_blocks: 8000,
 			},
 			true,
-			vec![
-				ReplyChannelRange {
-					chain_hash: chain_hash.clone(),
-					first_blocknum: 100000,
-					number_of_blocks: 8000,
-					sync_complete: true,
-					short_channel_ids: (100000..=107999)
-						.map(|block| scid_from_parts(block, 0, 0).unwrap())
-						.collect(),
-				},
-			]
+			vec![ReplyChannelRange {
+				chain_hash: chain_hash.clone(),
+				first_blocknum: 100000,
+				number_of_blocks: 8000,
+				sync_complete: true,
+				short_channel_ids: (100000..=107999)
+					.map(|block| scid_from_parts(block, 0, 0).unwrap())
+					.collect(),
+			}],
 		);
 
 		// Multiple split on new block
@@ -3535,11 +4086,9 @@ pub(crate) mod tests {
 					first_blocknum: 107999,
 					number_of_blocks: 2,
 					sync_complete: true,
-					short_channel_ids: vec![
-						scid_from_parts(108000, 0, 0).unwrap(),
-					],
-				}
-			]
+					short_channel_ids: vec![scid_from_parts(108000, 0, 0).unwrap()],
+				},
+			],
 		);
 
 		// Multiple split on same block
@@ -3567,25 +4116,25 @@ pub(crate) mod tests {
 					first_blocknum: 108001,
 					number_of_blocks: 1,
 					sync_complete: true,
-					short_channel_ids: vec![
-						scid_from_parts(108001, 1, 0).unwrap(),
-					],
-				}
-			]
+					short_channel_ids: vec![scid_from_parts(108001, 1, 0).unwrap()],
+				},
+			],
 		);
 	}
 
 	fn do_handling_query_channel_range(
-		gossip_sync: &P2PGossipSync<&NetworkGraph<Arc<test_utils::TestLogger>>, Arc<test_utils::TestChainSource>, Arc<test_utils::TestLogger>>,
-		test_node_id: &PublicKey,
-		msg: QueryChannelRange,
-		expected_ok: bool,
-		expected_replies: Vec<ReplyChannelRange>
+		gossip_sync: &P2PGossipSync<
+			&NetworkGraph<Arc<test_utils::TestLogger>>,
+			Arc<test_utils::TestChainSource>,
+			Arc<test_utils::TestLogger>,
+		>,
+		test_node_id: &PublicKey, msg: QueryChannelRange, expected_ok: bool,
+		expected_replies: Vec<ReplyChannelRange>,
 	) {
 		let mut max_firstblocknum = msg.first_blocknum.saturating_sub(1);
 		let mut c_lightning_0_9_prev_end_blocknum = max_firstblocknum;
 		let query_end_blocknum = msg.end_blocknum();
-		let result = gossip_sync.handle_query_channel_range(test_node_id, msg);
+		let result = gossip_sync.handle_query_channel_range(*test_node_id, msg);
 
 		if expected_ok {
 			assert!(result.is_ok());
@@ -3608,14 +4157,22 @@ pub(crate) mod tests {
 					assert_eq!(msg.short_channel_ids, expected_reply.short_channel_ids);
 
 					// Enforce exactly the sequencing requirements present on c-lightning v0.9.3
-					assert!(msg.first_blocknum == c_lightning_0_9_prev_end_blocknum || msg.first_blocknum == c_lightning_0_9_prev_end_blocknum.saturating_add(1));
+					assert!(
+						msg.first_blocknum == c_lightning_0_9_prev_end_blocknum
+							|| msg.first_blocknum
+								== c_lightning_0_9_prev_end_blocknum.saturating_add(1)
+					);
 					assert!(msg.first_blocknum >= max_firstblocknum);
 					max_firstblocknum = msg.first_blocknum;
-					c_lightning_0_9_prev_end_blocknum = msg.first_blocknum.saturating_add(msg.number_of_blocks);
+					c_lightning_0_9_prev_end_blocknum =
+						msg.first_blocknum.saturating_add(msg.number_of_blocks);
 
 					// Check that the last block count is >= the query's end_blocknum
 					if i == events.len() - 1 {
-						assert!(msg.first_blocknum.saturating_add(msg.number_of_blocks) >= query_end_blocknum);
+						assert!(
+							msg.first_blocknum.saturating_add(msg.number_of_blocks)
+								>= query_end_blocknum
+						);
 					}
 				},
 				_ => panic!("expected MessageSendEvent::SendReplyChannelRange"),
@@ -3632,10 +4189,10 @@ pub(crate) mod tests {
 
 		let chain_hash = ChainHash::using_genesis_block(Network::Testnet);
 
-		let result = gossip_sync.handle_query_short_channel_ids(&node_id, QueryShortChannelIds {
-			chain_hash,
-			short_channel_ids: vec![0x0003e8_000000_0000],
-		});
+		let result = gossip_sync.handle_query_short_channel_ids(
+			node_id,
+			QueryShortChannelIds { chain_hash, short_channel_ids: vec![0x0003e8_000000_0000] },
+		);
 		assert!(result.is_err());
 	}
 
@@ -3643,7 +4200,7 @@ pub(crate) mod tests {
 	fn displays_node_alias() {
 		let format_str_alias = |alias: &str| {
 			let mut bytes = [0u8; 32];
-			bytes[..alias.as_bytes().len()].copy_from_slice(alias.as_bytes());
+			bytes[..alias.len()].copy_from_slice(alias.as_bytes());
 			format!("{}", NodeAlias(bytes))
 		};
 
@@ -3666,7 +4223,11 @@ pub(crate) mod tests {
 	fn channel_info_is_readable() {
 		let chanmon_cfgs = crate::ln::functional_test_utils::create_chanmon_cfgs(2);
 		let node_cfgs = crate::ln::functional_test_utils::create_node_cfgs(2, &chanmon_cfgs);
-		let node_chanmgrs = crate::ln::functional_test_utils::create_node_chanmgrs(2, &node_cfgs, &[None, None, None, None]);
+		let node_chanmgrs = crate::ln::functional_test_utils::create_node_chanmgrs(
+			2,
+			&node_cfgs,
+			&[None, None, None, None],
+		);
 		let nodes = crate::ln::functional_test_utils::create_network(2, &node_cfgs, &node_chanmgrs);
 		let config = crate::ln::functional_test_utils::test_default_channel_config();
 
@@ -3685,7 +4246,8 @@ pub(crate) mod tests {
 		assert!(chan_update_info.write(&mut encoded_chan_update_info).is_ok());
 
 		// First make sure we can read ChannelUpdateInfos we just wrote
-		let read_chan_update_info: ChannelUpdateInfo = crate::util::ser::Readable::read(&mut encoded_chan_update_info.as_slice()).unwrap();
+		let read_chan_update_info: ChannelUpdateInfo =
+			crate::util::ser::Readable::read(&mut encoded_chan_update_info.as_slice()).unwrap();
 		assert_eq!(chan_update_info, read_chan_update_info);
 
 		// Check the serialization hasn't changed.
@@ -3695,11 +4257,15 @@ pub(crate) mod tests {
 		// Check we fail if htlc_maximum_msat is not present in either the ChannelUpdateInfo itself
 		// or the ChannelUpdate enclosed with `last_update_message`.
 		let legacy_chan_update_info_with_some_and_fail_update: Vec<u8> = <Vec<u8>>::from_hex("b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f42400000271000000014").unwrap();
-		let read_chan_update_info_res: Result<ChannelUpdateInfo, crate::ln::msgs::DecodeError> = crate::util::ser::Readable::read(&mut legacy_chan_update_info_with_some_and_fail_update.as_slice());
+		let read_chan_update_info_res: Result<ChannelUpdateInfo, crate::ln::msgs::DecodeError> =
+			crate::util::ser::Readable::read(
+				&mut legacy_chan_update_info_with_some_and_fail_update.as_slice(),
+			);
 		assert!(read_chan_update_info_res.is_err());
 
 		let legacy_chan_update_info_with_none: Vec<u8> = <Vec<u8>>::from_hex("2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c0100").unwrap();
-		let read_chan_update_info_res: Result<ChannelUpdateInfo, crate::ln::msgs::DecodeError> = crate::util::ser::Readable::read(&mut legacy_chan_update_info_with_none.as_slice());
+		let read_chan_update_info_res: Result<ChannelUpdateInfo, crate::ln::msgs::DecodeError> =
+			crate::util::ser::Readable::read(&mut legacy_chan_update_info_with_none.as_slice());
 		assert!(read_chan_update_info_res.is_err());
 
 		// 2. Test encoding/decoding of ChannelInfo
@@ -3720,7 +4286,8 @@ pub(crate) mod tests {
 		let mut encoded_chan_info: Vec<u8> = Vec::new();
 		assert!(chan_info_none_updates.write(&mut encoded_chan_info).is_ok());
 
-		let read_chan_info: ChannelInfo = crate::util::ser::Readable::read(&mut encoded_chan_info.as_slice()).unwrap();
+		let read_chan_info: ChannelInfo =
+			crate::util::ser::Readable::read(&mut encoded_chan_info.as_slice()).unwrap();
 		assert_eq!(chan_info_none_updates, read_chan_info);
 
 		// Check we can encode/decode ChannelInfo with ChannelUpdateInfo fields present.
@@ -3740,7 +4307,8 @@ pub(crate) mod tests {
 		let mut encoded_chan_info: Vec<u8> = Vec::new();
 		assert!(chan_info_some_updates.write(&mut encoded_chan_info).is_ok());
 
-		let read_chan_info: ChannelInfo = crate::util::ser::Readable::read(&mut encoded_chan_info.as_slice()).unwrap();
+		let read_chan_info: ChannelInfo =
+			crate::util::ser::Readable::read(&mut encoded_chan_info.as_slice()).unwrap();
 		assert_eq!(chan_info_some_updates, read_chan_info);
 
 		// Check the serialization hasn't changed.
@@ -3750,13 +4318,17 @@ pub(crate) mod tests {
 		// Check we can decode legacy ChannelInfo, even if the `two_to_one` / `one_to_two` /
 		// `last_update_message` fields fail to decode due to missing htlc_maximum_msat.
 		let legacy_chan_info_with_some_and_fail_update = <Vec<u8>>::from_hex("fd01ca00020000010800000000000156660221027f921585f2ac0c7c70e36110adecfd8fd14b8a99bfb3d000a283fcac358fce8804b6b6b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f4240000027100000001406210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c2308b6b6b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f424000002710000000140a01000c0100").unwrap();
-		let read_chan_info: ChannelInfo = crate::util::ser::Readable::read(&mut legacy_chan_info_with_some_and_fail_update.as_slice()).unwrap();
+		let read_chan_info: ChannelInfo = crate::util::ser::Readable::read(
+			&mut legacy_chan_info_with_some_and_fail_update.as_slice(),
+		)
+		.unwrap();
 		assert_eq!(read_chan_info.announcement_received_time, 87654);
 		assert_eq!(read_chan_info.one_to_two, None);
 		assert_eq!(read_chan_info.two_to_one, None);
 
 		let legacy_chan_info_with_none: Vec<u8> = <Vec<u8>>::from_hex("ba00020000010800000000000156660221027f921585f2ac0c7c70e36110adecfd8fd14b8a99bfb3d000a283fcac358fce88042e2e2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c010006210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c23082e2e2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c01000a01000c0100").unwrap();
-		let read_chan_info: ChannelInfo = crate::util::ser::Readable::read(&mut legacy_chan_info_with_none.as_slice()).unwrap();
+		let read_chan_info: ChannelInfo =
+			crate::util::ser::Readable::read(&mut legacy_chan_info_with_none.as_slice()).unwrap();
 		assert_eq!(read_chan_info.announcement_received_time, 87654);
 		assert_eq!(read_chan_info.one_to_two, None);
 		assert_eq!(read_chan_info.two_to_one, None);
@@ -3766,17 +4338,21 @@ pub(crate) mod tests {
 	fn node_info_is_readable() {
 		// 1. Check we can read a valid NodeAnnouncementInfo and fail on an invalid one
 		let announcement_message = <Vec<u8>>::from_hex("d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000122013413a7031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f2020201010101010101010101010101010101010101010101010101010101010101010000701fffefdfc2607").unwrap();
-		let announcement_message = NodeAnnouncement::read(&mut announcement_message.as_slice()).unwrap();
+		let announcement_message =
+			NodeAnnouncement::read_from_fixed_length_buffer(&mut announcement_message.as_slice())
+				.unwrap();
 		let valid_node_ann_info = NodeAnnouncementInfo::Relayed(announcement_message);
 
 		let mut encoded_valid_node_ann_info = Vec::new();
 		assert!(valid_node_ann_info.write(&mut encoded_valid_node_ann_info).is_ok());
-		let read_valid_node_ann_info = NodeAnnouncementInfo::read(&mut encoded_valid_node_ann_info.as_slice()).unwrap();
+		let read_valid_node_ann_info =
+			NodeAnnouncementInfo::read(&mut encoded_valid_node_ann_info.as_slice()).unwrap();
 		assert_eq!(read_valid_node_ann_info, valid_node_ann_info);
 		assert_eq!(read_valid_node_ann_info.addresses().len(), 1);
 
 		let encoded_invalid_node_ann_info = <Vec<u8>>::from_hex("3f0009000788a000080a51a20204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014004d2").unwrap();
-		let read_invalid_node_ann_info_res = NodeAnnouncementInfo::read(&mut encoded_invalid_node_ann_info.as_slice());
+		let read_invalid_node_ann_info_res =
+			NodeAnnouncementInfo::read(&mut encoded_invalid_node_ann_info.as_slice());
 		assert!(read_invalid_node_ann_info_res.is_err());
 
 		// 2. Check we can read a NodeInfo anyways, but set the NodeAnnouncementInfo to None if invalid
@@ -3792,14 +4368,16 @@ pub(crate) mod tests {
 		assert_eq!(read_valid_node_info, valid_node_info);
 
 		let encoded_invalid_node_info_hex = <Vec<u8>>::from_hex("4402403f0009000788a000080a51a20204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014004d20400").unwrap();
-		let read_invalid_node_info = NodeInfo::read(&mut encoded_invalid_node_info_hex.as_slice()).unwrap();
+		let read_invalid_node_info =
+			NodeInfo::read(&mut encoded_invalid_node_info_hex.as_slice()).unwrap();
 		assert_eq!(read_invalid_node_info.announcement_info, None);
 	}
 
 	#[test]
 	fn test_node_info_keeps_compatibility() {
 		let old_ann_info_with_addresses = <Vec<u8>>::from_hex("3f0009000708a000080a51220204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014104d2").unwrap();
-		let ann_info_with_addresses = NodeAnnouncementInfo::read(&mut old_ann_info_with_addresses.as_slice())
+		let ann_info_with_addresses =
+			NodeAnnouncementInfo::read(&mut old_ann_info_with_addresses.as_slice())
 				.expect("to be able to read an old NodeAnnouncementInfo with addresses");
 		// This serialized info has no announcement_message but its address field should still be considered
 		assert!(!ann_info_with_addresses.addresses().is_empty());
@@ -3808,7 +4386,10 @@ pub(crate) mod tests {
 	#[test]
 	fn test_node_id_display() {
 		let node_id = NodeId([42; 33]);
-		assert_eq!(format!("{}", &node_id), "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a");
+		assert_eq!(
+			format!("{}", &node_id),
+			"2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+		);
 	}
 
 	#[test]
@@ -3817,26 +4398,29 @@ pub(crate) mod tests {
 		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
 
 		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
 		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
 		let node_1_id = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_1_privkey));
 
-		let announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
-		gossip_sync.handle_channel_announcement(&announcement).unwrap();
+		let announcement =
+			get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+		gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &announcement).unwrap();
 
-		let tcp_ip_v4 = SocketAddress::TcpIpV4 {
-			addr: [255, 254, 253, 252],
-			port: 9735
-		};
+		let tcp_ip_v4 = SocketAddress::TcpIpV4 { addr: [255, 254, 253, 252], port: 9735 };
 		let tcp_ip_v6 = SocketAddress::TcpIpV6 {
 			addr: [255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240],
-			port: 9735
+			port: 9735,
 		};
-		let onion_v2 = SocketAddress::OnionV2([255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 38, 7]);
+		let onion_v2 =
+			SocketAddress::OnionV2([255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 38, 7]);
 		let onion_v3 = SocketAddress::OnionV3 {
-			ed25519_pubkey:	[255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240, 239, 238, 237, 236, 235, 234, 233, 232, 231, 230, 229, 228, 227, 226, 225, 224],
+			ed25519_pubkey: [
+				255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240,
+				239, 238, 237, 236, 235, 234, 233, 232, 231, 230, 229, 228, 227, 226, 225, 224,
+			],
 			checksum: 32,
 			version: 16,
-			port: 9735
+			port: 9735,
 		};
 		let hostname = SocketAddress::Hostname {
 			hostname: Hostname::try_from(String::from("host")).unwrap(),
@@ -3846,44 +4430,48 @@ pub(crate) mod tests {
 		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 
 		let announcement = get_signed_node_announcement(|_| {}, node_1_privkey, &secp_ctx);
-		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &announcement).unwrap();
 		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 
 		let announcement = get_signed_node_announcement(
 			|announcement| {
 				announcement.addresses = vec![
-					tcp_ip_v4.clone(), tcp_ip_v6.clone(), onion_v2.clone(), onion_v3.clone(),
-					hostname.clone()
+					tcp_ip_v4.clone(),
+					tcp_ip_v6.clone(),
+					onion_v2.clone(),
+					onion_v3.clone(),
+					hostname.clone(),
 				];
 				announcement.timestamp += 1000;
 			},
-			node_1_privkey, &secp_ctx
+			node_1_privkey,
+			&secp_ctx,
 		);
-		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &announcement).unwrap();
 		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 
 		let announcement = get_signed_node_announcement(
 			|announcement| {
-				announcement.addresses = vec![
-					tcp_ip_v4.clone(), tcp_ip_v6.clone(), onion_v2.clone(), onion_v3.clone()
-				];
+				announcement.addresses =
+					vec![tcp_ip_v4.clone(), tcp_ip_v6.clone(), onion_v2.clone(), onion_v3.clone()];
 				announcement.timestamp += 2000;
 			},
-			node_1_privkey, &secp_ctx
+			node_1_privkey,
+			&secp_ctx,
 		);
-		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &announcement).unwrap();
 		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 
 		let announcement = get_signed_node_announcement(
 			|announcement| {
-				announcement.addresses = vec![
-					tcp_ip_v6.clone(), onion_v2.clone(), onion_v3.clone()
-				];
+				announcement.addresses =
+					vec![tcp_ip_v6.clone(), onion_v2.clone(), onion_v3.clone()];
 				announcement.timestamp += 3000;
 			},
-			node_1_privkey, &secp_ctx
+			node_1_privkey,
+			&secp_ctx,
 		);
-		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &announcement).unwrap();
 		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 
 		let announcement = get_signed_node_announcement(
@@ -3891,9 +4479,10 @@ pub(crate) mod tests {
 				announcement.addresses = vec![onion_v2.clone(), onion_v3.clone()];
 				announcement.timestamp += 4000;
 			},
-			node_1_privkey, &secp_ctx
+			node_1_privkey,
+			&secp_ctx,
 		);
-		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &announcement).unwrap();
 		assert!(network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 
 		let announcement = get_signed_node_announcement(
@@ -3901,9 +4490,10 @@ pub(crate) mod tests {
 				announcement.addresses = vec![onion_v2.clone()];
 				announcement.timestamp += 5000;
 			},
-			node_1_privkey, &secp_ctx
+			node_1_privkey,
+			&secp_ctx,
 		);
-		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &announcement).unwrap();
 		assert!(network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 
 		let announcement = get_signed_node_announcement(
@@ -3911,9 +4501,10 @@ pub(crate) mod tests {
 				announcement.addresses = vec![tcp_ip_v4.clone()];
 				announcement.timestamp += 6000;
 			},
-			node_1_privkey, &secp_ctx
+			node_1_privkey,
+			&secp_ctx,
 		);
-		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &announcement).unwrap();
 		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 	}
 }
@@ -3921,17 +4512,19 @@ pub(crate) mod tests {
 #[cfg(ldk_bench)]
 pub mod benches {
 	use super::*;
-	use std::io::Read;
 	use criterion::{black_box, Criterion};
+	use std::io::Read;
 
 	pub fn read_network_graph(bench: &mut Criterion) {
 		let logger = crate::util::test_utils::TestLogger::new();
 		let (mut d, _) = crate::routing::router::bench_utils::get_graph_scorer_file().unwrap();
 		let mut v = Vec::new();
 		d.read_to_end(&mut v).unwrap();
-		bench.bench_function("read_network_graph", |b| b.iter(||
-			NetworkGraph::read(&mut crate::io::Cursor::new(black_box(&v)), &logger).unwrap()
-		));
+		bench.bench_function("read_network_graph", |b| {
+			b.iter(|| {
+				NetworkGraph::read(&mut crate::io::Cursor::new(black_box(&v)), &logger).unwrap()
+			})
+		});
 	}
 
 	pub fn write_network_graph(bench: &mut Criterion) {
@@ -3940,9 +4533,7 @@ pub mod benches {
 		let mut graph_buffer = Vec::new();
 		d.read_to_end(&mut graph_buffer).unwrap();
 		let net_graph = NetworkGraph::read(&mut &graph_buffer[..], &logger).unwrap();
-		bench.bench_function("write_network_graph", |b| b.iter(||
-			black_box(&net_graph).encode()
-		));
+		bench.bench_function("write_network_graph", |b| b.iter(|| black_box(&net_graph).encode()));
 	}
 }
 */

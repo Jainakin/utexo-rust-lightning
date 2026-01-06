@@ -10,11 +10,10 @@ use bitcoin::hash_types::BlockHash;
 use bitcoin::transaction::{OutPoint, TxOut};
 
 use lightning::ln::peer_handler::APeerManager;
-
 use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
 use lightning::routing::utxo::{UtxoFuture, UtxoLookup, UtxoLookupError, UtxoResult};
-
 use lightning::util::logger::Logger;
+use lightning::util::native_async::FutureSpawner;
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -41,17 +40,6 @@ pub trait UtxoSource: BlockSource + 'static {
 	/// Returns true if the given output has *not* been spent, i.e. is a member of the current UTXO
 	/// set.
 	fn is_output_unspent<'a>(&'a self, outpoint: OutPoint) -> AsyncBlockSourceResult<'a, bool>;
-}
-
-/// A generic trait which is able to spawn futures in the background.
-///
-/// If the `tokio` feature is enabled, this is implemented on `TokioSpawner` struct which
-/// delegates to `tokio::spawn()`.
-pub trait FutureSpawner: Send + Sync + 'static {
-	/// Spawns the given future as a background task.
-	///
-	/// This method MUST NOT block on the given future immediately.
-	fn spawn<T: Future<Output = ()> + Send + 'static>(&self, future: T);
 }
 
 #[cfg(feature = "tokio")]
@@ -144,7 +132,7 @@ pub struct GossipVerifier<
 {
 	source: Blocks,
 	peer_manager_wake: Arc<dyn Fn() + Send + Sync>,
-	gossiper: Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Self, L>>,
+	gossiper: Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Arc<Self>, L>>,
 	spawn: S,
 	block_cache: Arc<Mutex<VecDeque<(u32, Block)>>>,
 }
@@ -162,7 +150,7 @@ where
 	/// This is expected to be given to a [`P2PGossipSync`] (initially constructed with `None` for
 	/// the UTXO lookup) via [`P2PGossipSync::add_utxo_lookup`].
 	pub fn new<APM: Deref + Send + Sync + Clone + 'static>(
-		source: Blocks, spawn: S, gossiper: Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Self, L>>,
+		source: Blocks, spawn: S, gossiper: Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Arc<Self>, L>>,
 		peer_manager: APM,
 	) -> Self
 	where

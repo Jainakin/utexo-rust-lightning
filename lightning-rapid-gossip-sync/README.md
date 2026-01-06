@@ -4,6 +4,20 @@ This crate exposes functionality for rapid gossip graph syncing, aimed primarily
 Its server counterpart is the
 [rapid-gossip-sync-server](https://github.com/lightningdevkit/rapid-gossip-sync-server) repository.
 
+## Usage
+
+To kick off Rapid Gossip Sync from the beginning, retrieve a snapshot from an RGS server instance with the initial
+timestamp being 0.
+
+Applying that snapshot using the `RapidGossipSync` instance will extract and retrieve the subsequent timestamp to
+request from the server instance. The methods `sync_network_graph_with_file_path`, `update_network_graph`, and
+`update_network_graph_no_std` all return a `Result<u32, GraphSyncError>`, and that `u32` success value
+is the timestamp meant to be used for the next server request.
+
+Note that running those methods also updates the timestamp stored in the `NetworkGraph` object, whence it can be easily
+retrieved by calling `get_last_rapid_gossip_sync_timestamp`, so using RGS does not impose any additional caching
+requirements beyond those already used for storing the network graph.
+
 ## Mechanism
 
 The (presumed) server sends a compressed gossip response containing gossip data. The gossip data is
@@ -122,23 +136,25 @@ broadcast on the network may be taken into account when calculating the delta.
 ## Performance
 
 Given the primary purpose of this utility is a faster graph sync, we thought it might be helpful to
-provide some examples of various delta sets. These examples were calculated as of May 19th  2022
+provide some examples of various delta sets. These examples were calculated as of August 2024
 with a network graph comprised of 80,000 channel announcements and 160,000 directed channel updates.
+
+The processing times were averaged over 100 iterations on an iPhone 15 Pro.
 
 | Full sync                   |        |
 |-----------------------------|--------|
-| Message Length              | 4.7 MB |
-| Gzipped Message Length      | 2.0 MB |
-| Client-side Processing Time | 1.4 s  |
+| Message Length              | 3.3 MB |
+| Gzipped Message Length      | 1.5 MB |
+| Client-side Processing Time | 407 ms |
 
 | Week-old sync               |        |
 |-----------------------------|--------|
-| Message Length              | 2.7 MB |
-| Gzipped Message Length      | 862 kB |
-| Client-side Processing Time | 907 ms |
+| Message Length              | 1.7 MB |
+| Gzipped Message Length      | 566 kB |
+| Client-side Processing Time | 283 ms |
 
-| Day-old sync                |         |
-|-----------------------------|---------|
-| Message Length              | 191 kB  |
-| Gzipped Message Length      | 92.8 kB |
-| Client-side Processing Time | 196 ms  |
+| Day-old sync                |        |
+|-----------------------------|--------|
+| Message Length              | 210 kB |
+| Gzipped Message Length      | 99 kB  |
+| Client-side Processing Time | 26 ms  |

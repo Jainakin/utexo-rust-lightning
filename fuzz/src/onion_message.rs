@@ -5,15 +5,18 @@ use bitcoin::secp256k1::ecdsa::RecoverableSignature;
 use bitcoin::secp256k1::schnorr;
 use bitcoin::secp256k1::{self, PublicKey, Scalar, Secp256k1, SecretKey};
 
-use lightning::blinded_path::message::{BlindedMessagePath, MessageContext, OffersContext};
+use lightning::blinded_path::message::{
+	AsyncPaymentsContext, BlindedMessagePath, MessageContext, MessageForwardNode, OffersContext,
+};
 use lightning::blinded_path::EmptyNodeIdLookUp;
-use lightning::ln::features::InitFeatures;
-use lightning::ln::msgs::{self, DecodeError, OnionMessageHandler};
+use lightning::ln::inbound_payment::ExpandedKey;
+use lightning::ln::msgs::{self, BaseMessageHandler, DecodeError, OnionMessageHandler};
+use lightning::ln::peer_handler::IgnoringMessageHandler;
 use lightning::ln::script::ShutdownScript;
 use lightning::offers::invoice::UnsignedBolt12Invoice;
-use lightning::offers::invoice_request::UnsignedInvoiceRequest;
 use lightning::onion_message::async_payments::{
-	AsyncPaymentsMessageHandler, HeldHtlcAvailable, ReleaseHeldHtlc,
+	AsyncPaymentsMessageHandler, HeldHtlcAvailable, OfferPaths, OfferPathsRequest, ReleaseHeldHtlc,
+	ServeStaticInvoice, StaticInvoicePersisted,
 };
 use lightning::onion_message::messenger::{
 	CustomOnionMessageHandler, Destination, MessageRouter, MessageSendInstructions,
@@ -21,22 +24,28 @@ use lightning::onion_message::messenger::{
 };
 use lightning::onion_message::offers::{OffersMessage, OffersMessageHandler};
 use lightning::onion_message::packet::OnionMessageContents;
-use lightning::sign::{EntropySource, KeyMaterial, NodeSigner, Recipient, SignerProvider};
+use lightning::sign::{
+	EntropySource, NodeSigner, PeerStorageKey, ReceiveAuthKey, Recipient, SignerProvider,
+};
+use lightning::types::features::InitFeatures;
 use lightning::util::logger::Logger;
-use lightning::util::ser::{Readable, Writeable, Writer};
+use lightning::util::ser::{LengthReadable, Writeable, Writer};
 use lightning::util::test_channel_signer::TestChannelSigner;
 
 use lightning_invoice::RawBolt11Invoice;
 
 use crate::utils::test_logger;
 
-use lightning::io::{self, Cursor};
+use lightning::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[inline]
 /// Actual fuzz test, method signature and name are fixed
 pub fn do_test<L: Logger>(data: &[u8], logger: &L) {
-	if let Ok(msg) = <msgs::OnionMessage as Readable>::read(&mut Cursor::new(data)) {
+	let mut reader = &data[..];
+	if let Ok(msg) =
+		<msgs::OnionMessage as LengthReadable>::read_from_fixed_length_buffer(&mut reader)
+	{
 		let mut secret_bytes = [1; 32];
 		secret_bytes[31] = 2;
 		let secret = SecretKey::from_slice(&secret_bytes).unwrap();
@@ -54,6 +63,7 @@ pub fn do_test<L: Logger>(data: &[u8], logger: &L) {
 			&message_router,
 			&offers_msg_handler,
 			&async_payments_msg_handler,
+			IgnoringMessageHandler {}, // TODO: Move to ChannelManager once it supports DNSSEC.
 			&custom_msg_handler,
 		);
 
@@ -68,8 +78,8 @@ pub fn do_test<L: Logger>(data: &[u8], logger: &L) {
 		features.set_onion_messages_optional();
 		let init = msgs::Init { features, networks: None, remote_network_address: None };
 
-		onion_messenger.peer_connected(&peer_node_id, &init, false).unwrap();
-		onion_messenger.handle_onion_message(&peer_node_id, &msg);
+		onion_messenger.peer_connected(peer_node_id, &init, false).unwrap();
+		onion_messenger.handle_onion_message(peer_node_id, &msg);
 	}
 }
 
@@ -92,12 +102,12 @@ impl MessageRouter for TestMessageRouter {
 	fn find_path(
 		&self, _sender: PublicKey, _peers: Vec<PublicKey>, destination: Destination,
 	) -> Result<OnionMessagePath, ()> {
-		Ok(OnionMessagePath { intermediate_nodes: vec![], destination, first_node_addresses: None })
+		Ok(OnionMessagePath { intermediate_nodes: vec![], destination, first_node_addresses: vec![] })
 	}
 
 	fn create_blinded_paths<T: secp256k1::Signing + secp256k1::Verification>(
-		&self, _recipient: PublicKey, _context: MessageContext, _peers: Vec<PublicKey>,
-		_secp_ctx: &Secp256k1<T>,
+		&self, _recipient: PublicKey, _local_node_receive_key: ReceiveAuthKey,
+		_context: MessageContext, _peers: Vec<MessageForwardNode>, _secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedMessagePath>, ()> {
 		unreachable!()
 	}
@@ -117,19 +127,41 @@ impl OffersMessageHandler for TestOffersMessageHandler {
 struct TestAsyncPaymentsMessageHandler {}
 
 impl AsyncPaymentsMessageHandler for TestAsyncPaymentsMessageHandler {
-	fn held_htlc_available(
-		&self, message: HeldHtlcAvailable, responder: Option<Responder>,
+	fn handle_offer_paths_request(
+		&self, _message: OfferPathsRequest, _context: AsyncPaymentsContext,
+		responder: Option<Responder>,
+	) -> Option<(OfferPaths, ResponseInstruction)> {
+		let responder = match responder {
+			Some(resp) => resp,
+			None => return None,
+		};
+		Some((OfferPaths { paths: Vec::new(), paths_absolute_expiry: None }, responder.respond()))
+	}
+	fn handle_offer_paths(
+		&self, _message: OfferPaths, _context: AsyncPaymentsContext, _responder: Option<Responder>,
+	) -> Option<(ServeStaticInvoice, ResponseInstruction)> {
+		None
+	}
+	fn handle_serve_static_invoice(
+		&self, _message: ServeStaticInvoice, _context: AsyncPaymentsContext,
+		_responder: Option<Responder>,
+	) {
+	}
+	fn handle_static_invoice_persisted(
+		&self, _message: StaticInvoicePersisted, _context: AsyncPaymentsContext,
+	) {
+	}
+	fn handle_held_htlc_available(
+		&self, _message: HeldHtlcAvailable, _context: AsyncPaymentsContext,
+		responder: Option<Responder>,
 	) -> Option<(ReleaseHeldHtlc, ResponseInstruction)> {
 		let responder = match responder {
 			Some(resp) => resp,
 			None => return None,
 		};
-		Some((
-			ReleaseHeldHtlc { payment_release_secret: message.payment_release_secret },
-			responder.respond(),
-		))
+		Some((ReleaseHeldHtlc {}, responder.respond()))
 	}
-	fn release_held_htlc(&self, _message: ReleaseHeldHtlc) {}
+	fn handle_release_held_htlc(&self, _message: ReleaseHeldHtlc, _context: AsyncPaymentsContext) {}
 }
 
 #[derive(Debug)]
@@ -168,7 +200,7 @@ impl CustomOnionMessageHandler for TestCustomMessageHandler {
 	}
 	fn read_custom_message<R: io::Read>(
 		&self, _message_type: u64, buffer: &mut R,
-	) -> Result<Option<Self::CustomMessage>, msgs::DecodeError> {
+	) -> Result<Option<Self::CustomMessage>, DecodeError> {
 		let mut buf = Vec::new();
 		buffer.read_to_limit(&mut buf, u64::MAX)?;
 		return Ok(Some(TestCustomMessage {}));
@@ -223,19 +255,13 @@ impl NodeSigner for KeyProvider {
 		Ok(SharedSecret::new(other_key, &node_secret))
 	}
 
-	fn get_inbound_payment_key_material(&self) -> KeyMaterial {
+	fn get_expanded_key(&self) -> ExpandedKey {
 		unreachable!()
 	}
 
 	fn sign_invoice(
 		&self, _invoice: &RawBolt11Invoice, _recipient: Recipient,
 	) -> Result<RecoverableSignature, ()> {
-		unreachable!()
-	}
-
-	fn sign_bolt12_invoice_request(
-		&self, _invoice_request: &UnsignedInvoiceRequest,
-	) -> Result<schnorr::Signature, ()> {
 		unreachable!()
 	}
 
@@ -250,6 +276,18 @@ impl NodeSigner for KeyProvider {
 	) -> Result<bitcoin::secp256k1::ecdsa::Signature, ()> {
 		unreachable!()
 	}
+
+	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
+		Ok(lightning::util::message_signing::sign(msg, &self.node_secret))
+	}
+
+	fn get_peer_storage_key(&self) -> PeerStorageKey {
+		unreachable!()
+	}
+
+	fn get_receive_auth_key(&self) -> ReceiveAuthKey {
+		ReceiveAuthKey([41; 32])
+	}
 }
 
 impl SignerProvider for KeyProvider {
@@ -257,19 +295,11 @@ impl SignerProvider for KeyProvider {
 	#[cfg(taproot)]
 	type TaprootSigner = TestChannelSigner;
 
-	fn generate_channel_keys_id(
-		&self, _inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128,
-	) -> [u8; 32] {
+	fn generate_channel_keys_id(&self, _inbound: bool, _user_channel_id: u128) -> [u8; 32] {
 		unreachable!()
 	}
 
-	fn derive_channel_signer(
-		&self, _channel_value_satoshis: u64, _channel_keys_id: [u8; 32],
-	) -> Self::EcdsaSigner {
-		unreachable!()
-	}
-
-	fn read_chan_signer(&self, _data: &[u8]) -> Result<TestChannelSigner, DecodeError> {
+	fn derive_channel_signer(&self, _channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
 		unreachable!()
 	}
 
@@ -352,8 +382,7 @@ mod tests {
 			assert_eq!(
 				log_entries.get(&(
 					"lightning::onion_message::messenger".to_string(),
-					"Received an onion message with a reply_path: Custom(TestCustomMessage)"
-						.to_string()
+					"Received an onion message with a reply_path: TestCustomMessage".to_string()
 				)),
 				Some(&1)
 			);
@@ -401,7 +430,7 @@ mod tests {
 		super::do_test(&<Vec<u8>>::from_hex(two_unblinded_hops_om).unwrap(), &logger);
 		{
 			let log_entries = logger.lines.lock().unwrap();
-			assert_eq!(log_entries.get(&("lightning::onion_message::messenger".to_string(), "Forwarding an onion message to peer 020202020202020202020202020202020202020202020202020202020202020202".to_string())), Some(&1));
+			assert_eq!(log_entries.get(&("lightning::onion_message::messenger".to_string(), "Forwarding an onion message to peer 020202020202020202020202020202020202020202020202020202020202020202 when forwarding peeled onion message from 020000000000000000000000000000000000000000000000000000000000000002".to_string())), Some(&1));
 		}
 
 		let two_unblinded_two_blinded_om = "\
@@ -442,7 +471,7 @@ mod tests {
 		super::do_test(&<Vec<u8>>::from_hex(two_unblinded_two_blinded_om).unwrap(), &logger);
 		{
 			let log_entries = logger.lines.lock().unwrap();
-			assert_eq!(log_entries.get(&("lightning::onion_message::messenger".to_string(), "Forwarding an onion message to peer 020202020202020202020202020202020202020202020202020202020202020202".to_string())), Some(&1));
+			assert_eq!(log_entries.get(&("lightning::onion_message::messenger".to_string(), "Forwarding an onion message to peer 020202020202020202020202020202020202020202020202020202020202020202 when forwarding peeled onion message from 020000000000000000000000000000000000000000000000000000000000000002".to_string())), Some(&1));
 		}
 
 		let three_blinded_om = "\
@@ -483,7 +512,7 @@ mod tests {
 		super::do_test(&<Vec<u8>>::from_hex(three_blinded_om).unwrap(), &logger);
 		{
 			let log_entries = logger.lines.lock().unwrap();
-			assert_eq!(log_entries.get(&("lightning::onion_message::messenger".to_string(), "Forwarding an onion message to peer 020202020202020202020202020202020202020202020202020202020202020202".to_string())), Some(&1));
+			assert_eq!(log_entries.get(&("lightning::onion_message::messenger".to_string(), "Forwarding an onion message to peer 020202020202020202020202020202020202020202020202020202020202020202 when forwarding peeled onion message from 020000000000000000000000000000000000000000000000000000000000000002".to_string())), Some(&1));
 		}
 	}
 }

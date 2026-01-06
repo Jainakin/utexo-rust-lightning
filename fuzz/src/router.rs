@@ -17,7 +17,6 @@ use lightning::blinded_path::BlindedHop;
 use lightning::chain::transaction::OutPoint;
 use lightning::ln::channel_state::{ChannelCounterparty, ChannelDetails, ChannelShutdownState};
 use lightning::ln::channelmanager;
-use lightning::ln::features::{BlindedHopFeatures, Bolt12InvoiceFeatures};
 use lightning::ln::msgs;
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::{NetworkGraph, RoutingFees};
@@ -28,9 +27,10 @@ use lightning::routing::scoring::{
 	ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
 };
 use lightning::routing::utxo::{UtxoFuture, UtxoLookup, UtxoLookupError, UtxoResult};
+use lightning::types::features::{BlindedHopFeatures, Bolt12InvoiceFeatures};
 use lightning::util::config::UserConfig;
 use lightning::util::hash_tables::*;
-use lightning::util::ser::Readable;
+use lightning::util::ser::LengthReadable;
 
 use bitcoin::hashes::Hash;
 use bitcoin::network::Network;
@@ -146,10 +146,12 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 
 	macro_rules! decode_msg {
 		($MsgType: path, $len: expr) => {{
-			let mut reader = ::lightning::io::Cursor::new(get_slice!($len));
-			match <$MsgType>::read(&mut reader) {
+			let data = get_slice!($len);
+			let mut reader = &data[..];
+			match <$MsgType>::read_from_fixed_length_buffer(&mut reader) {
 				Ok(msg) => {
-					assert_eq!(reader.position(), $len as u64);
+					// Check that we read the slice to the end
+					assert!(reader.is_empty());
 					msg
 				},
 				Err(e) => match e {
@@ -227,6 +229,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 								txid: bitcoin::Txid::from_slice(&[0; 32]).unwrap(),
 								index: 0,
 							}),
+							funding_redeem_script: None,
 							channel_type: None,
 							short_channel_id: Some(scid),
 							inbound_scid_alias: None,
@@ -242,7 +245,6 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 							is_channel_ready: true,
 							is_usable: true,
 							is_announced: true,
-							balance_msat: 0,
 							outbound_capacity_msat: capacity.saturating_mul(1000),
 							next_outbound_htlc_limit_msat: capacity.saturating_mul(1000),
 							next_outbound_htlc_minimum_msat: 0,
@@ -400,7 +402,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 								encrypted_payload: Vec::new(),
 							});
 						}
-						BlindedPaymentPath::from_raw(
+						BlindedPaymentPath::from_blinded_path_and_payinfo(
 							hop.src_node_id,
 							dummy_pk,
 							blinded_hops,

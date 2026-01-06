@@ -16,7 +16,7 @@ macro_rules! invoice_builder_methods_common { (
 	#[doc = concat!("Sets the [`", stringify!($invoice_type), "::relative_expiry`]")]
 	#[doc = concat!("as seconds since [`", stringify!($invoice_type), "::created_at`].")]
 	#[doc = "Any expiry that has already passed is valid and can be checked for using"]
-	#[doc = concat!("[`", stringify!($invoice_type), "::is_expired`].")]
+	#[cfg_attr(feature = "std", doc = concat!("[`", stringify!($invoice_type), "::is_expired`]."))]
 	///
 	/// Successive calls to this method will override the previous setting.
 	pub fn relative_expiry($($self_mut)* $self: $self_type, relative_expiry_secs: u32) -> $return_type {
@@ -83,11 +83,11 @@ macro_rules! invoice_builder_methods_common { (
 } }
 
 #[cfg(test)]
-macro_rules! invoice_builder_methods_test { (
+macro_rules! invoice_builder_methods_test_common { (
 	$self: ident, $self_type: ty, $invoice_fields: expr, $return_type: ty, $return_value: expr
 	$(, $self_mut: tt)?
 ) => {
-	#[cfg_attr(c_bindings, allow(dead_code))]
+	#[allow(dead_code)] // TODO: mode to `#[cfg_attr(c_bindings, allow(dead_code))]` once we remove the `async_payments` cfg flag
 	pub(crate) fn features_unchecked(
 		$($self_mut)* $self: $self_type, features: Bolt12InvoiceFeatures
 	) -> $return_type {
@@ -95,6 +95,11 @@ macro_rules! invoice_builder_methods_test { (
 		$return_value
 	}
 
+	#[cfg_attr(c_bindings, allow(dead_code))]
+	pub(super) fn experimental_baz($($self_mut)* $self: $self_type, experimental_baz: u64) -> $return_type {
+		$invoice_fields.experimental_baz = Some(experimental_baz);
+		$return_value
+	}
 } }
 
 macro_rules! invoice_accessors_common { ($self: ident, $contents: expr, $invoice_type: ty) => {
@@ -104,9 +109,6 @@ macro_rules! invoice_accessors_common { ($self: ident, $contents: expr, $invoice
 	/// Blinded paths provide recipient privacy by obfuscating its node id. Note, however, that this
 	/// privacy is lost if a public node id is used for
 	#[doc = concat!("[`", stringify!($invoice_type), "::signing_pubkey`].")]
-	///
-	/// This is not exported to bindings users as slices with non-reference types cannot be ABI
-	/// matched in another language.
 	pub fn payment_paths(&$self) -> &[BlindedPaymentPath] {
 		$contents.payment_paths()
 	}
@@ -129,6 +131,11 @@ macro_rules! invoice_accessors_common { ($self: ident, $contents: expr, $invoice
 		$contents.is_expired()
 	}
 
+	/// Whether the invoice has expired given the current time as duration since the Unix epoch.
+	pub fn is_expired_no_std(&$self, duration_since_epoch: Duration) -> bool {
+		$contents.is_expired_no_std(duration_since_epoch)
+	}
+
 	/// Fallback addresses for paying the invoice on-chain, in order of most-preferred to
 	/// least-preferred.
 	pub fn fallbacks(&$self) -> Vec<Address> {
@@ -139,14 +146,9 @@ macro_rules! invoice_accessors_common { ($self: ident, $contents: expr, $invoice
 	pub fn invoice_features(&$self) -> &Bolt12InvoiceFeatures {
 		$contents.features()
 	}
-
-	/// The public key corresponding to the key used to sign the invoice.
-	pub fn signing_pubkey(&$self) -> PublicKey {
-		$contents.signing_pubkey()
-	}
 } }
 
 pub(super) use invoice_accessors_common;
 pub(super) use invoice_builder_methods_common;
 #[cfg(test)]
-pub(super) use invoice_builder_methods_test;
+pub(super) use invoice_builder_methods_test_common;

@@ -25,6 +25,10 @@ pub struct ChannelHandshakeConfig {
 	/// Applied only for inbound channels (see [`ChannelHandshakeLimits::max_minimum_depth`] for the
 	/// equivalent limit applied to outbound channels).
 	///
+	/// Also used when splicing the channel for the number of confirmations needed before sending a
+	/// `splice_locked` message to the counterparty. The spliced funds are considered locked in when
+	/// both parties have exchanged `splice_locked`.
+	///
 	/// A lower-bound of `1` is applied, requiring all channels to have a confirmed commitment
 	/// transaction before operation. If you wish to accept channels with zero confirmations, see
 	/// [`UserConfig::manually_accept_inbound_channels`] and
@@ -176,17 +180,51 @@ pub struct ChannelHandshakeConfig {
 	/// counterparties that do not support the `anchors_zero_fee_htlc_tx` option; we will simply
 	/// fall back to a `static_remote_key` channel.
 	///
-	/// LDK will not support the legacy `option_anchors` commitment version due to a discovered
-	/// vulnerability after its deployment. For more context, see the [`SIGHASH_SINGLE + update_fee
-	/// Considered Harmful`] mailing list post.
-	///
 	/// Default value: `false` (This value is likely to change to `true` in the future.)
 	///
 	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 	/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
 	/// [`DecodeError::InvalidValue`]: crate::ln::msgs::DecodeError::InvalidValue
-	/// [`SIGHASH_SINGLE + update_fee Considered Harmful`]: https://lists.linuxfoundation.org/pipermail/lightning-dev/2020-September/002796.html
 	pub negotiate_anchors_zero_fee_htlc_tx: bool,
+
+	/// If set, we attempt to negotiate the `zero_fee_commitments` option for all future channels.
+	///
+	/// These channels operate very similarly to the `anchors_zero_fee_htlc` channels but rely on
+	/// [TRUC] to assign zero fee to the commitment transactions themselves, avoiding many protocol
+	/// edge-cases involving fee updates and greatly simplifying the concept of your "balance" in
+	/// lightning.
+	///
+	/// Like `anchors_zero_fee_htlc` channels, this feature requires having a reserve of onchain
+	/// funds readily available to bump transactions in the event of a channel force close to avoid
+	/// the possibility of losing funds.
+	///
+	/// Note that if you wish accept inbound channels with anchor outputs, you must enable
+	/// [`UserConfig::manually_accept_inbound_channels`] and manually accept them with
+	/// [`ChannelManager::accept_inbound_channel`]. This is done to give you the chance to check
+	/// whether your reserve of onchain funds is enough to cover the fees for all existing and new
+	/// channels featuring anchor outputs in the event of a force close.
+	///
+	/// If this option is set, channels may be created that will not be readable by LDK versions
+	/// prior to 0.2, causing [`ChannelManager`]'s read method to return a
+	/// [`DecodeError::InvalidValue`].
+	///
+	/// Note that setting this to true does *not* prevent us from opening channels with
+	/// counterparties that do not support the `zero_fee_commitments` option; we will simply fall
+	/// back to a `anchors_zero_fee_htlc` (if [`Self::negotiate_anchors_zero_fee_htlc_tx`]
+	/// is set) or `static_remote_key` channel.
+	///
+	/// For a force-close transaction to reach miners and get confirmed,
+	/// zero-fee commitment channels require a path from your Bitcoin node to miners that
+	/// relays TRUC transactions (BIP 431), P2A outputs, and Ephemeral Dust. Currently, only
+	/// nodes running Bitcoin Core v29 and above relay transactions with these features.
+	///
+	/// Default value: `false` (This value is likely to change to `true` in the future.)
+	///
+	/// [TRUC]: (https://bitcoinops.org/en/topics/version-3-transaction-relay/)
+	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
+	/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
+	/// [`DecodeError::InvalidValue`]: crate::ln::msgs::DecodeError::InvalidValue
+	pub negotiate_anchor_zero_fee_commitments: bool,
 
 	/// The maximum number of HTLCs in-flight from our counterparty towards us at the same time.
 	///
@@ -198,8 +236,10 @@ pub struct ChannelHandshakeConfig {
 	///
 	/// Default value: `50`
 	///
-	/// Maximum value: `483` (Any values larger will be treated as `483`. This is the BOLT #2 spec
-	/// limit on `max_accepted_htlcs`.)
+	/// Maximum value: depends on channel type, see docs on [`max_htlcs`] (any values over the
+	///                maximum will be silently reduced to the maximum).
+	///
+	/// [`max_htlcs`]: crate::ln::chan_utils::max_htlcs
 	pub our_max_accepted_htlcs: u16,
 }
 
@@ -215,6 +255,7 @@ impl Default for ChannelHandshakeConfig {
 			commit_upfront_shutdown_pubkey: true,
 			their_channel_reserve_proportional_millionths: 10_000,
 			negotiate_anchors_zero_fee_htlc_tx: false,
+			negotiate_anchor_zero_fee_commitments: false,
 			our_max_accepted_htlcs: 50,
 		}
 	}
@@ -236,6 +277,7 @@ impl Readable for ChannelHandshakeConfig {
 			commit_upfront_shutdown_pubkey: Readable::read(reader)?,
 			their_channel_reserve_proportional_millionths: Readable::read(reader)?,
 			negotiate_anchors_zero_fee_htlc_tx: Readable::read(reader)?,
+			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
 		})
 	}
@@ -327,7 +369,7 @@ pub struct ChannelHandshakeLimits {
 	///
 	/// Default value: `2016`, which we also enforce as a maximum value so you can tweak config to
 	/// reduce the loss of having useless locked funds (if your peer accepts)
-	pub their_to_self_delay: u16
+	pub their_to_self_delay: u16,
 }
 
 impl Default for ChannelHandshakeLimits {
@@ -402,12 +444,19 @@ pub enum MaxDustHTLCExposure {
 	/// on HTLC outputs means your channel may be subject to more dust exposure in the event of
 	/// increases in fee rate.
 	///
+	/// Note that because zero-commitment-fee anchor channels do not allow for feerate updates (and
+	/// thus never experience dust exposure changes due to feerate shifts, resulting in no
+	/// force-closes due to dust exposure limits), such channels will calculate their maximum
+	/// dust exposure using a constant feerate of 250 sat/KW when using this variant.
+	/// See [`ChannelHandshakeConfig::negotiate_anchor_zero_fee_commitments`] to enable such channels.
+	///
 	/// # Backwards Compatibility
 	/// This variant only became available in LDK 0.0.116, so if you downgrade to a prior version
 	/// by default this will be set to a [`Self::FixedLimitMsat`] of 5,000,000 msat.
 	///
 	/// [`FeeEstimator`]: crate::chain::chaininterface::FeeEstimator
 	/// [`ConfirmationTarget::MaximumFeeEstimate`]: crate::chain::chaininterface::ConfirmationTarget::MaximumFeeEstimate
+	/// [`ChannelHandshakeConfig::negotiate_anchor_zero_fee_commitments`]: ChannelHandshakeConfig::negotiate_anchor_zero_fee_commitments
 	FeeRateMultiplier(u64),
 }
 
@@ -582,7 +631,9 @@ pub struct ChannelConfig {
 impl ChannelConfig {
 	/// Applies the given [`ChannelConfigUpdate`] as a partial update to the [`ChannelConfig`].
 	pub fn apply(&mut self, update: &ChannelConfigUpdate) {
-		if let Some(forwarding_fee_proportional_millionths) = update.forwarding_fee_proportional_millionths {
+		if let Some(forwarding_fee_proportional_millionths) =
+			update.forwarding_fee_proportional_millionths
+		{
 			self.forwarding_fee_proportional_millionths = forwarding_fee_proportional_millionths;
 		}
 		if let Some(forwarding_fee_base_msat) = update.forwarding_fee_base_msat {
@@ -594,8 +645,13 @@ impl ChannelConfig {
 		if let Some(max_dust_htlc_exposure_msat) = update.max_dust_htlc_exposure_msat {
 			self.max_dust_htlc_exposure = max_dust_htlc_exposure_msat;
 		}
-		if let Some(force_close_avoidance_max_fee_satoshis) = update.force_close_avoidance_max_fee_satoshis {
+		if let Some(force_close_avoidance_max_fee_satoshis) =
+			update.force_close_avoidance_max_fee_satoshis
+		{
 			self.force_close_avoidance_max_fee_satoshis = force_close_avoidance_max_fee_satoshis;
+		}
+		if let Some(accept_underpaying_htlcs) = update.accept_underpaying_htlcs {
+			self.accept_underpaying_htlcs = accept_underpaying_htlcs;
 		}
 	}
 }
@@ -670,24 +726,45 @@ impl crate::util::ser::Readable for ChannelConfig {
 }
 
 /// A parallel struct to [`ChannelConfig`] to define partial updates.
-#[allow(missing_docs)]
 #[derive(Default)]
 pub struct ChannelConfigUpdate {
+	/// Amount (in millionths of a satoshi) charged per satoshi for payments forwarded outbound over the channel. See
+	/// [`ChannelConfig::forwarding_fee_proportional_millionths`].
 	pub forwarding_fee_proportional_millionths: Option<u32>,
+
+	/// Amount (in milli-satoshi) charged for payments forwarded outbound over the channel. See
+	/// [`ChannelConfig::forwarding_fee_base_msat`].
 	pub forwarding_fee_base_msat: Option<u32>,
+
+	/// The difference in the CLTV value between incoming HTLCs and an outbound HTLC forwarded over the channel this
+	/// config applies to. See [`ChannelConfig::cltv_expiry_delta`].
 	pub cltv_expiry_delta: Option<u16>,
+
+	/// The total exposure we are willing to allow to dust HTLCs. See [`ChannelConfig::max_dust_htlc_exposure`].
 	pub max_dust_htlc_exposure_msat: Option<MaxDustHTLCExposure>,
+
+	/// The additional fee we're willing to pay to avoid waiting for the counterparty's `to_self_delay` to reclaim
+	/// funds. See [`ChannelConfig::force_close_avoidance_max_fee_satoshis`].
 	pub force_close_avoidance_max_fee_satoshis: Option<u64>,
+
+	/// If set, allows this channel's counterparty to skim an additional fee off this node's inbound HTLCs. See
+	/// [`ChannelConfig::accept_underpaying_htlcs`].
+	pub accept_underpaying_htlcs: Option<bool>,
 }
 
 impl From<ChannelConfig> for ChannelConfigUpdate {
 	fn from(config: ChannelConfig) -> ChannelConfigUpdate {
 		ChannelConfigUpdate {
-			forwarding_fee_proportional_millionths: Some(config.forwarding_fee_proportional_millionths),
+			forwarding_fee_proportional_millionths: Some(
+				config.forwarding_fee_proportional_millionths,
+			),
 			forwarding_fee_base_msat: Some(config.forwarding_fee_base_msat),
 			cltv_expiry_delta: Some(config.cltv_expiry_delta),
 			max_dust_htlc_exposure_msat: Some(config.max_dust_htlc_exposure),
-			force_close_avoidance_max_fee_satoshis: Some(config.force_close_avoidance_max_fee_satoshis),
+			force_close_avoidance_max_fee_satoshis: Some(
+				config.force_close_avoidance_max_fee_satoshis,
+			),
+			accept_underpaying_htlcs: Some(config.accept_underpaying_htlcs),
 		}
 	}
 }
@@ -760,8 +837,9 @@ impl crate::util::ser::Readable for LegacyChannelConfig {
 		});
 		let max_dust_htlc_exposure_msat_fixed_limit =
 			max_dust_htlc_exposure_msat_fixed_limit.unwrap_or(5_000_000);
-		let max_dust_htlc_exposure_msat = max_dust_htlc_exposure_enum
-			.unwrap_or(MaxDustHTLCExposure::FixedLimitMsat(max_dust_htlc_exposure_msat_fixed_limit));
+		let max_dust_htlc_exposure_msat = max_dust_htlc_exposure_enum.unwrap_or(
+			MaxDustHTLCExposure::FixedLimitMsat(max_dust_htlc_exposure_msat_fixed_limit),
+		);
 		Ok(Self {
 			options: ChannelConfig {
 				forwarding_fee_proportional_millionths,
@@ -781,7 +859,7 @@ impl crate::util::ser::Readable for LegacyChannelConfig {
 ///
 /// `Default::default()` provides sane defaults for most configurations
 /// (but currently with zero relay fees!)
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct UserConfig {
 	/// Channel handshake config that we propose to our counterparty.
 	pub channel_handshake_config: ChannelHandshakeConfig,
@@ -804,7 +882,12 @@ pub struct UserConfig {
 	/// all your channels and open new ones. For privacy, you should also change your node_id
 	/// (swapping all private and public key material for new ones) at that time.
 	///
+	/// Note that this setting does not apply for intercepted payments that are surfaced via
+	/// [`Event::HTLCIntercepted`] and manually forwarded.
+	///
 	/// Default value: `false`
+	///
+	/// [`Event::HTLCIntercepted`]: crate::events::Event::HTLCIntercepted
 	pub accept_forwards_to_priv_channels: bool,
 	/// If this is set to `false`, we do not accept inbound requests to open a new channel.
 	///
@@ -835,17 +918,6 @@ pub struct UserConfig {
 	/// [`ChannelManager::get_intercept_scid`]: crate::ln::channelmanager::ChannelManager::get_intercept_scid
 	/// [`Event::HTLCIntercepted`]: crate::events::Event::HTLCIntercepted
 	pub accept_intercept_htlcs: bool,
-	/// If this is set to `false`, when receiving a keysend payment we'll fail it if it has multiple
-	/// parts. If this is set to `true`, we'll accept the payment.
-	///
-	/// Setting this to `true` will break backwards compatibility upon downgrading to an LDK
-	/// version prior to 0.0.116 while receiving an MPP keysend. If we have already received an MPP
-	/// keysend, downgrading will cause us to fail to deserialize [`ChannelManager`].
-	///
-	/// Default value: `false`
-	///
-	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
-	pub accept_mpp_keysend: bool,
 	/// If this is set to `true`, the user needs to manually pay [`Bolt12Invoice`]s when received.
 	///
 	/// When set to `true`, [`Event::InvoiceReceived`] will be generated for each received
@@ -860,6 +932,48 @@ pub struct UserConfig {
 	/// [`ChannelManager::send_payment_for_bolt12_invoice`]: crate::ln::channelmanager::ChannelManager::send_payment_for_bolt12_invoice
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
 	pub manually_handle_bolt12_invoices: bool,
+	#[cfg(dual_funding)]
+	/// If this is set to `true`, dual-funded channels will be enabled.
+	///
+	/// Default value: `false`
+	pub enable_dual_funded_channels: bool,
+	/// LDK supports a feature for always-online nodes such that these nodes can hold onto an HTLC
+	/// from an often-offline channel peer until the often-offline payment recipient sends an onion
+	/// message telling the always-online node to release the HTLC. If this is set to `true`, our node
+	/// will carry out this feature for channel peers that request it.
+	///
+	/// This should only be set to `true` for nodes which expect to be online reliably.
+	///
+	/// Setting this to `true` may break backwards compatibility with LDK versions < 0.2.
+	///
+	/// Default value: `false`
+	pub enable_htlc_hold: bool,
+	/// If this is set to true, then if we as an often-offline payer receive a [`StaticInvoice`] to
+	/// pay, we will attempt to hold the corresponding outbound HTLCs with our next-hop channel
+	/// counterparty(s) that support the `htlc_hold` feature. This allows our node to go offline once
+	/// the HTLCs are locked in even though the recipient may not yet be online to receive them.
+	///
+	/// This option is intended for usage by private nodes, and should NOT be set if we are an
+	/// announced node that is expected to be online at all times.
+	///
+	/// Setting this to `true` may lead to HTLC failures if downgrading to LDK versions < 0.2.
+	///
+	/// Default value: `false`
+	///
+	/// [`StaticInvoice`]: crate::offers::static_invoice::StaticInvoice
+	pub hold_outbound_htlcs_at_next_hop: bool,
+	/// If this is set to `true`, then inbound channel splice requests will be rejected. This
+	/// ensures backwards compatibility is not broken with LDK versions < 0.2 while a splice is
+	/// pending.
+	///
+	/// Outbound channel splice requests (via [`ChannelManager::splice_channel`], an opt-in API) are
+	/// still allowed as users should be aware of the backwards compatibility risk prior to using
+	/// the functionality.
+	///
+	/// Default value: `true`
+	///
+	/// [`ChannelManager::splice_channel`]: crate::ln::channelmanager::ChannelManager::splice_channel
+	pub reject_inbound_splices: bool,
 }
 
 impl Default for UserConfig {
@@ -872,8 +986,12 @@ impl Default for UserConfig {
 			accept_inbound_channels: true,
 			manually_accept_inbound_channels: false,
 			accept_intercept_htlcs: false,
-			accept_mpp_keysend: false,
 			manually_handle_bolt12_invoices: false,
+			#[cfg(dual_funding)]
+			enable_dual_funded_channels: false,
+			enable_htlc_hold: false,
+			hold_outbound_htlcs_at_next_hop: false,
+			reject_inbound_splices: true,
 		}
 	}
 }
@@ -884,16 +1002,113 @@ impl Default for UserConfig {
 #[cfg(fuzzing)]
 impl Readable for UserConfig {
 	fn read<R: crate::io::Read>(reader: &mut R) -> Result<Self, crate::ln::msgs::DecodeError> {
+		let channel_handshake_config = Readable::read(reader)?;
+		let channel_handshake_limits = Readable::read(reader)?;
+		let channel_config = Readable::read(reader)?;
+		let accept_forwards_to_priv_channels = Readable::read(reader)?;
+		let accept_inbound_channels = Readable::read(reader)?;
+		let manually_accept_inbound_channels = Readable::read(reader)?;
+		let accept_intercept_htlcs = Readable::read(reader)?;
+		let manually_handle_bolt12_invoices = Readable::read(reader)?;
+		let _enable_dual_funded_channels: bool = Readable::read(reader)?;
+		let hold_outbound_htlcs_at_next_hop = Readable::read(reader)?;
+		let enable_htlc_hold = Readable::read(reader)?;
+		let reject_inbound_splices = Readable::read(reader)?;
 		Ok(Self {
-			channel_handshake_config: Readable::read(reader)?,
-			channel_handshake_limits: Readable::read(reader)?,
-			channel_config: Readable::read(reader)?,
-			accept_forwards_to_priv_channels: Readable::read(reader)?,
-			accept_inbound_channels: Readable::read(reader)?,
-			manually_accept_inbound_channels: Readable::read(reader)?,
-			accept_intercept_htlcs: Readable::read(reader)?,
-			accept_mpp_keysend: Readable::read(reader)?,
-			manually_handle_bolt12_invoices: Readable::read(reader)?,
+			channel_handshake_config,
+			channel_handshake_limits,
+			channel_config,
+			accept_forwards_to_priv_channels,
+			accept_inbound_channels,
+			manually_accept_inbound_channels,
+			accept_intercept_htlcs,
+			manually_handle_bolt12_invoices,
+			#[cfg(dual_funding)]
+			enable_dual_funded_channels: _enable_dual_funded_channels,
+			hold_outbound_htlcs_at_next_hop,
+			enable_htlc_hold,
+			reject_inbound_splices,
 		})
+	}
+}
+
+/// Config structure for overriding channel parameters.
+#[derive(Default)]
+pub struct ChannelConfigOverrides {
+	/// Overrides for channel handshake parameters.
+	pub handshake_overrides: Option<ChannelHandshakeConfigUpdate>,
+
+	/// Overrides for channel update parameters.
+	pub update_overrides: Option<ChannelConfigUpdate>,
+}
+
+impl UserConfig {
+	/// Applies given channel config overrides to the user config.
+	pub fn apply(&mut self, config: &ChannelConfigOverrides) {
+		if let Some(handshake_overrides) = &config.handshake_overrides {
+			self.channel_handshake_config.apply(&handshake_overrides);
+		}
+
+		if let Some(update_overrides) = &config.update_overrides {
+			self.channel_config.apply(&update_overrides);
+		}
+	}
+}
+
+/// Config structure for overriding channel handshake parameters.
+#[derive(Default)]
+pub struct ChannelHandshakeConfigUpdate {
+	/// Overrides the percentage of the channel value we will cap the total value of outstanding inbound HTLCs to. See
+	/// [`ChannelHandshakeConfig::max_inbound_htlc_value_in_flight_percent_of_channel`].
+	pub max_inbound_htlc_value_in_flight_percent_of_channel: Option<u8>,
+
+	/// Overrides the smallest value HTLC we will accept to process. See [`ChannelHandshakeConfig::our_htlc_minimum_msat`].
+	pub htlc_minimum_msat: Option<u64>,
+
+	/// Overrides confirmations we will wait for before considering the channel locked in. See
+	/// [`ChannelHandshakeConfig::minimum_depth`].
+	pub minimum_depth: Option<u32>,
+
+	/// Overrides the number of blocks we require our counterparty to wait to claim their money. See
+	/// [`ChannelHandshakeConfig::our_to_self_delay`].
+	pub to_self_delay: Option<u16>,
+
+	/// The maximum number of HTLCs in-flight from our counterparty towards us at the same time. See
+	/// [`ChannelHandshakeConfig::our_max_accepted_htlcs`].
+	pub max_accepted_htlcs: Option<u16>,
+
+	/// The Proportion of the channel value to configure as counterparty's channel reserve. See
+	/// [`ChannelHandshakeConfig::their_channel_reserve_proportional_millionths`].
+	pub channel_reserve_proportional_millionths: Option<u32>,
+}
+
+impl ChannelHandshakeConfig {
+	/// Applies the provided handshake config update.
+	pub fn apply(&mut self, config: &ChannelHandshakeConfigUpdate) {
+		if let Some(max_in_flight_percent) =
+			config.max_inbound_htlc_value_in_flight_percent_of_channel
+		{
+			self.max_inbound_htlc_value_in_flight_percent_of_channel = max_in_flight_percent;
+		}
+
+		if let Some(htlc_minimum_msat) = config.htlc_minimum_msat {
+			self.our_htlc_minimum_msat = htlc_minimum_msat;
+		}
+
+		if let Some(minimum_depth) = config.minimum_depth {
+			self.minimum_depth = minimum_depth;
+		}
+
+		if let Some(to_self_delay) = config.to_self_delay {
+			self.our_to_self_delay = to_self_delay;
+		}
+
+		if let Some(max_accepted_htlcs) = config.max_accepted_htlcs {
+			self.our_max_accepted_htlcs = max_accepted_htlcs;
+		}
+
+		if let Some(channel_reserve) = config.channel_reserve_proportional_millionths {
+			self.their_channel_reserve_proportional_millionths = channel_reserve;
+		}
 	}
 }
