@@ -163,7 +163,12 @@ fn _new_rgb_wallet(
 		master_fingerprint,
 		mnemonic: None,
 		vanilla_keychain: None,
-		supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa, AssetSchema::Uda],
+		supported_schemas: vec![
+			AssetSchema::Nia,
+			AssetSchema::Cfa,
+			AssetSchema::Uda,
+			AssetSchema::Ifa,
+		],
 	})
 	.expect("valid rgb-lib wallet")
 }
