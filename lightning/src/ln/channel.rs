@@ -2239,6 +2239,28 @@ where
 		}
 	}
 
+	pub fn get_balance_sats_floors(&self) -> (Option<u64>, Option<u64>) {
+		match &self.phase {
+			ChannelPhase::Undefined => unreachable!(),
+			ChannelPhase::Funded(chan) => chan
+				.get_holder_counterparty_balances_floor_incl_fee(&chan.funding)
+				.map(|(holder_balance, counterparty_balance)| {
+					(Some(holder_balance.to_sat()), Some(counterparty_balance.to_sat()))
+				})
+				.unwrap_or((None, None)),
+			ChannelPhase::UnfundedOutboundV1(_)
+			| ChannelPhase::UnfundedInboundV1(_)
+			| ChannelPhase::UnfundedV2(_) => (None, None),
+		}
+	}
+
+	pub fn has_inflight_htlcs(&self) -> bool {
+		let context = self.context();
+		!context.pending_inbound_htlcs.is_empty()
+			|| !context.pending_outbound_htlcs.is_empty()
+			|| !context.holding_cell_htlc_updates.is_empty()
+	}
+
 	pub fn minimum_depth(&self) -> Option<u32> {
 		self.context().minimum_depth(self.funding())
 	}
@@ -2658,6 +2680,10 @@ impl FundingScope {
 			self.get_funding_redeemscript(),
 		)
 	}
+
+	pub fn was_funding_tx_confirmed(&self) -> bool {
+		self.funding_tx_confirmed_in.is_some()
+	}
 }
 
 // TODO: Remove once MSRV is at least 1.66
@@ -3047,6 +3073,7 @@ where
 	/// This flag indicates that it is the user's responsibility to validated and broadcast the
 	/// funding transaction.
 	is_manual_broadcast: bool,
+	trusted_no_broadcast: bool,
 	is_batch_funding: Option<()>,
 
 	counterparty_next_commitment_point: Option<PublicKey>,
@@ -3736,6 +3763,7 @@ where
 			blocked_monitor_updates: Vec::new(),
 
 			is_manual_broadcast: false,
+			trusted_no_broadcast: false,
 
 			interactive_tx_signing_session: None,
 
@@ -3982,6 +4010,7 @@ where
 			blocked_monitor_updates: Vec::new(),
 			local_initiated_shutdown: None,
 			is_manual_broadcast: false,
+			trusted_no_broadcast: false,
 
 			interactive_tx_signing_session: None,
 
@@ -4245,7 +4274,9 @@ where
 		if channel_reserve_satoshis > funding.get_value_satoshis() {
 			return Err(ChannelError::close(format!("Bogus channel_reserve_satoshis ({}). Must not be greater than ({})", channel_reserve_satoshis, funding.get_value_satoshis())));
 		}
-		if common_fields.dust_limit_satoshis > funding.holder_selected_channel_reserve_satoshis {
+		if funding.holder_selected_channel_reserve_satoshis > 0
+			&& common_fields.dust_limit_satoshis > funding.holder_selected_channel_reserve_satoshis
+		{
 			return Err(ChannelError::close(format!("Dust limit ({}) is bigger than our channel reserve ({})", common_fields.dust_limit_satoshis, funding.holder_selected_channel_reserve_satoshis)));
 		}
 		if channel_reserve_satoshis > funding.get_value_satoshis() - funding.holder_selected_channel_reserve_satoshis {
@@ -4416,6 +4447,10 @@ where
 		self.is_manual_broadcast
 	}
 
+	pub fn is_trusted_no_broadcast(&self) -> bool {
+		self.trusted_no_broadcast
+	}
+
 	pub fn get_cltv_expiry_delta(&self) -> u16 {
 		cmp::max(self.config.options.cltv_expiry_delta, MIN_CLTV_EXPIRY_DELTA)
 	}
@@ -4531,10 +4566,16 @@ where
 	///
 	/// This is useful if you wish to get hold of the funding transaction before it is broadcasted
 	/// via [`Event::FundingTxBroadcastSafe`] event.
+	/// Virtual channels also set this flag, but
+	/// do not emit [`Event::FundingTxBroadcastSafe`].
 	///
 	/// [`Event::FundingTxBroadcastSafe`]: crate::events::Event::FundingTxBroadcastSafe
 	pub fn set_manual_broadcast(&mut self) {
 		self.is_manual_broadcast = true;
+	}
+
+	pub fn set_trusted_no_broadcast(&mut self) {
+		self.trusted_no_broadcast = true;
 	}
 
 	fn can_resume_on_reconnect(&self) -> bool {
@@ -5100,7 +5141,7 @@ where
 				&holder_keys.broadcaster_delayed_payment_key,
 				&holder_keys.revocation_key,
 			);
-			if self.is_colored() {
+			if self.is_colored() && !self.is_trusted_no_broadcast() {
 				color_htlc(&mut htlc_tx, htlc, &self.ldk_data_dir)
 					.expect("successful htlc coloring");
 			}
@@ -6117,7 +6158,11 @@ where
 		// be delayed in being processed! See the docs for `ChannelManagerReadArgs` for more.
 		assert!(!matches!(self.channel_state, ChannelState::ShutdownComplete));
 
-		let broadcast = self.is_funding_broadcastable();
+		let broadcast = if matches!(closure_reason, ClosureReason::VirtualChannelAbandoned) {
+			false
+		} else {
+			self.is_funding_broadcastable()
+		};
 
 		// We go ahead and "free" any holding cell HTLCs or HTLCs we haven't yet committed to and
 		// return them to fail the payment.
@@ -6557,6 +6602,11 @@ fn get_holder_max_htlc_value_in_flight_msat(
 pub(crate) fn get_holder_selected_channel_reserve_satoshis(
 	channel_value_satoshis: u64, config: &UserConfig,
 ) -> u64 {
+	if let Some(override_sat) =
+		config.channel_handshake_config.their_channel_reserve_satoshis_override
+	{
+		return cmp::min(override_sat, channel_value_satoshis);
+	}
 	let counterparty_chan_reserve_prop_mil =
 		config.channel_handshake_config.their_channel_reserve_proportional_millionths as u64;
 	let calculated_reserve =
@@ -11587,7 +11637,8 @@ where
 					self.context.minimum_depth.unwrap(), funding_tx_confirmations);
 				return Err(ClosureReason::ProcessingError { err: err_reason });
 			}
-		} else if !self.funding.is_outbound() && self.funding.funding_tx_confirmed_in.is_none() &&
+		} else if !self.context.is_trusted_no_broadcast() &&
+				!self.funding.is_outbound() && self.funding.funding_tx_confirmed_in.is_none() &&
 				height >= self.context.channel_creation_height + FUNDING_CONF_DEADLINE_BLOCKS {
 			log_info!(logger, "Closing channel {} due to funding timeout", &self.context.channel_id);
 			// If funding_tx_confirmed_in is unset, the channel must not be active
@@ -13586,7 +13637,9 @@ where
 	      L::Target: Logger,
 	{
 		let holder_selected_channel_reserve_satoshis = get_holder_selected_channel_reserve_satoshis(channel_value_satoshis, config);
-		if holder_selected_channel_reserve_satoshis < MIN_CHAN_DUST_LIMIT_SATOSHIS {
+		if holder_selected_channel_reserve_satoshis > 0
+			&& holder_selected_channel_reserve_satoshis < MIN_CHAN_DUST_LIMIT_SATOSHIS
+		{
 			// Protocol level safety check in place, although it should never happen because
 			// of `MIN_THEIR_CHAN_RESERVE_SATOSHIS`
 			return Err(APIError::APIMisuseError { err: format!("Holder selected channel reserve below \
@@ -15020,6 +15073,7 @@ where
 			monitor_pending_update_adds = Some(&self.context.monitor_pending_update_adds);
 		}
 		let is_manual_broadcast = Some(self.context.is_manual_broadcast);
+		let trusted_no_broadcast = Some(self.context.trusted_no_broadcast);
 
 		let holder_commitment_point_current = self.holder_commitment_point.current_point();
 		let holder_commitment_point_next = self.holder_commitment_point.next_point();
@@ -15084,6 +15138,7 @@ where
 			(69, holding_cell_held_htlc_flags, optional_vec), // Added in 0.2
 			(71, self.funding.consignment_endpoint, option),
 			(73, self.funding.push_asset_amount, option),
+			(75, trusted_no_broadcast, option),
 		});
 
 		Ok(())
@@ -15444,6 +15499,7 @@ where
 		let mut holder_commitment_point_next_opt: Option<PublicKey> = None;
 		let mut holder_commitment_point_pending_next_opt: Option<PublicKey> = None;
 		let mut is_manual_broadcast = None;
+		let mut trusted_no_broadcast = None;
 
 		let mut historical_scids = Some(Vec::new());
 
@@ -15505,6 +15561,7 @@ where
 			(69, holding_cell_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(71, consignment_endpoint, option),
 			(73, push_asset_amount, option),
+			(75, trusted_no_broadcast, option),
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -15894,6 +15951,7 @@ where
 
 				blocked_monitor_updates: blocked_monitor_updates.unwrap(),
 				is_manual_broadcast: is_manual_broadcast.unwrap_or(false),
+				trusted_no_broadcast: trusted_no_broadcast.unwrap_or(false),
 
 				interactive_tx_signing_session,
 				is_colored: consignment_endpoint.is_some(),

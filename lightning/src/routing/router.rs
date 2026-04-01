@@ -4031,6 +4031,10 @@ mod tests {
 			channel_shutdown_state: Some(ChannelShutdownState::NotShuttingDown),
 			pending_inbound_htlcs: Vec::new(),
 			pending_outbound_htlcs: Vec::new(),
+			has_inflight_htlcs: false,
+			counterparty_balance_sats_floor: None,
+			holder_balance_sats_floor: None,
+			trusted_no_broadcast: false,
 		}
 	}
 
@@ -9433,6 +9437,10 @@ pub(crate) mod bench_utils {
 			channel_shutdown_state: Some(ChannelShutdownState::NotShuttingDown),
 			pending_inbound_htlcs: Vec::new(),
 			pending_outbound_htlcs: Vec::new(),
+			has_inflight_htlcs: false,
+			counterparty_balance_sats_floor: None,
+			holder_balance_sats_floor: None,
+			trusted_no_broadcast: false,
 		}
 	}
 
