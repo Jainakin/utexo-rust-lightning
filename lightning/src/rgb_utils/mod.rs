@@ -18,6 +18,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::TxOut;
 use rgb_lib::{
 	bitcoin::psbt::Psbt as RgbLibPsbt,
+	keys::WitnessVersion,
 	wallet::{
 		rust_only::{AssetColoringInfo, ColoringInfo},
 		DatabaseType, SinglesigKeys, Wallet, WalletData,
@@ -63,6 +64,9 @@ pub struct RgbInfo {
 	pub local_rgb_amount: u64,
 	/// Channel RGB remote amount
 	pub remote_rgb_amount: u64,
+	/// Batch transfer index from rgb-lib (set after rgb_send_begin)
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub batch_transfer_idx: Option<i32>,
 }
 
 /// RGB payment info
@@ -158,6 +162,7 @@ fn _new_rgb_wallet(
 		vanilla_keychain: None,
 		master_fingerprint,
 		mnemonic: None,
+		witness_version: WitnessVersion::Taproot,
 	};
 	Wallet::new(
 		WalletData {
@@ -700,6 +705,7 @@ pub(crate) fn handle_funding(
 		schema: AssetSchema::from_schema_id(consignment.schema_id()).unwrap(),
 		local_rgb_amount: push_amount,
 		remote_rgb_amount: channel_rgb_amount - push_amount,
+		batch_transfer_idx: None,
 	};
 	let temporary_channel_id_str = temporary_channel_id.0.as_hex().to_string();
 	write_rgb_channel_info(
