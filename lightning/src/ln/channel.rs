@@ -2572,8 +2572,8 @@ impl FundingScope {
 	where
 		SP::Target: SignerProvider,
 	{
-		debug_assert!(our_funding_contribution.abs() <= SignedAmount::MAX_MONEY);
-		debug_assert!(their_funding_contribution.abs() <= SignedAmount::MAX_MONEY);
+		debug_assert!(our_funding_contribution.unsigned_abs() <= Amount::MAX_MONEY);
+		debug_assert!(their_funding_contribution.unsigned_abs() <= Amount::MAX_MONEY);
 
 		let post_channel_value = prev_funding.compute_post_splice_value(
 			our_funding_contribution.to_sat(),
@@ -9092,7 +9092,6 @@ where
 							update_fail_htlcs.len() + update_fail_malformed_htlcs.len(),
 							&self.context.channel_id);
 					} else {
-						debug_assert!(htlcs_to_fail.is_empty());
 						let reason = if self.context.channel_state.is_local_stfu_sent() {
 							"exits quiescence"
 						} else if self.context.channel_state.is_monitor_update_in_progress() {
@@ -12369,7 +12368,7 @@ where
 	fn validate_splice_contributions(
 		&self, our_funding_contribution: SignedAmount, their_funding_contribution: SignedAmount,
 	) -> Result<(), String> {
-		if our_funding_contribution.abs() > SignedAmount::MAX_MONEY {
+		if our_funding_contribution.unsigned_abs() > Amount::MAX_MONEY {
 			return Err(format!(
 				"Channel {} cannot be spliced; our {} contribution exceeds the total bitcoin supply",
 				self.context.channel_id(),
@@ -12377,7 +12376,7 @@ where
 			));
 		}
 
-		if their_funding_contribution.abs() > SignedAmount::MAX_MONEY {
+		if their_funding_contribution.unsigned_abs() > Amount::MAX_MONEY {
 			return Err(format!(
 				"Channel {} cannot be spliced; their {} contribution exceeds the total bitcoin supply",
 				self.context.channel_id(),

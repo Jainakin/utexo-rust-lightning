@@ -1,3 +1,39 @@
+# 0.2.2 - Feb 6, 2025 - "An Async Splicing Production"
+
+## API Updates
+ * The `SplicePrototype` feature flag has been updated to refer to feature bit
+   63 - the same as `SpliceProduction`. This resolves a compatibility issue with
+   eclair nodes due to the use of the same splicing feature flag (155) they were
+   using for a pre-standardization version of splicing (#4387).
+
+## Bug Fixes
+ * Async `ChannelMonitorUpdate` persistence operations which complete, but are
+   not marked as complete in a persisted `ChannelManager` prior to restart,
+   followed immediately by a block connection and then another restart could
+   result in some channel operations hanging leading for force-closures (#4377).
+ * A debug assertion failure reachable when receiving an invalid splicing
+   message from a peer was fixed (#4383).
+
+
+# 0.2.1 - Jan 29, 2025 - "Electrum Confirmations Logged"
+
+## API Updates
+ * The `AttributionData` struct is now public, correcting an issue where it was
+   accidentally sealed preventing construction of some messages (#4268).
+ * The async background processor now exits even if work remains to be done as
+   soon as the sleeper returns the exit flag (#4259).
+
+## Bug Fixes
+ * The presence of unconfirmed transactions no longer causes
+   `ElectrumSyncClient` to spuriously fail to sync (#4341).
+ * `ChannelManager::splice_channel` now properly fails immediately if the
+   peer does not support splicing (#4262, #4274).
+ * A spurious debug assertion was removed which could fail in cases where an
+   HTLC fails to be forwarded after being accepted (#4312).
+ * Many log calls related to outbound payments were corrected to include a
+   `payment_hash` field (#4342).
+
+
 # 0.2 - Dec 2, 2025 - "Natively Asynchronous Splicing"
 
 ## API Updates
@@ -40,11 +76,13 @@
    pre-signed transactions, relying on anchor bumps instead. They also utilize
    the new TRUC + ephemeral dust policy in Bitcoin Core 29 to substantially
    improve the lightning security model. This requires having a path of Bitcoin
-   Core 29+ nodes between you and a miner for transactions to be mined. This
-   only works with LDK peers, and feature signaling may change in a future
-   version of LDK, breaking compatibility. This is negotiated automatically for
-   manually-accepted inbound channels and negotiated for outbound channels based
-   on `ChannelHandshakeConfig::negotiate_anchor_zero_fee_commitments`.
+   Core 29+ nodes between you and a miner for transactions to be mined. Bitcoin
+   Knots blocks these transactions by default, and is not recommended for use
+   with a lightning node. 0FC channels currently only work with LDK peers, and
+   feature signaling may change in a future version of LDK, breaking
+   compatibility. This is negotiated automatically for manually-accepted inbound
+   channels and negotiated for outbound channels based on
+   `ChannelHandshakeConfig::negotiate_anchor_zero_fee_commitments`.
  * `Event::BumpTransaction` is now always generated even if the transaction has
    sufficient fee. This allows you to manage transaction broadcasting more
    granularly for anchor channels (#4001).
@@ -144,7 +182,9 @@
    `ListProtocols` message (#3785).
  * A rare race which might lead `PeerManager` (and `lightning-net-tokio`) to
    stop reading from a peer until a new message is sent to that peer has been
-   fixed (#4168).
+   fixed. Note that this changed the semantics of the
+   `SocketDescriptor::send_data` method without changing its signature, check
+   that your implementation matches the new documentation (#4168).
  * The fields in `SocketAddress::OnionV3` are now correctly parsed, and the
    `Display` for such addresses is now lowercase (#4090).
  * `PeerManager` is now more conservative about disconnecting peers which aren't

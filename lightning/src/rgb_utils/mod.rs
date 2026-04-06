@@ -21,10 +21,10 @@ use rgb_lib::{
 	bitcoin::psbt::Psbt as RgbLibPsbt,
 	wallet::{
 		rust_only::{AssetColoringInfo, ColoringInfo},
-		DatabaseType, WalletData,
+		DatabaseType, SinglesigKeys, Wallet, WalletData,
 	},
 	AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
-	FileContent, RgbTransfer, RgbTransport, RgbTxid, Wallet, WitnessOrd,
+	FileContent, RgbTransfer, RgbTransport, WitnessOrd,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -154,18 +154,28 @@ fn _new_rgb_wallet(
 	data_dir: String, bitcoin_network: BitcoinNetwork, account_xpub_vanilla: String,
 	account_xpub_colored: String, master_fingerprint: String,
 ) -> Wallet {
-	Wallet::new(WalletData {
-		data_dir,
-		bitcoin_network,
-		database_type: DatabaseType::Sqlite,
-		max_allocations_per_utxo: 1,
+	let keys = SinglesigKeys {
 		account_xpub_vanilla,
 		account_xpub_colored,
+		vanilla_keychain: None,
 		master_fingerprint,
 		mnemonic: None,
-		vanilla_keychain: None,
-		supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa, AssetSchema::Uda],
-	})
+	};
+	Wallet::new(
+		WalletData {
+			data_dir,
+			bitcoin_network,
+			database_type: DatabaseType::Sqlite,
+			max_allocations_per_utxo: 1,
+			supported_schemas: vec![
+				AssetSchema::Nia,
+				AssetSchema::Cfa,
+				AssetSchema::Uda,
+				AssetSchema::Ifa,
+			],
+		},
+		keys,
+	)
 	.expect("valid rgb-lib wallet")
 }
 
@@ -451,13 +461,7 @@ where
 	let txid = modified_tx.compute_txid();
 	commitment_transaction.built = BuiltCommitmentTransaction { transaction: modified_tx, txid };
 
-	wallet
-		.consume_fascia(
-			fascia.clone(),
-			RgbTxid::from_str(&txid.to_string()).unwrap(),
-			Some(WitnessOrd::Ignored),
-		)
-		.unwrap();
+	wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)).unwrap();
 
 	// save RGB transfer data to disk
 	let rgb_amount = if counterparty {
@@ -511,13 +515,7 @@ pub(crate) fn color_htlc(
 	};
 	let txid = &modified_tx.compute_txid();
 
-	wallet
-		.consume_fascia(
-			fascia.clone(),
-			RgbTxid::from_str(&txid.to_string()).unwrap(),
-			Some(WitnessOrd::Ignored),
-		)
-		.unwrap();
+	wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)).unwrap();
 
 	// save RGB transfer data to disk
 	let transfer_info = TransferInfo { contract_id, rgb_amount: htlc_amount_rgb };
@@ -582,13 +580,7 @@ pub(crate) fn color_closing(
 	let txid = &modified_tx.compute_txid();
 	closing_transaction.built = modified_tx;
 
-	wallet
-		.consume_fascia(
-			fascia.clone(),
-			RgbTxid::from_str(&txid.to_string()).unwrap(),
-			Some(WitnessOrd::Ignored),
-		)
-		.unwrap();
+	wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)).unwrap();
 
 	// save RGB transfer data to disk
 	let transfer_info = TransferInfo { contract_id, rgb_amount: holder_vout_amount };
