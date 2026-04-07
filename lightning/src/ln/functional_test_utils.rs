@@ -972,7 +972,7 @@ pub fn get_revoke_commit_msgs<CM: AChannelManager, H: NodeHolder<CM = CM>>(
 				assert_eq!(node_id, recipient);
 				(*msg).clone()
 			},
-			_ => panic!("Unexpected event"),
+			_ => panic!("Unexpected event: {events:?}"),
 		},
 		match events[1] {
 			MessageSendEvent::UpdateHTLCs { ref node_id, ref channel_id, ref updates } => {
@@ -985,7 +985,7 @@ pub fn get_revoke_commit_msgs<CM: AChannelManager, H: NodeHolder<CM = CM>>(
 				assert!(updates.commitment_signed.iter().all(|cs| cs.channel_id == *channel_id));
 				updates.commitment_signed.clone()
 			},
-			_ => panic!("Unexpected event"),
+			_ => panic!("Unexpected event: {events:?}"),
 		},
 	)
 }
@@ -3488,7 +3488,7 @@ pub fn send_along_route_with_secret<'a, 'b, 'c>(
 	payment_id
 }
 
-fn fail_payment_along_path<'a, 'b, 'c>(expected_path: &[&Node<'a, 'b, 'c>]) {
+pub fn fail_payment_along_path<'a, 'b, 'c>(expected_path: &[&Node<'a, 'b, 'c>]) {
 	let origin_node_id = expected_path[0].node.get_our_node_id();
 
 	// iterate from the receiving node to the origin node and handle update fail htlc.
