@@ -203,6 +203,12 @@ pub use crate::ln::outbound_payment::{
 };
 use crate::ln::script::ShutdownScript;
 
+/// Test-only hook: if set to a node's pubkey, that node will drop outgoing
+/// `funding_signed` messages (sending an `ErrorMessage` instead) in its
+/// `internal_funding_created` handler.
+#[cfg(any(test, feature = "_rln_test_hooks"))]
+pub static DROP_FUNDING_SIGNED_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
 // We hold various information about HTLC relay in the HTLC objects in Channel itself:
 //
 // Upon receipt of an HTLC from a peer, we'll give it a PendingHTLCStatus indicating if it should
@@ -10510,10 +10516,34 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					// accepted payment from yet. We do, however, need to wait to send our channel_ready
 					// until we have persisted our monitor.
 					if let Some(msg) = funding_msg_opt {
-						peer_state.pending_msg_events.push(MessageSendEvent::SendFundingSigned {
-							node_id: *counterparty_node_id,
-							msg,
-						});
+						#[cfg(any(test, feature = "_rln_test_hooks"))]
+						let drop_funding_signed = DROP_FUNDING_SIGNED_ON_NODE
+							.lock()
+							.unwrap()
+							.as_ref()
+							.map_or(false, |id| *id == self.get_our_node_id());
+						#[cfg(not(any(test, feature = "_rln_test_hooks")))]
+						let drop_funding_signed = false;
+						if drop_funding_signed {
+							log_error!(
+								WithChannelContext::from(&self.logger, &chan.context, None),
+								"TEST: dropping funding_signed for channel {funded_channel_id}, sending error instead"
+							);
+							peer_state.pending_msg_events.push(MessageSendEvent::HandleError {
+								node_id: *counterparty_node_id,
+								action: msgs::ErrorAction::SendErrorMessage {
+									msg: msgs::ErrorMessage {
+										channel_id: msg.channel_id,
+										data: "TEST: funding_signed dropped".to_owned(),
+									},
+								},
+							});
+						} else {
+							peer_state.pending_msg_events.push(MessageSendEvent::SendFundingSigned {
+								node_id: *counterparty_node_id,
+								msg,
+							});
+						}
 					}
 
 					if let Some(funded_chan) = e.insert(Channel::from(chan)).as_funded_mut() {

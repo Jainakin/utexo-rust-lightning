@@ -16,6 +16,7 @@ features = ["std", "dnssec"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
+_rln_test_hooks = []
 # Internal test utilities exposed to other repo crates
 _test_utils = ["regex", "bitcoin/bitcoinconsensus", "lightning-types/_test_utils"]
 _externalize_tests = ["inventory", "_test_utils"]
