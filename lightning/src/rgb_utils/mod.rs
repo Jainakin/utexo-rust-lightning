@@ -336,14 +336,40 @@ where
 				.expect("able to remove pending payment info");
 		}
 
-		let rgb_payment_info = if let Ok(data) =
-			kv_store.read(RGB_PRIMARY_NS, namespace, &htlc_proxy_id)
+		// Only accept a stored candidate if it actually describes THIS HTLC on THIS channel.
+		// Matches the pre-KVStore guard in `color_commitment`: a record whose contract_id,
+		// amount, or direction disagrees with what's being coloured right now cannot have been
+		// written for this HTLC, so treating it as authoritative would poison the commitment
+		// (e.g. two legs of an atomic RGB swap sharing a payment_hash under different assets).
+		let is_compatible = |info: &RgbPaymentInfo| {
+			info.contract_id == contract_id
+				&& info.amount == htlc_amount_rgb
+				&& info.inbound == inbound
+		};
+
+		let rgb_payment_info = if let Some(info) = kv_store
+			.read(RGB_PRIMARY_NS, namespace, &htlc_proxy_id)
+			.ok()
+			.map(|data| bincode::deserialize::<RgbPaymentInfo>(&data).expect("valid data"))
+			.filter(|info| is_compatible(info))
 		{
-			let mut info: RgbPaymentInfo = bincode::deserialize(&data).expect("valid data");
-			info.local_rgb_amount = rgb_info.local_rgb_amount;
-			info.remote_rgb_amount = rgb_info.remote_rgb_amount;
+			// Cache hit on the per-channel record. Preserve stored balances: they were the
+			// channel's snapshot at the time this HTLC was first coloured, and the later
+			// `remote_rgb_amount - rgb_received_htlc` (and local/offered) subtraction assumes
+			// that snapshot — using current `rgb_info` values can underflow if the channel
+			// state has since moved. Matches pre-KVStore `channel_rgb_payment_info_path`
+			// behaviour, where `should_persist_channel_info` stayed false on this branch.
 			info
-		} else if let Ok(mut info) = kv_store.read_rgb_payment_info(&htlc.payment_hash, inbound) {
+		} else if let Some(mut info) = kv_store
+			.read_rgb_payment_info(&htlc.payment_hash, inbound)
+			.ok()
+			.filter(|info| is_compatible(info))
+		{
+			// Fall back to the canonical payment-hash-keyed record written by the sender/payee
+			// via `write_rgb_payment_info_file`. Lets a second channel on the same node recover
+			// the authoritative payment info once the first channel has consumed the
+			// `<payment_hash>_pending` marker. Refresh balances, then persist a per-channel
+			// copy so subsequent commitment updates hit the cached branch above.
 			info.local_rgb_amount = rgb_info.local_rgb_amount;
 			info.remote_rgb_amount = rgb_info.remote_rgb_amount;
 			let data = bincode::serialize(&info).expect("valid rgb payment info");
@@ -355,6 +381,9 @@ where
 				.expect("able to write rgb pending payment info");
 			info
 		} else {
+			// No compatible record available (e.g. a forwarder that never saw a
+			// sender/payee-side write). Synthesize from the channel's own RGB info plus the
+			// HTLC's amount.
 			let rgb_payment_info = RgbPaymentInfo {
 				contract_id,
 				amount: htlc_amount_rgb,
