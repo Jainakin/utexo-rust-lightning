@@ -21,7 +21,7 @@ use rgb_lib::{
 	keys::WitnessVersion,
 	wallet::{
 		rust_only::{AssetColoringInfo, ColoringInfo},
-		DatabaseType, SinglesigKeys, Wallet, WalletData,
+		DatabaseType, OnlineOptions, SinglesigKeys, Wallet, WalletData,
 	},
 	AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
 	FileContent, RgbTransfer, RgbTransport, WitnessOrd,
@@ -51,6 +51,7 @@ pub const WALLET_ACCOUNT_XPUB_COLORED_FNAME: &str = "wallet_account_xpub_colored
 pub const WALLET_MASTER_FINGERPRINT_FNAME: &str = "wallet_master_fingerprint";
 const INBOUND_EXT: &str = "inbound";
 const OUTBOUND_EXT: &str = "outbound";
+const VANILLA_SYNC_LOOKBACK: u32 = 20;
 
 /// RGB channel info
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -222,7 +223,11 @@ async fn _accept_transfer(
 			account_xpub_colored,
 			master_fingerprint,
 		);
-		wallet.go_online(true, indexer_url)?;
+		wallet.go_online(OnlineOptions {
+			indexer_url,
+			skip_consistency_check: true,
+			vanilla_sync_lookback: VANILLA_SYNC_LOOKBACK,
+		})?;
 		wallet.accept_transfer(
 			funding_txid.clone(),
 			funding_vout,
