@@ -35,6 +35,3 @@ hashbrown = { version = "0.13", default-features = false }
 
 [lints]
 workspace = true
-
-[patch.crates-io]
-rgb-lib = { git = "https://github.com/RGB-Tools/rgb-lib", branch = "master" }
