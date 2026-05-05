@@ -21,7 +21,7 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hashes::Hash;
 use bitcoin::network::Network;
 
-use rgb_lib::ContractId;
+use crate::rgb_utils::ContractId;
 
 use crate::ln::msgs;
 use crate::ln::msgs::{

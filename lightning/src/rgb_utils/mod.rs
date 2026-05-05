@@ -1,5 +1,9 @@
 //! A module to provide RGB functionality
 
+// This module is used by native RLN builds. For `wasm32` consumers we allow
+// compiling `lightning` with `default-features = false` and without the `rgb`
+// feature, to avoid pulling host-only crates (`rgb-lib` → `sea-orm` → `sqlx`).
+
 use crate::ln::chan_utils::{
 	get_countersigner_payment_script, BuiltCommitmentTransaction, ClosingTransaction,
 	CommitmentTransaction, HTLCOutputInCommitment,
@@ -17,16 +21,29 @@ use bitcoin::hex::DisplayHex;
 use bitcoin::psbt::{ExtractTxError, Psbt};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::TxOut;
+
+#[cfg(feature = "rgb")]
 use rgb_lib::{
 	bitcoin::psbt::Psbt as RgbLibPsbt,
 	wallet::{
 		rust_only::{AssetColoringInfo, ColoringInfo},
 		DatabaseType, SinglesigKeys, Wallet, WalletData,
 	},
-	AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
-	FileContent, RgbTransfer, RgbTransport, WitnessOrd,
+	AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, Error as RgbLibError, FileContent,
+	RgbTransfer, WitnessOrd,
 };
+/// Same `ContractId` as BOLT11 / TLV (`lightning-invoice`), re-exported from `rgb-lib` when `rgb`
+/// is enabled on both crates (see `lightning` crate `rgb` feature → `lightning-invoice/rgb`).
+#[cfg(feature = "rgb")]
+pub use lightning_invoice::ContractId;
+#[cfg(feature = "rgb")]
+pub use rgb_lib::RgbTransport;
+
+#[cfg(not(feature = "rgb"))]
+pub use self::stubs::{AssetSchema, ContractId, RgbTransport};
+
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "rgb")]
 use tokio::runtime::Handle;
 
 use core::ops::Deref;
@@ -34,6 +51,51 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+#[cfg(not(feature = "rgb"))]
+mod stubs {
+	//! Minimal RGB type stubs for builds without `feature = "rgb"`.
+	//!
+	//! These are intentionally lightweight: they exist so wasm consumers can compile `lightning`
+	//! without linking the host RGB wallet/database stack. Functionality is disabled.
+
+	use core::fmt;
+	use core::str::FromStr;
+	use serde::{Deserialize, Serialize};
+
+	/// Contract id type shared with `lightning-invoice` for non-RGB builds.
+	pub type ContractId = lightning_invoice::ContractId;
+
+	#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+	/// Stub RGB transport used when the `rgb` feature is disabled.
+	pub enum RgbTransport {
+		/// RGB transport is disabled for this build.
+		Disabled,
+	}
+
+	#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+	/// Stub asset schema used when the `rgb` feature is disabled.
+	pub enum AssetSchema {
+		/// Unknown schema placeholder.
+		Unknown,
+	}
+
+	impl fmt::Display for RgbTransport {
+		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+			match self {
+				RgbTransport::Disabled => f.write_str("disabled"),
+			}
+		}
+	}
+
+	impl FromStr for RgbTransport {
+		type Err = core::convert::Infallible;
+
+		fn from_str(_s: &str) -> Result<Self, Self::Err> {
+			Ok(RgbTransport::Disabled)
+		}
+	}
+}
 
 /// Static blinding costant (will be removed in the future)
 pub const STATIC_BLINDING: u64 = 777;
@@ -116,40 +178,49 @@ mod contract_id_serde {
 	}
 }
 
+#[cfg(feature = "rgb")]
 fn _get_file_in_parent(ldk_data_dir: &Path, fname: &str) -> PathBuf {
 	ldk_data_dir.parent().unwrap().join(fname)
 }
 
+#[cfg(feature = "rgb")]
 fn _read_file_in_parent(ldk_data_dir: &Path, fname: &str) -> String {
 	fs::read_to_string(_get_file_in_parent(ldk_data_dir, fname)).unwrap()
 }
 
+#[cfg(feature = "rgb")]
 fn _get_rgb_wallet_dir(ldk_data_dir: &Path) -> PathBuf {
 	let fingerprint = _read_file_in_parent(ldk_data_dir, WALLET_FINGERPRINT_FNAME);
 	_get_file_in_parent(ldk_data_dir, &fingerprint)
 }
 
+#[cfg(feature = "rgb")]
 fn _get_bitcoin_network(ldk_data_dir: &Path) -> BitcoinNetwork {
 	let bitcoin_network = _read_file_in_parent(ldk_data_dir, BITCOIN_NETWORK_FNAME);
 	BitcoinNetwork::from_str(&bitcoin_network).unwrap()
 }
 
+#[cfg(feature = "rgb")]
 fn _get_account_xpub_colored(ldk_data_dir: &Path) -> String {
 	_read_file_in_parent(ldk_data_dir, WALLET_ACCOUNT_XPUB_COLORED_FNAME)
 }
 
+#[cfg(feature = "rgb")]
 fn _get_account_xpub_vanilla(ldk_data_dir: &Path) -> String {
 	_read_file_in_parent(ldk_data_dir, WALLET_ACCOUNT_XPUB_VANILLA_FNAME)
 }
 
+#[cfg(feature = "rgb")]
 fn _get_master_fingerprint(ldk_data_dir: &Path) -> String {
 	_read_file_in_parent(ldk_data_dir, WALLET_MASTER_FINGERPRINT_FNAME)
 }
 
+#[cfg(feature = "rgb")]
 fn _get_indexer_url(ldk_data_dir: &Path) -> String {
 	_read_file_in_parent(ldk_data_dir, INDEXER_URL_FNAME)
 }
 
+#[cfg(feature = "rgb")]
 fn _new_rgb_wallet(
 	data_dir: String, bitcoin_network: BitcoinNetwork, account_xpub_vanilla: String,
 	account_xpub_colored: String, master_fingerprint: String,
@@ -179,6 +250,7 @@ fn _new_rgb_wallet(
 	.expect("valid rgb-lib wallet")
 }
 
+#[cfg(feature = "rgb")]
 fn _get_wallet_data(ldk_data_dir: &Path) -> (String, BitcoinNetwork, String, String, String) {
 	let data_dir = ldk_data_dir.parent().unwrap().to_string_lossy().to_string();
 	let bitcoin_network = _get_bitcoin_network(ldk_data_dir);
@@ -188,6 +260,7 @@ fn _get_wallet_data(ldk_data_dir: &Path) -> (String, BitcoinNetwork, String, Str
 	(data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored, master_fingerprint)
 }
 
+#[cfg(feature = "rgb")]
 async fn _get_rgb_wallet(ldk_data_dir: &Path) -> Wallet {
 	let (data_dir, bitcoin_network, account_xpub_vanilla, account_xpub_colored, master_fingerprint) =
 		_get_wallet_data(ldk_data_dir);
@@ -204,6 +277,7 @@ async fn _get_rgb_wallet(ldk_data_dir: &Path) -> Wallet {
 	.unwrap()
 }
 
+#[cfg(feature = "rgb")]
 async fn _accept_transfer(
 	ldk_data_dir: &Path, funding_txid: String, consignment_endpoint: RgbTransport,
 ) -> Result<(RgbTransfer, Vec<Assignment>), RgbLibError> {
@@ -266,6 +340,7 @@ pub fn is_tx_colored(tx: &Transaction) -> bool {
 }
 
 /// Color commitment transaction
+#[cfg(feature = "rgb")]
 pub(crate) fn color_commitment<SP: Deref>(
 	channel_context: &ChannelContext<SP>, funding_scope: &FundingScope,
 	commitment_transaction: &mut CommitmentTransaction, counterparty: bool,
@@ -476,7 +551,19 @@ where
 	Ok(())
 }
 
+#[cfg(not(feature = "rgb"))]
+pub(crate) fn color_commitment<SP: Deref>(
+	_channel_context: &ChannelContext<SP>, _funding_scope: &FundingScope,
+	_commitment_transaction: &mut CommitmentTransaction, _counterparty: bool,
+) -> Result<(), ChannelError>
+where
+	<SP as std::ops::Deref>::Target: SignerProvider,
+{
+	Ok(())
+}
+
 /// Color HTLC transaction
+#[cfg(feature = "rgb")]
 pub(crate) fn color_htlc(
 	htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitment, ldk_data_dir: &Path,
 ) -> Result<(), ChannelError> {
@@ -525,7 +612,15 @@ pub(crate) fn color_htlc(
 	Ok(())
 }
 
+#[cfg(not(feature = "rgb"))]
+pub(crate) fn color_htlc(
+	_htlc_tx: &mut Transaction, _htlc: &HTLCOutputInCommitment, _ldk_data_dir: &Path,
+) -> Result<(), ChannelError> {
+	Ok(())
+}
+
 /// Color closing transaction
+#[cfg(feature = "rgb")]
 pub(crate) fn color_closing(
 	channel_id: &ChannelId, closing_transaction: &mut ClosingTransaction, ldk_data_dir: &Path,
 ) -> Result<(), ChannelError> {
@@ -587,6 +682,13 @@ pub(crate) fn color_closing(
 	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
 
+	Ok(())
+}
+
+#[cfg(not(feature = "rgb"))]
+pub(crate) fn color_closing(
+	_channel_id: &ChannelId, _closing_transaction: &mut ClosingTransaction, _ldk_data_dir: &Path,
+) -> Result<(), ChannelError> {
 	Ok(())
 }
 
@@ -730,6 +832,7 @@ pub(crate) fn rename_rgb_files(
 }
 
 /// Handle funding on the receiver side
+#[cfg(feature = "rgb")]
 pub(crate) fn handle_funding(
 	temporary_channel_id: &ChannelId, funding_txid: String, ldk_data_dir: &Path,
 	consignment_endpoint: RgbTransport, push_asset_amount: Option<u64>,
@@ -809,6 +912,17 @@ pub(crate) fn handle_funding(
 		&rgb_info,
 	);
 
+	Ok(())
+}
+
+#[cfg(not(feature = "rgb"))]
+pub(crate) fn handle_funding(
+	_temporary_channel_id: &ChannelId,
+	_funding_txid: String,
+	_ldk_data_dir: &Path,
+	_consignment_endpoint: RgbTransport,
+	_push_asset_amount: Option<u64>,
+) -> Result<(), MsgHandleErrInternal> {
 	Ok(())
 }
 

@@ -45,7 +45,7 @@ use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1};
 use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
 use bitcoin::{secp256k1, Sequence, Witness};
 
-use rgb_lib::ContractId;
+use crate::rgb_utils::ContractId;
 
 use super::channel_keys::{
 	DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, HtlcKey, RevocationBasepoint,

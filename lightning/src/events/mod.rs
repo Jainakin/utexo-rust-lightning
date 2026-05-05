@@ -16,7 +16,7 @@
 
 pub mod bump_transaction;
 
-use rgb_lib::ContractId;
+use crate::rgb_utils::ContractId;
 
 pub use bump_transaction::BumpTransactionEvent;
 
