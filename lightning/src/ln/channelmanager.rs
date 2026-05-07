@@ -119,10 +119,7 @@ use crate::onion_message::messenger::{
 	MessageRouter, MessageSendInstructions, Responder, ResponseInstruction,
 };
 use crate::onion_message::offers::{OffersMessage, OffersMessageHandler};
-use crate::rgb_utils::{
-	get_rgb_channel_info, get_rgb_payment_info_path, handle_funding, is_channel_rgb,
-	parse_rgb_payment_info,
-};
+use crate::rgb_utils::{handle_funding, is_channel_rgb, RgbKvStoreExt};
 use crate::routing::router::{
 	BlindedTail, FixedRouter, InFlightHtlcs, Path, Payee, PaymentParameters, Route,
 	RouteParameters, RouteParametersConfig, Router,
@@ -139,6 +136,7 @@ use crate::types::string::UntrustedString;
 use crate::util::config::{ChannelConfig, ChannelConfigOverrides, ChannelConfigUpdate, UserConfig};
 use crate::util::errors::APIError;
 use crate::util::logger::{Level, Logger, WithContext};
+use crate::util::persist::KVStoreSync;
 use crate::util::scid_utils::fake_scid;
 use crate::util::ser::{
 	BigSize, FixedLengthReader, LengthReadable, MaybeReadable, Readable, ReadableArgs, VecWriter,
@@ -954,14 +952,14 @@ impl Into<LocalHTLCFailureReason> for FailureCode {
 /// immediately (ie with no further calls on it made). Thus, this step happens inside a
 /// peer_state lock. We then return the set of things that need to be done outside the lock in
 /// this struct and call handle_error!() on it.
-pub(crate) struct MsgHandleErrInternal {
+struct MsgHandleErrInternal {
 	err: msgs::LightningError,
 	closes_channel: bool,
 	shutdown_finish: Option<(ShutdownResult, Option<msgs::ChannelUpdate>)>,
 	tx_abort: Option<msgs::TxAbort>,
 }
 impl MsgHandleErrInternal {
-	pub(crate) fn send_err_msg_no_close(err: String, channel_id: ChannelId) -> Self {
+	fn send_err_msg_no_close(err: String, channel_id: ChannelId) -> Self {
 		Self {
 			err: LightningError {
 				err: err.clone(),
@@ -2016,6 +2014,8 @@ where
 /// #     best_block: lightning::chain::BestBlock,
 /// #     current_timestamp: u32,
 /// #     mut reader: R,
+/// #     ldk_data_dir: std::path::PathBuf,
+/// #     rgb_kv_store: std::sync::Arc<dyn lightning::util::persist::KVStoreSync + Send + Sync>,
 /// # ) -> Result<(), lightning::ln::msgs::DecodeError> {
 /// // Fresh start with no channels
 /// let params = ChainParameters {
@@ -2026,6 +2026,7 @@ where
 /// let channel_manager = ChannelManager::new(
 ///     fee_estimator, chain_monitor, tx_broadcaster, router, message_router, logger,
 ///     entropy_source, node_signer, signer_provider, config.clone(), params, current_timestamp,
+///     ldk_data_dir, rgb_kv_store,
 /// );
 ///
 /// // Restart from deserialized data
@@ -2033,6 +2034,7 @@ where
 /// let args = ChannelManagerReadArgs::new(
 ///     entropy_source, node_signer, signer_provider, fee_estimator, chain_monitor, tx_broadcaster,
 ///     router, message_router, logger, config, channel_monitors.iter().collect(),
+///     ldk_data_dir, rgb_kv_store,
 /// );
 /// let (block_hash, channel_manager) =
 ///     <(BlockHash, ChannelManager<_, _, _, _, _, _, _, _, _>)>::read(&mut reader, args)?;
@@ -2973,6 +2975,9 @@ pub struct ChannelManager<
 	logger: L,
 
 	ldk_data_dir: PathBuf,
+
+	/// KVStore for RGB data persistence
+	rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 }
 
 /// Chain-related parameters used to construct a new `ChannelManager`.
@@ -3996,7 +4001,8 @@ where
 	pub fn new(
 		fee_est: F, chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR, logger: L,
 		entropy_source: ES, node_signer: NS, signer_provider: SP, config: UserConfig,
-		params: ChainParameters, current_timestamp: u32, ldk_data_dir: PathBuf
+		params: ChainParameters, current_timestamp: u32, ldk_data_dir: PathBuf,
+		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> Self
 	where
 		L: Clone,
@@ -4025,7 +4031,7 @@ where
 			best_block: RwLock::new(params.best_block),
 
 			outbound_scid_aliases: Mutex::new(new_hash_set()),
-			pending_outbound_payments: OutboundPayments::new(new_hash_map(), ldk_data_dir.clone()),
+			pending_outbound_payments: OutboundPayments::new(new_hash_map(), rgb_kv_store.clone()),
 			forward_htlcs: Mutex::new(new_hash_map()),
 			decode_update_add_htlcs: Mutex::new(new_hash_map()),
 			claimable_payments: Mutex::new(ClaimablePayments { claimable_payments: new_hash_map(), pending_claiming_payments: new_hash_map() }),
@@ -4072,6 +4078,7 @@ where
 			testing_dnssec_proof_offer_resolution_override: Mutex::new(new_hash_map()),
 
 			ldk_data_dir,
+			rgb_kv_store,
 		}
 	}
 
@@ -4190,7 +4197,8 @@ where
 			};
 			match OutboundV1Channel::new(&self.fee_estimator, &self.entropy_source, &self.signer_provider, their_network_key,
 				their_features, channel_value_satoshis, push_msat, user_channel_id, config,
-				self.best_block.read().unwrap().height, outbound_scid_alias, temporary_channel_id, &*self.logger, consignment_endpoint, self.ldk_data_dir.clone(), push_asset_amount)
+				self.best_block.read().unwrap().height, outbound_scid_alias, temporary_channel_id, &*self.logger, consignment_endpoint, self.ldk_data_dir.clone(), push_asset_amount,
+				self.rgb_kv_store.clone())
 			{
 				Ok(res) => res,
 				Err(e) => {
@@ -5383,18 +5391,11 @@ where
 		// The top-level caller should hold the total_consistency_lock read lock.
 		debug_assert!(self.total_consistency_lock.try_write().is_err());
 
-		let rgb_payment_info_hash_path_outbound =
-			get_rgb_payment_info_path(payment_hash, &self.ldk_data_dir, false);
-		let needs_rgb_modification = if rgb_payment_info_hash_path_outbound.exists() {
-			let info = parse_rgb_payment_info(&rgb_payment_info_hash_path_outbound);
-			if !info.swap_payment {
-				Some(info)
-			} else {
-				None
-			}
-		} else {
-			None
-		};
+		let needs_rgb_modification =
+			match self.rgb_kv_store.read_rgb_payment_info(payment_hash, false) {
+				Ok(info) if !info.swap_payment => Some(info),
+				_ => None,
+			};
 		let modified_path;
 		let path = if let Some(rgb_payment_info) = needs_rgb_modification {
 			modified_path = {
@@ -7720,15 +7721,14 @@ where
 								.contains(&outgoing_amt_msat);
 							if is_in_range && chan.context.is_usable() {
 								if let Some((cid, outgoing_amount_rgb)) = outgoing_rgb_payment {
-									if !is_channel_rgb(&chan.context.channel_id, &self.ldk_data_dir)
+									if !is_channel_rgb(&chan.context.channel_id, self.rgb_kv_store.as_ref())
 									{
 										return None;
 									}
-									let (rgb_chan_info, _) = get_rgb_channel_info(
+									let rgb_chan_info = self.rgb_kv_store.read_rgb_channel_info(
 										&chan.context.channel_id.0.as_hex().to_string(),
-										&self.ldk_data_dir,
 										false,
-									);
+									).expect("channel info must exist in KVStore");
 									if rgb_chan_info.contract_id == *cid
 										&& rgb_chan_info.local_rgb_amount >= *outgoing_amount_rgb
 									{
@@ -10217,7 +10217,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						InboundV1Channel::new(
 							&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 							&self.channel_type_features(), &peer_state.latest_features, &open_channel_msg,
-							user_channel_id, &config, best_block_height, &self.logger, accept_0conf, self.ldk_data_dir.clone()
+							user_channel_id, &config, best_block_height, &self.logger, accept_0conf, self.ldk_data_dir.clone(),
+							self.rgb_kv_store.clone(),
 						).map_err(|err| MsgHandleErrInternal::from_chan_no_close(err, *temporary_channel_id)
 						).map(|mut channel| {
 							Self::apply_inbound_channel_funding_type(&mut channel.context, channel_funding_type);
@@ -10240,6 +10241,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							user_channel_id, &config, best_block_height,
 							&self.logger,
 							self.ldk_data_dir.clone(),
+							self.rgb_kv_store.clone(),
 						).map_err(|e| {
 							let channel_id = open_channel_msg.common_fields.temporary_channel_id;
 							MsgHandleErrInternal::from_chan_no_close(e, channel_id)
@@ -10510,7 +10512,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				let mut channel = InboundV1Channel::new(
 					&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 					&self.channel_type_features(), &peer_state.latest_features, msg, user_channel_id,
-					&self.config.read().unwrap(), best_block_height, &self.logger, /*is_0conf=*/false, self.ldk_data_dir.clone()
+					&self.config.read().unwrap(), best_block_height, &self.logger, /*is_0conf=*/false, self.ldk_data_dir.clone(),
+					self.rgb_kv_store.clone(),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let logger = WithChannelContext::from(&self.logger, &channel.context, None);
 				let message_send_event = channel.accept_inbound_channel(&&logger).map(|msg| {
@@ -10528,6 +10531,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					&peer_state.latest_features, msg, user_channel_id,
 					&self.config.read().unwrap(), best_block_height, &self.logger,
 					self.ldk_data_dir.clone(),
+					self.rgb_kv_store.clone(),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let message_send_event = MessageSendEvent::SendAcceptChannelV2 {
 					node_id: *counterparty_node_id,
@@ -10612,7 +10616,16 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				Some(Ok(inbound_chan)) => {
 					let logger = WithChannelContext::from(&self.logger, &inbound_chan.context, None);
 					if let Some(consignment_endpoint) = &inbound_chan.funding.consignment_endpoint {
-						handle_funding(&msg.temporary_channel_id, msg.funding_txid.to_string(), &self.ldk_data_dir, consignment_endpoint.clone(), inbound_chan.funding.push_asset_amount)?;
+						match handle_funding(&msg.temporary_channel_id, msg.funding_txid.to_string(), &self.ldk_data_dir, consignment_endpoint.clone(), inbound_chan.funding.push_asset_amount, self.rgb_kv_store.as_ref()) {
+							Ok(()) => (),
+							Err(e) => {
+								// at this point the channel initiator already transitioned its channel to the funded channel ID
+								let mut chan = Channel::from(inbound_chan);
+								let funding_txo = OutPoint { txid: msg.funding_txid, index: msg.funding_output_index };
+								chan.context_mut().channel_id = ChannelId::v1_from_funding_outpoint(funding_txo);
+								return Err(convert_channel_err!(self, peer_state, e, &mut chan).1);
+							},
+						}
 					}
 					match inbound_chan.funding_created(msg, best_block, &self.signer_provider, &&logger) {
 						Ok(res) => res,
@@ -16973,6 +16986,9 @@ pub struct ChannelManagerReadArgs<
 
 	/// LDK data directory
 	pub ldk_data_dir: PathBuf,
+
+	/// KVStore for RGB data persistence
+	pub rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 }
 
 impl<
@@ -17007,6 +17023,7 @@ where
 		config: UserConfig,
 		mut channel_monitors: Vec<&'a ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>>,
 		ldk_data_dir: PathBuf,
+		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> Self {
 		Self {
 			entropy_source,
@@ -17023,6 +17040,7 @@ where
 				channel_monitors.drain(..).map(|monitor| (monitor.channel_id(), monitor)),
 			),
 			ldk_data_dir,
+			rgb_kv_store,
 		}
 	}
 }
@@ -17126,6 +17144,7 @@ where
 					&args.signer_provider,
 					&provided_channel_type_features(&args.config),
 					args.ldk_data_dir.clone(),
+					args.rgb_kv_store.clone(),
 				),
 			)?;
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
@@ -17555,7 +17574,7 @@ where
 			}
 			pending_outbound_payments = Some(outbounds);
 		}
-		let pending_outbounds = OutboundPayments::new(pending_outbound_payments.unwrap(), args.ldk_data_dir.clone());
+		let pending_outbounds = OutboundPayments::new(pending_outbound_payments.unwrap(), args.rgb_kv_store.clone());
 
 		for (peer_pubkey, peer_storage) in peer_storage_dir {
 			if let Some(peer_state) = per_peer_state.get_mut(&peer_pubkey) {
@@ -18498,6 +18517,7 @@ where
 			testing_dnssec_proof_offer_resolution_override: Mutex::new(new_hash_map()),
 
 			ldk_data_dir: args.ldk_data_dir,
+			rgb_kv_store: args.rgb_kv_store,
 		};
 
 		let mut processed_claims: HashSet<Vec<MPPClaimHTLCSource>> = new_hash_set();
@@ -20013,22 +20033,24 @@ pub mod bench {
 		config.channel_handshake_config.minimum_depth = 1;
 
 		let seed_a = [1u8; 32];
-		let keys_manager_a = KeysManager::new(&seed_a, 42, 42, true);
+		let rgb_kv_store_a: Arc<dyn crate::util::persist::KVStoreSync + Send + Sync> = Arc::new(test_utils::TestStore::new(false));
+		let keys_manager_a = KeysManager::new(&seed_a, 42, 42, true, std::path::PathBuf::from("/tmp/ldk_bench_a"), rgb_kv_store_a.clone());
 		let chain_monitor_a = ChainMonitor::new(None, &tx_broadcaster, &logger_a, &fee_estimator, &persister_a, &keys_manager_a, keys_manager_a.get_peer_storage_key());
 		let node_a = ChannelManager::new(&fee_estimator, &chain_monitor_a, &tx_broadcaster, &router, &message_router, &logger_a, &keys_manager_a, &keys_manager_a, &keys_manager_a, config.clone(), ChainParameters {
 			network,
 			best_block: BestBlock::from_network(network),
-		}, genesis_block.header.time);
+		}, genesis_block.header.time, std::path::PathBuf::from("/tmp/ldk_bench_a"), rgb_kv_store_a);
 		let node_a_holder = ANodeHolder { node: &node_a };
 
 		let logger_b = test_utils::TestLogger::with_id("node a".to_owned());
 		let seed_b = [2u8; 32];
-		let keys_manager_b = KeysManager::new(&seed_b, 42, 42, true);
+		let rgb_kv_store_b: Arc<dyn crate::util::persist::KVStoreSync + Send + Sync> = Arc::new(test_utils::TestStore::new(false));
+		let keys_manager_b = KeysManager::new(&seed_b, 42, 42, true, std::path::PathBuf::from("/tmp/ldk_bench_b"), rgb_kv_store_b.clone());
 		let chain_monitor_b = ChainMonitor::new(None, &tx_broadcaster, &logger_a, &fee_estimator, &persister_b, &keys_manager_b, keys_manager_b.get_peer_storage_key());
 		let node_b = ChannelManager::new(&fee_estimator, &chain_monitor_b, &tx_broadcaster, &router, &message_router, &logger_b, &keys_manager_b, &keys_manager_b, &keys_manager_b, config.clone(), ChainParameters {
 			network,
 			best_block: BestBlock::from_network(network),
-		}, genesis_block.header.time);
+		}, genesis_block.header.time, std::path::PathBuf::from("/tmp/ldk_bench_b"), rgb_kv_store_b);
 		let node_b_holder = ANodeHolder { node: &node_b };
 
 		node_a.peer_connected(node_b.get_our_node_id(), &Init {
