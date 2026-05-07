@@ -8,6 +8,7 @@
 // licenses.
 
 #![crate_name = "lightning_types"]
+#![allow(clippy::result_unit_err)]
 
 //! Various types which are used in the lightning network.
 //!

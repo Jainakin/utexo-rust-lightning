@@ -1215,7 +1215,15 @@ mod test {
 		let cross_node_seed = [44u8; 32];
 		let rgb_kv_store: std::sync::Arc<dyn crate::util::persist::KVStoreSync + Send + Sync> =
 			std::sync::Arc::new(test_utils::TestStore::new(false));
-		let inner = PhantomKeysManager::new(&seed, 43, 44, &cross_node_seed, true, std::path::PathBuf::from("/tmp/ldk_test"), rgb_kv_store);
+		let inner = PhantomKeysManager::new(
+			&seed,
+			43,
+			44,
+			&cross_node_seed,
+			true,
+			std::path::PathBuf::from("/tmp/ldk_test"),
+			rgb_kv_store,
+		);
 		let dyn_inner = DynPhantomKeysInterface::new(inner);
 		DynKeysInterface::new(Box::new(dyn_inner))
 	}

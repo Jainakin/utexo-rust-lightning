@@ -5374,6 +5374,7 @@ where
 		})
 	}
 
+	#[allow(clippy::never_loop)]
 	fn send_payment_along_path(&self, args: SendAlongPathArgs) -> Result<(), APIError> {
 		let SendAlongPathArgs {
 			path,
@@ -7721,14 +7722,19 @@ where
 								.contains(&outgoing_amt_msat);
 							if is_in_range && chan.context.is_usable() {
 								if let Some((cid, outgoing_amount_rgb)) = outgoing_rgb_payment {
-									if !is_channel_rgb(&chan.context.channel_id, self.rgb_kv_store.as_ref())
-									{
+									if !is_channel_rgb(
+										&chan.context.channel_id,
+										self.rgb_kv_store.as_ref(),
+									) {
 										return None;
 									}
-									let rgb_chan_info = self.rgb_kv_store.read_rgb_channel_info(
-										&chan.context.channel_id.0.as_hex().to_string(),
-										false,
-									).expect("channel info must exist in KVStore");
+									let rgb_chan_info = self
+										.rgb_kv_store
+										.read_rgb_channel_info(
+											&chan.context.channel_id.0.as_hex().to_string(),
+											false,
+										)
+										.expect("channel info must exist in KVStore");
 									if rgb_chan_info.contract_id == *cid
 										&& rgb_chan_info.local_rgb_amount >= *outgoing_amount_rgb
 									{
@@ -12494,6 +12500,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	/// Check the holding cell in each channel and free any pending HTLCs in them if possible.
 	/// Returns whether there were any updates such as if pending HTLCs were freed or a monitor
 	/// update was applied.
+	#[allow(clippy::never_loop)]
 	fn check_free_holding_cells(&self) -> bool {
 		let mut has_monitor_update = false;
 		let mut failed_htlcs = Vec::new();
@@ -17022,8 +17029,7 @@ where
 		chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR, logger: L,
 		config: UserConfig,
 		mut channel_monitors: Vec<&'a ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>>,
-		ldk_data_dir: PathBuf,
-		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
+		ldk_data_dir: PathBuf, rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> Self {
 		Self {
 			entropy_source,
@@ -17574,7 +17580,8 @@ where
 			}
 			pending_outbound_payments = Some(outbounds);
 		}
-		let pending_outbounds = OutboundPayments::new(pending_outbound_payments.unwrap(), args.rgb_kv_store.clone());
+		let pending_outbounds =
+			OutboundPayments::new(pending_outbound_payments.unwrap(), args.rgb_kv_store.clone());
 
 		for (peer_pubkey, peer_storage) in peer_storage_dir {
 			if let Some(peer_state) = per_peer_state.get_mut(&peer_pubkey) {

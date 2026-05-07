@@ -3513,6 +3513,7 @@ where
 	/// issues!
 	///
 	/// [`send_data`]: SocketDescriptor::send_data
+	#[allow(clippy::never_loop)]
 	pub fn timer_tick_occurred(&self) {
 		let mut descriptors_needing_disconnect = Vec::new();
 		{

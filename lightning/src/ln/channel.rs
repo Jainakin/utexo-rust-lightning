@@ -101,9 +101,9 @@ use alloc::collections::{btree_map, BTreeMap};
 use crate::io;
 use crate::prelude::*;
 use crate::sign::type_resolver::ChannelSignerType;
+use crate::sync::Arc;
 #[cfg(any(test, fuzzing, debug_assertions))]
 use crate::sync::Mutex;
-use crate::sync::Arc;
 use crate::util::persist::KVStoreSync;
 use core::ops::Deref;
 use core::time::Duration;
@@ -15149,16 +15149,30 @@ where
 	}
 }
 
-impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, &'c ChannelTypeFeatures, PathBuf, Arc<dyn KVStoreSync + Send + Sync>)>
-	for FundedChannel<SP>
+impl<'a, 'b, 'c, ES: Deref, SP: Deref>
+	ReadableArgs<(
+		&'a ES,
+		&'b SP,
+		&'c ChannelTypeFeatures,
+		PathBuf,
+		Arc<dyn KVStoreSync + Send + Sync>,
+	)> for FundedChannel<SP>
 where
 	ES::Target: EntropySource,
 	SP::Target: SignerProvider,
 {
 	fn read<R: io::Read>(
-		reader: &mut R, args: (&'a ES, &'b SP, &'c ChannelTypeFeatures, PathBuf, Arc<dyn KVStoreSync + Send + Sync>),
+		reader: &mut R,
+		args: (
+			&'a ES,
+			&'b SP,
+			&'c ChannelTypeFeatures,
+			PathBuf,
+			Arc<dyn KVStoreSync + Send + Sync>,
+		),
 	) -> Result<Self, DecodeError> {
-		let (entropy_source, signer_provider, our_supported_features, ldk_data_dir, rgb_kv_store) = args;
+		let (entropy_source, signer_provider, our_supported_features, ldk_data_dir, rgb_kv_store) =
+			args;
 		let ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 		if ver <= 2 {
 			return Err(DecodeError::UnknownVersion);

@@ -2757,8 +2757,12 @@ pub mod benches {
 		let kv_store: Arc<dyn crate::util::persist::KVStoreSync + Send + Sync> =
 			Arc::new(crate::util::test_utils::TestStore::new(false));
 		let keys_manager = Arc::new(KeysManager::new(
-			&seed, now.as_secs(), now.subsec_micros(), true,
-			PathBuf::from("/tmp/ldk_bench"), kv_store,
+			&seed,
+			now.as_secs(),
+			now.subsec_micros(),
+			true,
+			PathBuf::from("/tmp/ldk_bench"),
+			kv_store,
 		));
 
 		let mut handles = Vec::new();
