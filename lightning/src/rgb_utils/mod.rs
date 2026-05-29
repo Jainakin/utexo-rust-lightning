@@ -32,6 +32,7 @@ use tokio::runtime::Handle;
 
 use crate::io;
 use core::ops::Deref;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -905,4 +906,20 @@ impl<K: KVStoreSync + ?Sized> RgbKvStoreExt for K {
 			}
 		});
 	}
+}
+
+thread_local! {
+	static HOLDER_VALIDATE_PSBT_WITNESS_SCRIPTS_HEX: RefCell<Option<Vec<String>>> =
+		RefCell::new(None);
+}
+
+/// Installed by [`crate::ln::channel`] before [`crate::sign::ChannelSigner::validate_holder_commitment`]
+/// on RGB-colored holder commitments so an external signer can attach PSBT `witness_script`s for VLS.
+pub fn holder_validate_install_psbt_output_witness_scripts_hex(hex_scripts: Vec<String>) {
+	HOLDER_VALIDATE_PSBT_WITNESS_SCRIPTS_HEX.with(|c| *c.borrow_mut() = Some(hex_scripts));
+}
+
+/// Removes and returns witness script hex strings installed by [`holder_validate_install_psbt_output_witness_scripts_hex`], if any.
+pub fn holder_validate_take_psbt_output_witness_scripts_hex() -> Option<Vec<String>> {
+	HOLDER_VALIDATE_PSBT_WITNESS_SCRIPTS_HEX.with(|c| c.borrow_mut().take())
 }
