@@ -365,14 +365,15 @@ impl UnauthenticatedReceiveTlvs {
 	}
 
 	/// Creates authenticated [`ReceiveTlvs`] using signer-owned inbound payment material.
-	pub fn authenticate_with_signer<NS: Deref>(
-		self, nonce: Nonce, node_signer: &NS,
-	) -> ReceiveTlvs
+	pub fn authenticate_with_signer<NS: Deref>(self, nonce: Nonce, node_signer: &NS) -> ReceiveTlvs
 	where
 		NS::Target: NodeSigner,
 	{
 		ReceiveTlvs {
-			authentication: (signer::hmac_for_payment_tlvs_with_signer(&self, nonce, node_signer), nonce),
+			authentication: (
+				signer::hmac_for_payment_tlvs_with_signer(&self, nonce, node_signer),
+				nonce,
+			),
 			tlvs: self,
 		}
 	}
@@ -686,10 +687,8 @@ pub(super) fn blinded_hops<T: secp256k1::Signing + secp256k1::Verification>(
 	secp_ctx: &Secp256k1<T>, intermediate_nodes: &[PaymentForwardNode], payee_node_id: PublicKey,
 	payee_tlvs: ReceiveTlvs, session_priv: &SecretKey,
 ) -> Vec<BlindedHop> {
-	let pks = intermediate_nodes
-		.iter()
-		.map(|node| node.node_id)
-		.chain(core::iter::once(payee_node_id));
+	let pks =
+		intermediate_nodes.iter().map(|node| node.node_id).chain(core::iter::once(payee_node_id));
 	let tlvs = intermediate_nodes
 		.iter()
 		.map(|node| BlindedPaymentTlvsRef::Forward(&node.tlvs))

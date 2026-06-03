@@ -87,13 +87,13 @@ use crate::offers::nonce::Nonce;
 use crate::offers::parse::{Bech32Encode, Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
 use crate::offers::signer::{self, Metadata, MetadataMaterial};
 use crate::onion_message::dns_resolution::HumanReadableName;
+use crate::sign::NodeSigner;
 use crate::types::features::OfferFeatures;
 use crate::types::string::PrintableString;
 use crate::util::ser::{
 	CursorReadable, HighZeroBytesDroppedBigSize, LengthLimitedRead, LengthReadable, Readable,
 	WithoutLength, Writeable, Writer,
 };
-use crate::sign::NodeSigner;
 use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
 use bitcoin::secp256k1::{self, Keypair, PublicKey, Secp256k1};
@@ -803,7 +803,12 @@ impl Offer {
 	where
 		NS::Target: NodeSigner,
 	{
-		self.contents.verify_using_recipient_data_with_signer(&self.bytes, nonce, node_signer, secp_ctx)
+		self.contents.verify_using_recipient_data_with_signer(
+			&self.bytes,
+			nonce,
+			node_signer,
+			secp_ctx,
+		)
 	}
 }
 
@@ -1092,7 +1097,13 @@ impl OfferContents {
 	where
 		NS::Target: NodeSigner,
 	{
-		self.verify_with_signer(bytes, self.metadata.as_ref(), node_signer, IV_BYTES_WITH_METADATA, secp_ctx)
+		self.verify_with_signer(
+			bytes,
+			self.metadata.as_ref(),
+			node_signer,
+			IV_BYTES_WITH_METADATA,
+			secp_ctx,
+		)
 	}
 
 	pub(super) fn verify_using_recipient_data<T: secp256k1::Signing>(
@@ -1109,7 +1120,13 @@ impl OfferContents {
 		NS::Target: NodeSigner,
 	{
 		let metadata = Metadata::RecipientData(nonce);
-		self.verify_with_signer(bytes, Some(&metadata), node_signer, IV_BYTES_WITHOUT_METADATA, secp_ctx)
+		self.verify_with_signer(
+			bytes,
+			Some(&metadata),
+			node_signer,
+			IV_BYTES_WITHOUT_METADATA,
+			secp_ctx,
+		)
 	}
 
 	/// Verifies that the offer metadata was produced from the offer in the TLV stream.

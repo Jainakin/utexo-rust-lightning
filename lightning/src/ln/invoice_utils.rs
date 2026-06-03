@@ -195,24 +195,26 @@ where
 	};
 
 	let (payment_hash, payment_secret) = if let Some(payment_hash) = payment_hash {
-		let payment_secret = node_signer.create_inbound_payment_for_hash(
-			payment_hash,
-			amt_msat,
-			invoice_expiry_delta_secs,
-			duration_since_epoch.as_secs(),
-			min_final_cltv_expiry_delta,
-		)
-		.map_err(|_| SignOrCreationError::CreationError(CreationError::InvalidAmount))?;
+		let payment_secret = node_signer
+			.create_inbound_payment_for_hash(
+				payment_hash,
+				amt_msat,
+				invoice_expiry_delta_secs,
+				duration_since_epoch.as_secs(),
+				min_final_cltv_expiry_delta,
+			)
+			.map_err(|_| SignOrCreationError::CreationError(CreationError::InvalidAmount))?;
 		(payment_hash, payment_secret)
 	} else {
-		node_signer.create_inbound_payment(
-			amt_msat,
-			invoice_expiry_delta_secs,
-			entropy_source.get_secure_random_bytes(),
-			duration_since_epoch.as_secs(),
-			min_final_cltv_expiry_delta,
-		)
-		.map_err(|_| SignOrCreationError::CreationError(CreationError::InvalidAmount))?
+		node_signer
+			.create_inbound_payment(
+				amt_msat,
+				invoice_expiry_delta_secs,
+				entropy_source.get_secure_random_bytes(),
+				duration_since_epoch.as_secs(),
+				min_final_cltv_expiry_delta,
+			)
+			.map_err(|_| SignOrCreationError::CreationError(CreationError::InvalidAmount))?
 	};
 
 	log_trace!(
@@ -1211,7 +1213,15 @@ mod test {
 		let cross_node_seed = [44u8; 32];
 		let rgb_kv_store: std::sync::Arc<dyn crate::util::persist::KVStoreSync + Send + Sync> =
 			std::sync::Arc::new(test_utils::TestStore::new(false));
-		let inner = PhantomKeysManager::new(&seed, 43, 44, &cross_node_seed, true, std::path::PathBuf::from("/tmp/ldk_test"), rgb_kv_store);
+		let inner = PhantomKeysManager::new(
+			&seed,
+			43,
+			44,
+			&cross_node_seed,
+			true,
+			std::path::PathBuf::from("/tmp/ldk_test"),
+			rgb_kv_store,
+		);
 		let dyn_inner = DynPhantomKeysInterface::new(inner);
 		DynKeysInterface::new(Box::new(dyn_inner))
 	}

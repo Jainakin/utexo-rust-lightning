@@ -420,8 +420,12 @@ where
 	let mut encrypted_payment_id = [0u8; PaymentId::LENGTH];
 	encrypted_payment_id.copy_from_slice(&metadata[..PaymentId::LENGTH]);
 
-	let mut hmac =
-		hmac_for_message_with_signer(&metadata[PaymentId::LENGTH..], node_signer, iv_bytes, tlv_stream)?;
+	let mut hmac = hmac_for_message_with_signer(
+		&metadata[PaymentId::LENGTH..],
+		node_signer,
+		iv_bytes,
+		tlv_stream,
+	)?;
 	hmac.input(WITH_ENCRYPTED_PAYMENT_ID_HMAC_INPUT);
 	hmac.input(&encrypted_payment_id);
 
@@ -457,11 +461,7 @@ pub(super) fn verify_recipient_metadata<'a, T: secp256k1::Signing>(
 	verify_metadata(metadata, Hmac::from_engine(hmac), signing_pubkey, secp_ctx)
 }
 
-pub(super) fn verify_recipient_metadata_with_signer<
-	'a,
-	T: secp256k1::Signing,
-	NS: Deref,
->(
+pub(super) fn verify_recipient_metadata_with_signer<'a, T: secp256k1::Signing, NS: Deref>(
 	metadata: &[u8], node_signer: &NS, iv_bytes: &[u8; IV_LEN], signing_pubkey: PublicKey,
 	tlv_stream: impl core::iter::Iterator<Item = TlvRecord<'a>>, secp_ctx: &Secp256k1<T>,
 ) -> Result<Option<Keypair>, ()>

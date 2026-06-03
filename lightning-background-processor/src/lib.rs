@@ -259,8 +259,7 @@ impl<
 		G,
 		&'a (dyn UtxoLookup + Send + Sync),
 		L,
-	>
-where
+	> where
 	L::Target: Logger,
 {
 	/// Initializes a new [`GossipSync::Rapid`] variant.
@@ -277,8 +276,7 @@ impl<'a, L: Deref>
 		&'a NetworkGraph<L>,
 		&'a (dyn UtxoLookup + Send + Sync),
 		L,
-	>
-where
+	> where
 	L::Target: Logger,
 {
 	/// Initializes a new [`GossipSync::None`] variant.
@@ -2329,8 +2327,12 @@ mod tests {
 			let rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync> =
 				Arc::new(test_utils::TestStore::new(false));
 			let keys_manager = Arc::new(KeysManager::new(
-				&seed, now.as_secs(), now.subsec_nanos(), true,
-				PathBuf::from("/tmp/ldk_test"), Arc::clone(&rgb_kv_store),
+				&seed,
+				now.as_secs(),
+				now.subsec_nanos(),
+				true,
+				PathBuf::from("/tmp/ldk_test"),
+				Arc::clone(&rgb_kv_store),
 			));
 			let router = Arc::new(DefaultRouter::new(
 				Arc::clone(&network_graph),
@@ -2348,8 +2350,12 @@ mod tests {
 				Arc::new(Persister::new(format!("{}_persister_{}", &persist_dir, i).into()));
 			let now = Duration::from_secs(genesis_block.header.time as u64);
 			let keys_manager = Arc::new(KeysManager::new(
-				&seed, now.as_secs(), now.subsec_nanos(), true,
-				PathBuf::from("/tmp/ldk_test"), Arc::clone(&rgb_kv_store),
+				&seed,
+				now.as_secs(),
+				now.subsec_nanos(),
+				true,
+				PathBuf::from("/tmp/ldk_test"),
+				Arc::clone(&rgb_kv_store),
 			));
 			let chain_monitor = Arc::new(chainmonitor::ChainMonitor::new(
 				Some(Arc::clone(&chain_source)),

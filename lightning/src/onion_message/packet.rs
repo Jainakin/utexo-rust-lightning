@@ -25,15 +25,15 @@ use crate::ln::onion_utils;
 use crate::sign::NodeSigner;
 use crate::util::logger::Logger;
 use crate::util::ser::{
-	BigSize, FixedLengthReader, LengthLimitedRead, LengthReadable, Readable,
-	ReadableArgs, Writeable, Writer,
+	BigSize, FixedLengthReader, LengthLimitedRead, LengthReadable, Readable, ReadableArgs,
+	Writeable, Writer,
 };
 
 use crate::io::{self, Read};
 use crate::prelude::*;
 use core::cmp;
-use core::ops::Deref;
 use core::fmt;
+use core::ops::Deref;
 
 // Per the spec, an onion message packet's `hop_data` field length should be
 // SMALL_PACKET_HOP_DATA_LEN if it fits, else BIG_PACKET_HOP_DATA_LEN if it fits.
@@ -275,9 +275,7 @@ impl<H: CustomOnionMessageHandler + ?Sized, L: Logger + ?Sized, NS: Deref>
 where
 	NS::Target: NodeSigner,
 {
-	fn read<R: Read>(
-		r: &mut R, args: (SharedSecret, &H, &NS, &L),
-	) -> Result<Self, DecodeError> {
+	fn read<R: Read>(r: &mut R, args: (SharedSecret, &H, &NS, &L)) -> Result<Self, DecodeError> {
 		let (encrypted_tlvs_ss, handler, node_signer, logger) = args;
 
 		let v: BigSize = Readable::read(r)?;
@@ -335,17 +333,13 @@ where
 				}
 				Ok(Payload::Forward(ForwardControlTlvs::Unblinded(tlvs)))
 			},
-			ControlTlvs::Dummy => {
-				Ok(Payload::Dummy { control_tlvs_authenticated: used_aad })
-			},
-			ControlTlvs::Receive(tlvs) => {
-				Ok(Payload::Receive {
-					control_tlvs: ReceiveControlTlvs::Unblinded(tlvs),
-					reply_path,
-					message: message.ok_or(DecodeError::InvalidValue)?,
-					control_tlvs_authenticated: used_aad,
-				})
-			},
+			ControlTlvs::Dummy => Ok(Payload::Dummy { control_tlvs_authenticated: used_aad }),
+			ControlTlvs::Receive(tlvs) => Ok(Payload::Receive {
+				control_tlvs: ReceiveControlTlvs::Unblinded(tlvs),
+				reply_path,
+				message: message.ok_or(DecodeError::InvalidValue)?,
+				control_tlvs_authenticated: used_aad,
+			}),
 		}
 	}
 }

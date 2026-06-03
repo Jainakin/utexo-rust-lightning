@@ -103,9 +103,9 @@ use alloc::collections::{btree_map, BTreeMap};
 use crate::io;
 use crate::prelude::*;
 use crate::sign::type_resolver::ChannelSignerType;
+use crate::sync::Arc;
 #[cfg(any(test, fuzzing, debug_assertions))]
 use crate::sync::Mutex;
-use crate::sync::Arc;
 use crate::util::persist::KVStoreSync;
 use core::ops::Deref;
 use core::time::Duration;
@@ -114,21 +114,19 @@ use core::{cmp, fmt, mem};
 use super::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 
 fn rgb_install_holder_validate_psbt_witness_scripts_if_colored(
-	funding: &FundingScope,
-	commitment_tx: &CommitmentTransaction,
+	funding: &FundingScope, commitment_tx: &CommitmentTransaction,
 ) -> Result<(), ChannelError> {
-	let is_rgb_channel = funding.push_asset_amount.is_some() || funding.consignment_endpoint.is_some();
+	let is_rgb_channel =
+		funding.push_asset_amount.is_some() || funding.consignment_endpoint.is_some();
 	if !is_rgb_channel && !is_tx_colored(&commitment_tx.trust().built_transaction().transaction) {
 		return Ok(());
 	}
 	let directed = funding.channel_transaction_parameters.as_holder_broadcastable();
-	let wits = commitment_tx
-		.output_witness_scripts_for_vls_validate(&directed)
-		.map_err(|_| {
-			ChannelError::close(
-				"failed to build PSBT witness scripts for external RGB holder validate".to_owned(),
-			)
-		})?;
+	let wits = commitment_tx.output_witness_scripts_for_vls_validate(&directed).map_err(|_| {
+		ChannelError::close(
+			"failed to build PSBT witness scripts for external RGB holder validate".to_owned(),
+		)
+	})?;
 	let hex_scripts: Vec<String> =
 		wits.iter().map(|s| s.as_bytes().to_lower_hex_string()).collect();
 	holder_validate_install_psbt_output_witness_scripts_hex(hex_scripts);
@@ -15183,16 +15181,30 @@ where
 	}
 }
 
-impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, &'c ChannelTypeFeatures, PathBuf, Arc<dyn KVStoreSync + Send + Sync>)>
-	for FundedChannel<SP>
+impl<'a, 'b, 'c, ES: Deref, SP: Deref>
+	ReadableArgs<(
+		&'a ES,
+		&'b SP,
+		&'c ChannelTypeFeatures,
+		PathBuf,
+		Arc<dyn KVStoreSync + Send + Sync>,
+	)> for FundedChannel<SP>
 where
 	ES::Target: EntropySource,
 	SP::Target: SignerProvider,
 {
 	fn read<R: io::Read>(
-		reader: &mut R, args: (&'a ES, &'b SP, &'c ChannelTypeFeatures, PathBuf, Arc<dyn KVStoreSync + Send + Sync>),
+		reader: &mut R,
+		args: (
+			&'a ES,
+			&'b SP,
+			&'c ChannelTypeFeatures,
+			PathBuf,
+			Arc<dyn KVStoreSync + Send + Sync>,
+		),
 	) -> Result<Self, DecodeError> {
-		let (entropy_source, signer_provider, our_supported_features, ldk_data_dir, rgb_kv_store) = args;
+		let (entropy_source, signer_provider, our_supported_features, ldk_data_dir, rgb_kv_store) =
+			args;
 		let ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 		if ver <= 2 {
 			return Err(DecodeError::UnknownVersion);

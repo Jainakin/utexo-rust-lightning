@@ -419,8 +419,7 @@ impl<
 		L,
 		AsyncPersister<K, S, L, ES, SP, T, F>,
 		ES,
-	>
-where
+	> where
 	K::Target: KVStore + MaybeSync,
 	SP::Target: SignerProvider + Sized,
 	C::Target: chain::Filter,
@@ -447,9 +446,7 @@ where
 		let our_peerstorage_encryptor: PeerStorageEncryptor = Arc::new({
 			let key = _our_peerstorage_encryption_key.clone();
 			move |plaintext: Vec<u8>, random_bytes: [u8; 32]| {
-				DecryptedOurPeerStorage::new(plaintext)
-					.encrypt(&key, &random_bytes)
-					.into_vec()
+				DecryptedOurPeerStorage::new(plaintext).encrypt(&key, &random_bytes).into_vec()
 			}
 		});
 		let event_notifier = Arc::new(Notifier::new());
@@ -673,9 +670,7 @@ where
 		let our_peerstorage_encryptor: PeerStorageEncryptor = Arc::new({
 			let key = _our_peerstorage_encryption_key.clone();
 			move |plaintext: Vec<u8>, random_bytes: [u8; 32]| {
-				DecryptedOurPeerStorage::new(plaintext)
-					.encrypt(&key, &random_bytes)
-					.into_vec()
+				DecryptedOurPeerStorage::new(plaintext).encrypt(&key, &random_bytes).into_vec()
 			}
 		});
 		Self {
