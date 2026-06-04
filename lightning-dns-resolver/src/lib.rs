@@ -233,7 +233,14 @@ mod test {
 		) -> Result<Vec<BlindedMessagePath>, ()> {
 			let rgb_kv_store: Arc<dyn lightning::util::persist::KVStoreSync + Send + Sync> =
 				Arc::new(lightning::util::test_utils::TestStore::new(false));
-			let keys = KeysManager::new(&[0; 32], 42, 43, true, std::path::PathBuf::from("/tmp/ldk_test"), rgb_kv_store);
+			let keys = KeysManager::new(
+				&[0; 32],
+				42,
+				43,
+				true,
+				std::path::PathBuf::from("/tmp/ldk_test"),
+				rgb_kv_store,
+			);
 			Ok(vec![BlindedMessagePath::one_hop(
 				recipient,
 				local_node_receive_key,
@@ -278,7 +285,14 @@ mod test {
 	fn create_resolver() -> (impl AOnionMessenger, PublicKey) {
 		let rgb_kv_store: Arc<dyn lightning::util::persist::KVStoreSync + Send + Sync> =
 			Arc::new(lightning::util::test_utils::TestStore::new(false));
-		let resolver_keys = Arc::new(KeysManager::new(&[99; 32], 42, 43, true, std::path::PathBuf::from("/tmp/ldk_test"), rgb_kv_store));
+		let resolver_keys = Arc::new(KeysManager::new(
+			&[99; 32],
+			42,
+			43,
+			true,
+			std::path::PathBuf::from("/tmp/ldk_test"),
+			rgb_kv_store,
+		));
 		let resolver_logger = TestLogger { node: "resolver" };
 		let resolver = OMDomainResolver::ignoring_incoming_proofs("8.8.8.8:53".parse().unwrap());
 		let resolver = Arc::new(resolver);
@@ -319,7 +333,14 @@ mod test {
 
 		let rgb_kv_store: Arc<dyn lightning::util::persist::KVStoreSync + Send + Sync> =
 			Arc::new(lightning::util::test_utils::TestStore::new(false));
-		let payer_keys = Arc::new(KeysManager::new(&[2; 32], 42, 43, true, std::path::PathBuf::from("/tmp/ldk_test"), rgb_kv_store));
+		let payer_keys = Arc::new(KeysManager::new(
+			&[2; 32],
+			42,
+			43,
+			true,
+			std::path::PathBuf::from("/tmp/ldk_test"),
+			rgb_kv_store,
+		));
 		let payer_logger = TestLogger { node: "payer" };
 		let payer_id = payer_keys.get_node_id(Recipient::Node).unwrap();
 		let payer = Arc::new(URIResolver {

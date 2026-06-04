@@ -1051,10 +1051,7 @@ impl Bolt12Invoice {
 	/// Returns the associated [`PaymentId`] to use when sending the payment.
 	///
 	/// [`ExpandedKey`]: crate::ln::inbound_payment::ExpandedKey
-	pub fn verify_using_payer_data_with_signer<
-		T: secp256k1::Signing,
-		NS: core::ops::Deref,
-	>(
+	pub fn verify_using_payer_data_with_signer<T: secp256k1::Signing, NS: core::ops::Deref>(
 		&self, payment_id: PaymentId, nonce: Nonce, node_signer: &NS, secp_ctx: &Secp256k1<T>,
 	) -> Result<PaymentId, ()>
 	where
@@ -1065,11 +1062,11 @@ impl Bolt12Invoice {
 			InvoiceContents::ForOffer { .. } => INVOICE_REQUEST_IV_BYTES,
 			InvoiceContents::ForRefund { .. } => REFUND_IV_BYTES_WITHOUT_METADATA,
 		};
-		self.contents.verify_with_signer(&self.bytes, &metadata, node_signer, iv_bytes, secp_ctx).and_then(
-			|extracted_payment_id| {
+		self.contents
+			.verify_with_signer(&self.bytes, &metadata, node_signer, iv_bytes, secp_ctx)
+			.and_then(|extracted_payment_id| {
 				(payment_id == extracted_payment_id).then(|| payment_id).ok_or(())
-			},
-		)
+			})
 	}
 
 	pub(crate) fn as_tlv_stream(&self) -> FullInvoiceTlvStreamRef<'_> {

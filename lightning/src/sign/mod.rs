@@ -24,10 +24,10 @@ use bitcoin::sighash::EcdsaSighashType;
 use bitcoin::transaction::Version;
 use bitcoin::transaction::{Transaction, TxIn, TxOut};
 
+use bitcoin::hashes::hmac::HmacEngine;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hashes::{Hash, HashEngine};
-use bitcoin::hashes::hmac::HmacEngine;
 
 use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
@@ -54,16 +54,16 @@ use crate::ln::channel_keys::{
 	add_public_key_tweak, DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, HtlcKey,
 	RevocationBasepoint, RevocationKey,
 };
+use crate::ln::channelmanager::PaymentId;
 use crate::ln::inbound_payment::ExpandedKey;
 #[cfg(taproot)]
 use crate::ln::msgs::PartialSignatureWithNonce;
 use crate::ln::msgs::{UnsignedChannelAnnouncement, UnsignedGossipMessage};
-use crate::ln::script::ShutdownScript;
-use crate::ln::channelmanager::PaymentId;
 use crate::ln::our_peer_storage::{DecryptedOurPeerStorage, EncryptedOurPeerStorage};
+use crate::ln::script::ShutdownScript;
 use crate::offers::invoice::Bolt12Invoice;
-use crate::offers::nonce::Nonce;
 use crate::offers::invoice::UnsignedBolt12Invoice;
+use crate::offers::nonce::Nonce;
 use crate::rgb_utils::color_htlc;
 use crate::types::features::ChannelTypeFeatures;
 use crate::types::payment::PaymentPreimage;
@@ -73,15 +73,17 @@ use crate::util::ser::{ReadableArgs, Writeable};
 use crate::util::transaction_utils;
 
 use crate::crypto::chacha20::ChaCha20;
-use crate::crypto::streams::{chachapoly_decrypt_with_optional_aad, chachapoly_encrypt_with_swapped_aad};
+use crate::crypto::streams::{
+	chachapoly_decrypt_with_optional_aad, chachapoly_encrypt_with_swapped_aad,
+};
 use crate::prelude::*;
 use crate::sign::ecdsa::EcdsaChannelSigner;
 #[cfg(taproot)]
 use crate::sign::taproot::TaprootChannelSigner;
 use crate::types::payment::{PaymentHash, PaymentSecret};
+use crate::util::atomic_counter::AtomicCounter;
 use crate::util::errors::APIError;
 use crate::util::logger::Logger;
-use crate::util::atomic_counter::AtomicCounter;
 use core::convert::TryInto;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -937,8 +939,8 @@ pub trait NodeSigner {
 	/// The default implementation delegates to [`crate::ln::inbound_payment::create`] using
 	/// [`Self::get_expanded_key`].
 	fn create_inbound_payment(
-		&self, min_value_msat: Option<u64>, invoice_expiry_delta_secs: u32,
-		random_bytes: [u8; 32], current_time: u64, min_final_cltv_expiry_delta: Option<u16>,
+		&self, min_value_msat: Option<u64>, invoice_expiry_delta_secs: u32, random_bytes: [u8; 32],
+		current_time: u64, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<(PaymentHash, PaymentSecret), ()> {
 		crate::ln::inbound_payment::create_from_random_bytes(
 			&self.get_expanded_key(),
@@ -969,8 +971,8 @@ pub trait NodeSigner {
 
 	/// Creates a spontaneous-payment secret using signer-owned inbound payment key material.
 	fn create_spontaneous_payment_secret(
-		&self, min_value_msat: Option<u64>, invoice_expiry_delta_secs: u32,
-		current_time: u64, min_final_cltv_expiry_delta: Option<u16>,
+		&self, min_value_msat: Option<u64>, invoice_expiry_delta_secs: u32, current_time: u64,
+		min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<PaymentSecret, ()> {
 		crate::ln::inbound_payment::create_for_spontaneous_payment(
 			&self.get_expanded_key(),
@@ -993,7 +995,9 @@ pub trait NodeSigner {
 		struct LoggerRef<'a>(&'a NoOpLogger);
 		impl<'a> core::ops::Deref for LoggerRef<'a> {
 			type Target = NoOpLogger;
-			fn deref(&self) -> &Self::Target { self.0 }
+			fn deref(&self) -> &Self::Target {
+				self.0
+			}
 		}
 		let logger = NoOpLogger;
 		let logger_ref = LoggerRef(&logger);
@@ -1042,9 +1046,7 @@ pub trait NodeSigner {
 	fn get_peer_storage_key(&self) -> PeerStorageKey;
 
 	/// Encrypts our peer-storage backup using signer-owned peer-storage material.
-	fn encrypt_peer_storage_payload(
-		&self, plaintext: Vec<u8>, random_bytes: [u8; 32],
-	) -> Vec<u8> {
+	fn encrypt_peer_storage_payload(&self, plaintext: Vec<u8>, random_bytes: [u8; 32]) -> Vec<u8> {
 		DecryptedOurPeerStorage::new(plaintext)
 			.encrypt(&self.get_peer_storage_key(), &random_bytes)
 			.into_vec()
@@ -1071,9 +1073,7 @@ pub trait NodeSigner {
 	fn get_receive_auth_key(&self) -> ReceiveAuthKey;
 
 	/// Encrypts a blinded-message recipient payload using signer-owned receive-auth material.
-	fn encrypt_blinded_message_payload(
-		&self, plaintext: Vec<u8>, rho: [u8; 32],
-	) -> Vec<u8> {
+	fn encrypt_blinded_message_payload(&self, plaintext: Vec<u8>, rho: [u8; 32]) -> Vec<u8> {
 		chachapoly_encrypt_with_swapped_aad(plaintext, rho, self.get_receive_auth_key().0)
 	}
 
@@ -1412,7 +1412,7 @@ impl Clone for InMemorySigner {
 			channel_keys_id: self.channel_keys_id,
 			entropy_source: RandomBytes::new(self.get_secure_random_bytes()),
 			ldk_data_dir: self.ldk_data_dir.clone(),
-			rgb_kv_store: self.rgb_kv_store.clone(),
+			rgb_kv_store: Arc::clone(&self.rgb_kv_store),
 		}
 	}
 }
@@ -2432,7 +2432,7 @@ impl KeysManager {
 			params.clone(),
 			self.ldk_data_dir.clone(),
 			prng_seed,
-			self.rgb_kv_store.clone(),
+			Arc::clone(&self.rgb_kv_store),
 		)
 	}
 
@@ -2941,8 +2941,12 @@ pub mod benches {
 		let kv_store: Arc<dyn crate::util::persist::KVStoreSync + Send + Sync> =
 			Arc::new(crate::util::test_utils::TestStore::new(false));
 		let keys_manager = Arc::new(KeysManager::new(
-			&seed, now.as_secs(), now.subsec_micros(), true,
-			PathBuf::from("/tmp/ldk_bench"), kv_store,
+			&seed,
+			now.as_secs(),
+			now.subsec_micros(),
+			true,
+			PathBuf::from("/tmp/ldk_bench"),
+			kv_store,
 		));
 
 		let mut handles = Vec::new();

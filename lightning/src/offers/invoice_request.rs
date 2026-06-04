@@ -167,7 +167,8 @@ macro_rules! invoice_request_derived_payer_signing_pubkey_builder_methods {
 			NS::Target: NodeSigner,
 		{
 			let payment_id = Some(payment_id);
-			let derivation_material = MetadataMaterial::new_with_signer(nonce, node_signer, payment_id);
+			let derivation_material =
+				MetadataMaterial::new_with_signer(nonce, node_signer, payment_id);
 			let metadata = Metadata::DerivedSigningPubkey(derivation_material);
 			Self {
 				offer,

@@ -1358,7 +1358,14 @@ mod tests {
 		};
 		let kv_store: std::sync::Arc<dyn crate::util::persist::KVStoreSync + Send + Sync> =
 			std::sync::Arc::new(TestStore::new(false));
-		let signer = KeysManager::new(&[42; 32], 42, 42, true, std::path::PathBuf::from("/tmp/ldk_test"), kv_store);
+		let signer = KeysManager::new(
+			&[42; 32],
+			42,
+			42,
+			true,
+			std::path::PathBuf::from("/tmp/ldk_test"),
+			kv_store,
+		);
 		let logger = TestLogger::new();
 		let handler = BumpTransactionEventHandlerSync::new(&broadcaster, &source, &signer, &logger);
 

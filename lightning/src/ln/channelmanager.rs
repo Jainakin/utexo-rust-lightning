@@ -201,6 +201,12 @@ pub use crate::ln::outbound_payment::{
 };
 use crate::ln::script::ShutdownScript;
 
+/// Test-only hook: if set to a node's pubkey, that node will drop outgoing
+/// `funding_signed` messages (sending an `ErrorMessage` instead) in its
+/// `internal_funding_created` handler.
+#[cfg(any(test, feature = "_rln_test_hooks"))]
+pub static DROP_FUNDING_SIGNED_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
 // We hold various information about HTLC relay in the HTLC objects in Channel itself:
 //
 // Upon receipt of an HTLC from a peer, we'll give it a PendingHTLCStatus indicating if it should
@@ -4028,7 +4034,7 @@ where
 			best_block: RwLock::new(params.best_block),
 
 			outbound_scid_aliases: Mutex::new(new_hash_set()),
-			pending_outbound_payments: OutboundPayments::new(new_hash_map(), rgb_kv_store.clone()),
+			pending_outbound_payments: OutboundPayments::new(new_hash_map(), Arc::clone(&rgb_kv_store)),
 			forward_htlcs: Mutex::new(new_hash_map()),
 			decode_update_add_htlcs: Mutex::new(new_hash_map()),
 			claimable_payments: Mutex::new(ClaimablePayments { claimable_payments: new_hash_map(), pending_claiming_payments: new_hash_map() }),
@@ -4193,7 +4199,7 @@ where
 			match OutboundV1Channel::new(&self.fee_estimator, &self.entropy_source, &self.signer_provider, their_network_key,
 				their_features, channel_value_satoshis, push_msat, user_channel_id, config,
 				self.best_block.read().unwrap().height, outbound_scid_alias, temporary_channel_id, &*self.logger, consignment_endpoint, self.ldk_data_dir.clone(), push_asset_amount,
-				self.rgb_kv_store.clone())
+				Arc::clone(&self.rgb_kv_store))
 			{
 				Ok(res) => res,
 				Err(e) => {
@@ -5781,11 +5787,12 @@ where
 		let secp_ctx = &self.secp_ctx;
 
 		match context {
-			None if invoice.is_for_refund_without_paths() =>
-				self.node_signer.verify_bolt12_invoice_using_metadata(invoice, secp_ctx),
-			Some(&OffersContext::OutboundPayment { payment_id, nonce, .. }) =>
-				self.node_signer
-					.verify_bolt12_invoice_using_payer_data(invoice, payment_id, nonce, secp_ctx),
+			None if invoice.is_for_refund_without_paths() => {
+				self.node_signer.verify_bolt12_invoice_using_metadata(invoice, secp_ctx)
+			},
+			Some(&OffersContext::OutboundPayment { payment_id, nonce, .. }) => self
+				.node_signer
+				.verify_bolt12_invoice_using_payer_data(invoice, payment_id, nonce, secp_ctx),
 			_ => Err(()),
 		}
 	}
@@ -7714,14 +7721,19 @@ where
 								.contains(&outgoing_amt_msat);
 							if is_in_range && chan.context.is_usable() {
 								if let Some((cid, outgoing_amount_rgb)) = outgoing_rgb_payment {
-									if !is_channel_rgb(&chan.context.channel_id, self.rgb_kv_store.as_ref())
-									{
+									if !is_channel_rgb(
+										&chan.context.channel_id,
+										self.rgb_kv_store.as_ref(),
+									) {
 										return None;
 									}
-									let rgb_chan_info = self.rgb_kv_store.read_rgb_channel_info(
-										&chan.context.channel_id.0.as_hex().to_string(),
-										false,
-									).expect("channel info must exist in KVStore");
+									let rgb_chan_info = self
+										.rgb_kv_store
+										.read_rgb_channel_info(
+											&chan.context.channel_id.0.as_hex().to_string(),
+											false,
+										)
+										.expect("channel info must exist in KVStore");
 									if rgb_chan_info.contract_id == *cid
 										&& rgb_chan_info.local_rgb_amount >= *outgoing_amount_rgb
 									{
@@ -9157,8 +9169,7 @@ where
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		)
-			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -9196,8 +9207,7 @@ where
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		)
-			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -10209,7 +10219,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 							&self.channel_type_features(), &peer_state.latest_features, &open_channel_msg,
 							user_channel_id, &config, best_block_height, &self.logger, accept_0conf, self.ldk_data_dir.clone(),
-							self.rgb_kv_store.clone(),
+							Arc::clone(&self.rgb_kv_store),
 						).map_err(|err| MsgHandleErrInternal::from_chan_no_close(err, *temporary_channel_id)
 						).map(|mut channel| {
 							Self::apply_inbound_channel_funding_type(&mut channel.context, channel_funding_type);
@@ -10232,7 +10242,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							user_channel_id, &config, best_block_height,
 							&self.logger,
 							self.ldk_data_dir.clone(),
-							self.rgb_kv_store.clone(),
+							Arc::clone(&self.rgb_kv_store),
 						).map_err(|e| {
 							let channel_id = open_channel_msg.common_fields.temporary_channel_id;
 							MsgHandleErrInternal::from_chan_no_close(e, channel_id)
@@ -10504,7 +10514,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 					&self.channel_type_features(), &peer_state.latest_features, msg, user_channel_id,
 					&self.config.read().unwrap(), best_block_height, &self.logger, /*is_0conf=*/false, self.ldk_data_dir.clone(),
-					self.rgb_kv_store.clone(),
+					Arc::clone(&self.rgb_kv_store),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let logger = WithChannelContext::from(&self.logger, &channel.context, None);
 				let message_send_event = channel.accept_inbound_channel(&&logger).map(|msg| {
@@ -10522,7 +10532,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					&peer_state.latest_features, msg, user_channel_id,
 					&self.config.read().unwrap(), best_block_height, &self.logger,
 					self.ldk_data_dir.clone(),
-					self.rgb_kv_store.clone(),
+					Arc::clone(&self.rgb_kv_store),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let message_send_event = MessageSendEvent::SendAcceptChannelV2 {
 					node_id: *counterparty_node_id,
@@ -10664,10 +10674,34 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					// accepted payment from yet. We do, however, need to wait to send our channel_ready
 					// until we have persisted our monitor.
 					if let Some(msg) = funding_msg_opt {
-						peer_state.pending_msg_events.push(MessageSendEvent::SendFundingSigned {
-							node_id: *counterparty_node_id,
-							msg,
-						});
+						#[cfg(any(test, feature = "_rln_test_hooks"))]
+						let drop_funding_signed = DROP_FUNDING_SIGNED_ON_NODE
+							.lock()
+							.unwrap()
+							.as_ref()
+							.map_or(false, |id| *id == self.get_our_node_id());
+						#[cfg(not(any(test, feature = "_rln_test_hooks")))]
+						let drop_funding_signed = false;
+						if drop_funding_signed {
+							log_error!(
+								WithChannelContext::from(&self.logger, &chan.context, None),
+								"TEST: dropping funding_signed for channel {funded_channel_id}, sending error instead"
+							);
+							peer_state.pending_msg_events.push(MessageSendEvent::HandleError {
+								node_id: *counterparty_node_id,
+								action: msgs::ErrorAction::SendErrorMessage {
+									msg: msgs::ErrorMessage {
+										channel_id: msg.channel_id,
+										data: "TEST: funding_signed dropped".to_owned(),
+									},
+								},
+							});
+						} else {
+							peer_state.pending_msg_events.push(MessageSendEvent::SendFundingSigned {
+								node_id: *counterparty_node_id,
+								msg,
+							});
+						}
 					}
 
 					if let Some(funded_chan) = e.insert(Channel::from(chan)).as_funded_mut() {
@@ -17002,8 +17036,7 @@ where
 		chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR, logger: L,
 		config: UserConfig,
 		mut channel_monitors: Vec<&'a ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>>,
-		ldk_data_dir: PathBuf,
-		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
+		ldk_data_dir: PathBuf, rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> Self {
 		Self {
 			entropy_source,
@@ -17124,7 +17157,7 @@ where
 					&args.signer_provider,
 					&provided_channel_type_features(&args.config),
 					args.ldk_data_dir.clone(),
-					args.rgb_kv_store.clone(),
+					Arc::clone(&args.rgb_kv_store),
 				),
 			)?;
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
@@ -17554,7 +17587,10 @@ where
 			}
 			pending_outbound_payments = Some(outbounds);
 		}
-		let pending_outbounds = OutboundPayments::new(pending_outbound_payments.unwrap(), args.rgb_kv_store.clone());
+		let pending_outbounds = OutboundPayments::new(
+			pending_outbound_payments.unwrap(),
+			Arc::clone(&args.rgb_kv_store),
+		);
 
 		for (peer_pubkey, peer_storage) in peer_storage_dir {
 			if let Some(peer_state) = per_peer_state.get_mut(&peer_pubkey) {

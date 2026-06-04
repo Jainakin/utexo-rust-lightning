@@ -118,9 +118,8 @@ where
 	/// Creates a new [`OffersMessageFlow`]
 	pub fn new(
 		chain_hash: ChainHash, best_block: BestBlock, our_network_pubkey: PublicKey,
-		current_timestamp: u32, node_signer: NS,
-		secp_ctx: Secp256k1<secp256k1::All>, message_router: MR,
-		logger: L,
+		current_timestamp: u32, node_signer: NS, secp_ctx: Secp256k1<secp256k1::All>,
+		message_router: MR, logger: L,
 	) -> Self {
 		Self {
 			chain_hash,
@@ -483,8 +482,11 @@ where
 		};
 
 		let invoice_request = match nonce {
-			Some(nonce) => invoice_request
-				.verify_using_recipient_data_with_signer(nonce, &self.node_signer, secp_ctx),
+			Some(nonce) => invoice_request.verify_using_recipient_data_with_signer(
+				nonce,
+				&self.node_signer,
+				secp_ctx,
+			),
 			None => invoice_request.verify_using_metadata_with_signer(&self.node_signer, secp_ctx),
 		}?;
 
@@ -505,11 +507,15 @@ where
 		let secp_ctx = &self.secp_ctx;
 
 		match context {
-			None if invoice.is_for_refund_without_paths() =>
-				invoice.verify_using_metadata_with_signer(&self.node_signer, secp_ctx),
-			Some(&OffersContext::OutboundPayment { payment_id, nonce, .. }) =>
-				invoice.verify_using_payer_data_with_signer(
-					payment_id, nonce, &self.node_signer, secp_ctx,
+			None if invoice.is_for_refund_without_paths() => {
+				invoice.verify_using_metadata_with_signer(&self.node_signer, secp_ctx)
+			},
+			Some(&OffersContext::OutboundPayment { payment_id, nonce, .. }) => invoice
+				.verify_using_payer_data_with_signer(
+					payment_id,
+					nonce,
+					&self.node_signer,
+					secp_ctx,
 				),
 			_ => Err(()),
 		}
@@ -558,9 +564,12 @@ where
 		let context = MessageContext::Offers(OffersContext::InvoiceRequest { nonce });
 
 		let mut builder = OfferBuilder::deriving_signing_pubkey_with_signer(
-			node_id, &self.node_signer, nonce, secp_ctx,
+			node_id,
+			&self.node_signer,
+			nonce,
+			secp_ctx,
 		)
-			.chain_hash(self.chain_hash);
+		.chain_hash(self.chain_hash);
 
 		for path in make_paths(node_id, context, secp_ctx)? {
 			builder = builder.path(path)
@@ -947,9 +956,9 @@ where
 	/// - We fail to generate valid payment paths to include in the [`Bolt12Invoice`].
 	/// - We fail to generate a valid signed [`Bolt12Invoice`] for the [`InvoiceRequest`].
 	pub fn create_response_for_invoice_request<ES: Deref, R: Deref>(
-		&self, router: &R, entropy_source: ES,
-		invoice_request: VerifiedInvoiceRequest, amount_msats: u64, payment_hash: PaymentHash,
-		payment_secret: PaymentSecret, usable_channels: Vec<ChannelDetails>,
+		&self, router: &R, entropy_source: ES, invoice_request: VerifiedInvoiceRequest,
+		amount_msats: u64, payment_hash: PaymentHash, payment_secret: PaymentSecret,
+		usable_channels: Vec<ChannelDetails>,
 	) -> (OffersMessage, Option<MessageContext>)
 	where
 		ES::Target: EntropySource,
@@ -1010,7 +1019,9 @@ where
 					#[cfg(c_bindings)]
 					let mut invoice = invoice;
 					invoice
-						.sign(|invoice: &UnsignedBolt12Invoice| self.node_signer.sign_bolt12_invoice(invoice))
+						.sign(|invoice: &UnsignedBolt12Invoice| {
+							self.node_signer.sign_bolt12_invoice(invoice)
+						})
 						.map_err(InvoiceError::from)
 				})
 		};

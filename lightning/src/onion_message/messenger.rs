@@ -518,8 +518,8 @@ pub trait MessageRouter {
 	/// Creates [`BlindedMessagePath`]s to the `recipient` node. The nodes in `peers` are assumed to
 	/// be direct peers with the `recipient`.
 	fn create_blinded_paths<T: secp256k1::Signing + secp256k1::Verification, NS: Deref>(
-		&self, recipient: PublicKey, node_signer: &NS,
-		context: MessageContext, peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
+		&self, recipient: PublicKey, node_signer: &NS, context: MessageContext,
+		peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedMessagePath>, ()>
 	where
 		NS::Target: NodeSigner;
@@ -581,9 +581,8 @@ where
 		NS: Deref,
 		T: secp256k1::Signing + secp256k1::Verification,
 	>(
-		network_graph: &G, recipient: PublicKey, node_signer: &NS,
-		context: MessageContext, peers: I, entropy_source: &ES, secp_ctx: &Secp256k1<T>,
-		compact_paths: bool,
+		network_graph: &G, recipient: PublicKey, node_signer: &NS, context: MessageContext,
+		peers: I, entropy_source: &ES, secp_ctx: &Secp256k1<T>, compact_paths: bool,
 	) -> Result<Vec<BlindedMessagePath>, ()>
 	where
 		NS::Target: NodeSigner,
@@ -736,8 +735,8 @@ where
 	}
 
 	fn create_blinded_paths<T: secp256k1::Signing + secp256k1::Verification, NS: Deref>(
-		&self, recipient: PublicKey, node_signer: &NS,
-		context: MessageContext, peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
+		&self, recipient: PublicKey, node_signer: &NS, context: MessageContext,
+		peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedMessagePath>, ()>
 	where
 		NS::Target: NodeSigner,
@@ -799,8 +798,8 @@ where
 	}
 
 	fn create_blinded_paths<T: secp256k1::Signing + secp256k1::Verification, NS: Deref>(
-		&self, recipient: PublicKey, node_signer: &NS,
-		context: MessageContext, peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
+		&self, recipient: PublicKey, node_signer: &NS, context: MessageContext,
+		peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedMessagePath>, ()>
 	where
 		NS::Target: NodeSigner,
@@ -844,8 +843,8 @@ impl MessageRouter for NullMessageRouter {
 	}
 
 	fn create_blinded_paths<T: secp256k1::Signing + secp256k1::Verification, NS: Deref>(
-		&self, _recipient: PublicKey, _node_signer: &NS,
-		_context: MessageContext, _peers: Vec<MessageForwardNode>, _secp_ctx: &Secp256k1<T>,
+		&self, _recipient: PublicKey, _node_signer: &NS, _context: MessageContext,
+		_peers: Vec<MessageForwardNode>, _secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedMessagePath>, ()>
 	where
 		NS::Target: NodeSigner,
@@ -1644,13 +1643,7 @@ where
 		};
 
 		self.message_router
-			.create_blinded_paths(
-				recipient,
-				&self.node_signer,
-				context,
-				peers,
-				secp_ctx,
-			)
+			.create_blinded_paths(recipient, &self.node_signer, context, peers, secp_ctx)
 			.and_then(|paths| paths.into_iter().next().ok_or(()))
 			.map_err(|_| SendError::PathNotFound)
 	}

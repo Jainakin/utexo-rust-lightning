@@ -55,8 +55,8 @@ impl Readable for BlindedMessagePath {
 impl BlindedMessagePath {
 	/// Create a one-hop blinded path for a message.
 	pub fn one_hop<ES: Deref, NS: Deref, T: secp256k1::Signing + secp256k1::Verification>(
-		recipient_node_id: PublicKey, node_signer: &NS, context: MessageContext, entropy_source: ES,
-		secp_ctx: &Secp256k1<T>,
+		recipient_node_id: PublicKey, node_signer: &NS, context: MessageContext,
+		entropy_source: ES, secp_ctx: &Secp256k1<T>,
 	) -> Self
 	where
 		ES::Target: EntropySource,
@@ -67,9 +67,8 @@ impl BlindedMessagePath {
 
 	/// Create a path for an onion message, to be forwarded along `node_pks`.
 	pub fn new<ES: Deref, NS: Deref, T: secp256k1::Signing + secp256k1::Verification>(
-		intermediate_nodes: &[MessageForwardNode], recipient_node_id: PublicKey,
-		node_signer: &NS, context: MessageContext, entropy_source: ES,
-		secp_ctx: &Secp256k1<T>,
+		intermediate_nodes: &[MessageForwardNode], recipient_node_id: PublicKey, node_signer: &NS,
+		context: MessageContext, entropy_source: ES, secp_ctx: &Secp256k1<T>,
 	) -> Self
 	where
 		ES::Target: EntropySource,
@@ -90,10 +89,14 @@ impl BlindedMessagePath {
 	///
 	/// Note:
 	/// At most [`MAX_DUMMY_HOPS_COUNT`] dummy hops can be added to the blinded path.
-	pub fn new_with_dummy_hops<ES: Deref, NS: Deref, T: secp256k1::Signing + secp256k1::Verification>(
+	pub fn new_with_dummy_hops<
+		ES: Deref,
+		NS: Deref,
+		T: secp256k1::Signing + secp256k1::Verification,
+	>(
 		intermediate_nodes: &[MessageForwardNode], recipient_node_id: PublicKey,
-		dummy_hop_count: usize, node_signer: &NS, context: MessageContext,
-		entropy_source: ES, secp_ctx: &Secp256k1<T>,
+		dummy_hop_count: usize, node_signer: &NS, context: MessageContext, entropy_source: ES,
+		secp_ctx: &Secp256k1<T>,
 	) -> Self
 	where
 		ES::Target: EntropySource,

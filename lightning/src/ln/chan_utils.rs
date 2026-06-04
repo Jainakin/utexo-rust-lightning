@@ -1825,8 +1825,7 @@ impl CommitmentTransaction {
 	///
 	/// For non-P2WSH outputs (P2WPKH, P2A, `OP_RETURN`, …) returns an empty [`ScriptBuf`].
 	pub fn output_witness_scripts_for_vls_validate<'a>(
-		&self,
-		channel_parameters: &DirectedChannelTransactionParameters<'a>,
+		&self, channel_parameters: &DirectedChannelTransactionParameters<'a>,
 	) -> Result<Vec<ScriptBuf>, ()> {
 		let mut spk_to_wit: HashMap<Vec<u8>, ScriptBuf> = HashMap::new();
 		Self::register_holder_commitment_p2wsh_witness_scripts(
@@ -1859,10 +1858,8 @@ impl CommitmentTransaction {
 	}
 
 	fn register_holder_commitment_p2wsh_witness_scripts<'a>(
-		spk_to_wit: &mut HashMap<Vec<u8>, ScriptBuf>,
-		keys: &TxCreationKeys,
-		to_broadcaster_value_sat: Amount,
-		to_countersignatory_value_sat: Amount,
+		spk_to_wit: &mut HashMap<Vec<u8>, ScriptBuf>, keys: &TxCreationKeys,
+		to_broadcaster_value_sat: Amount, to_countersignatory_value_sat: Amount,
 		nondust_htlcs: &[HTLCOutputInCommitment],
 		channel_parameters: &DirectedChannelTransactionParameters<'a>,
 	) {
@@ -1884,7 +1881,8 @@ impl CommitmentTransaction {
 
 		if to_countersignatory_value_sat > Amount::ZERO {
 			if channel_type.supports_anchors_zero_fee_htlc_tx() {
-				let wit = get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point);
+				let wit =
+					get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point);
 				spk_to_wit.insert(wit.to_p2wsh().as_bytes().to_vec(), wit);
 			}
 		}

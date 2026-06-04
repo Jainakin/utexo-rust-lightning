@@ -290,5 +290,4 @@ mod tests {
 		// This also serves to test the `option: $trait` variant of the `_decode_tlv` ser macro.
 		do_chacha_stream_adapters_ser_macros().unwrap()
 	}
-
 }
