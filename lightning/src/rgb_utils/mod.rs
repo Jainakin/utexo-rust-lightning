@@ -49,6 +49,7 @@ use tokio::runtime::Handle;
 
 use crate::io;
 use core::ops::Deref;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -133,6 +134,7 @@ pub const RGB_TRANSFER_INFO_NS: &str = "transfer_info";
 pub const RGB_CONSIGNMENT_NS: &str = "consignment";
 /// Secondary namespace for wallet configuration
 pub const RGB_WALLET_CONFIG_NS: &str = "wallet_config";
+const VANILLA_SYNC_LOOKBACK: u32 = 20;
 
 /// RGB channel info
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -146,6 +148,11 @@ pub struct RgbInfo {
 	pub local_rgb_amount: u64,
 	/// Channel RGB remote amount
 	pub remote_rgb_amount: u64,
+	/// Batch transfer index from rgb-lib (set after rgb_send_begin).
+	/// NOTE: no serde skip/default attributes here — RgbInfo is persisted via
+	/// bincode (a positional, non-self-describing format), so the field must be
+	/// serialized unconditionally to stay in sync on read.
+	pub batch_transfer_idx: Option<i32>,
 }
 
 /// RGB payment info
@@ -338,7 +345,7 @@ async fn _accept_transfer(
 		wallet.go_online(OnlineOptions {
 			indexer_url,
 			skip_consistency_check: true,
-			vanilla_sync_lookback: 0,
+			vanilla_sync_lookback: VANILLA_SYNC_LOOKBACK,
 		})?;
 		wallet.accept_transfer(
 			funding_txid.clone(),
@@ -846,6 +853,7 @@ pub(crate) fn handle_funding(
 		schema: AssetSchema::from_schema_id(consignment.schema_id()).unwrap(),
 		local_rgb_amount: push_amount,
 		remote_rgb_amount: channel_rgb_amount - push_amount,
+		batch_transfer_idx: None,
 	};
 	let temporary_channel_id_str = temporary_channel_id.0.as_hex().to_string();
 
@@ -1026,4 +1034,20 @@ impl<K: KVStoreSync + ?Sized> RgbKvStoreExt for K {
 			}
 		});
 	}
+}
+
+thread_local! {
+	static HOLDER_VALIDATE_PSBT_WITNESS_SCRIPTS_HEX: RefCell<Option<Vec<String>>> =
+		const { RefCell::new(None) };
+}
+
+/// Installed by [`crate::ln::channel`] before [`crate::sign::ChannelSigner::validate_holder_commitment`]
+/// on RGB-colored holder commitments so an external signer can attach PSBT `witness_script`s for VLS.
+pub fn holder_validate_install_psbt_output_witness_scripts_hex(hex_scripts: Vec<String>) {
+	HOLDER_VALIDATE_PSBT_WITNESS_SCRIPTS_HEX.with(|c| *c.borrow_mut() = Some(hex_scripts));
+}
+
+/// Removes and returns witness script hex strings installed by [`holder_validate_install_psbt_output_witness_scripts_hex`], if any.
+pub fn holder_validate_take_psbt_output_witness_scripts_hex() -> Option<Vec<String>> {
+	HOLDER_VALIDATE_PSBT_WITNESS_SCRIPTS_HEX.with(|c| c.borrow_mut().take())
 }

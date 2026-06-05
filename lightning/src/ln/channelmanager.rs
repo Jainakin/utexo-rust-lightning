@@ -89,7 +89,7 @@ use crate::ln::onion_utils::{
 	decode_fulfill_attribution_data, HTLCFailReason, LocalHTLCFailureReason,
 };
 use crate::ln::onion_utils::{process_fulfill_attribution_data, AttributionData};
-use crate::ln::our_peer_storage::{EncryptedOurPeerStorage, PeerStorageMonitorHolder};
+use crate::ln::our_peer_storage::PeerStorageMonitorHolder;
 #[cfg(test)]
 use crate::ln::outbound_payment;
 use crate::ln::outbound_payment::{
@@ -200,6 +200,12 @@ pub use crate::ln::outbound_payment::{
 	RetryableSendFailure,
 };
 use crate::ln::script::ShutdownScript;
+
+/// Test-only hook: if set to a node's pubkey, that node will drop outgoing
+/// `funding_signed` messages (sending an `ErrorMessage` instead) in its
+/// `internal_funding_created` handler.
+#[cfg(any(test, feature = "_rln_test_hooks"))]
+pub static DROP_FUNDING_SIGNED_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
 
 // We hold various information about HTLC relay in the HTLC objects in Channel itself:
 //
@@ -1846,7 +1852,7 @@ pub trait AChannelManager {
 	/// A type implementing [`NodeSigner`].
 	type NodeSigner: NodeSigner + ?Sized;
 	/// A type that may be dereferenced to [`Self::NodeSigner`].
-	type NS: Deref<Target = Self::NodeSigner>;
+	type NS: Deref<Target = Self::NodeSigner> + Clone;
 	/// A type implementing [`EcdsaChannelSigner`].
 	type Signer: EcdsaChannelSigner + Sized;
 	/// A type implementing [`SignerProvider`] for [`Self::Signer`].
@@ -1889,7 +1895,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -2718,7 +2724,7 @@ pub struct ChannelManager<
 	M: Deref,
 	T: Deref,
 	ES: Deref,
-	NS: Deref,
+	NS: Deref + Clone,
 	SP: Deref,
 	F: Deref,
 	R: Deref,
@@ -2743,9 +2749,9 @@ pub struct ChannelManager<
 	router: R,
 
 	#[cfg(test)]
-	pub(super) flow: OffersMessageFlow<MR, L>,
+	pub(super) flow: OffersMessageFlow<NS, MR, L>,
 	#[cfg(not(test))]
-	flow: OffersMessageFlow<MR, L>,
+	flow: OffersMessageFlow<NS, MR, L>,
 
 	/// See `ChannelManager` struct-level documentation for lock order requirements.
 	#[cfg(any(test, feature = "_test_utils"))]
@@ -2835,8 +2841,6 @@ pub struct ChannelManager<
 	short_to_chan_info: FairRwLock<HashMap<u64, (PublicKey, ChannelId)>>,
 
 	our_network_pubkey: PublicKey,
-
-	inbound_payment_key: inbound_payment::ExpandedKey,
 
 	/// LDK puts the [fake scids] that it generates into namespaces, to identify the type of an
 	/// incoming payment. To make it harder for a third-party to identify the type of a payment,
@@ -3962,7 +3966,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -4010,13 +4014,12 @@ where
 		let mut secp_ctx = Secp256k1::new();
 		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
 
-		let expanded_inbound_key = node_signer.get_expanded_key();
 		let our_network_pubkey = node_signer.get_node_id(Recipient::Node).unwrap();
 
 		let flow = OffersMessageFlow::new(
 			ChainHash::using_genesis_block(params.network), params.best_block,
-			our_network_pubkey, current_timestamp, expanded_inbound_key,
-			node_signer.get_receive_auth_key(), secp_ctx.clone(), message_router, logger.clone(),
+			our_network_pubkey, current_timestamp,
+			node_signer.clone(), secp_ctx.clone(), message_router, logger.clone(),
 		);
 
 		ChannelManager {
@@ -4031,7 +4034,7 @@ where
 			best_block: RwLock::new(params.best_block),
 
 			outbound_scid_aliases: Mutex::new(new_hash_set()),
-			pending_outbound_payments: OutboundPayments::new(new_hash_map(), rgb_kv_store.clone()),
+			pending_outbound_payments: OutboundPayments::new(new_hash_map(), Arc::clone(&rgb_kv_store)),
 			forward_htlcs: Mutex::new(new_hash_map()),
 			decode_update_add_htlcs: Mutex::new(new_hash_map()),
 			claimable_payments: Mutex::new(ClaimablePayments { claimable_payments: new_hash_map(), pending_claiming_payments: new_hash_map() }),
@@ -4040,8 +4043,6 @@ where
 
 			our_network_pubkey,
 			secp_ctx,
-
-			inbound_payment_key: expanded_inbound_key,
 			fake_scid_rand_bytes: entropy_source.get_secure_random_bytes(),
 
 			probing_cookie_secret: entropy_source.get_secure_random_bytes(),
@@ -4198,7 +4199,7 @@ where
 			match OutboundV1Channel::new(&self.fee_estimator, &self.entropy_source, &self.signer_provider, their_network_key,
 				their_features, channel_value_satoshis, push_msat, user_channel_id, config,
 				self.best_block.read().unwrap().height, outbound_scid_alias, temporary_channel_id, &*self.logger, consignment_endpoint, self.ldk_data_dir.clone(), push_asset_amount,
-				self.rgb_kv_store.clone())
+				Arc::clone(&self.rgb_kv_store))
 			{
 				Ok(res) => res,
 				Err(e) => {
@@ -5785,15 +5786,14 @@ where
 		&self, invoice: &Bolt12Invoice, context: Option<&OffersContext>,
 	) -> Result<PaymentId, ()> {
 		let secp_ctx = &self.secp_ctx;
-		let expanded_key = &self.inbound_payment_key;
 
 		match context {
 			None if invoice.is_for_refund_without_paths() => {
-				invoice.verify_using_metadata(expanded_key, secp_ctx)
+				self.node_signer.verify_bolt12_invoice_using_metadata(invoice, secp_ctx)
 			},
-			Some(&OffersContext::OutboundPayment { payment_id, nonce, .. }) => {
-				invoice.verify_using_payer_data(payment_id, nonce, expanded_key, secp_ctx)
-			},
+			Some(&OffersContext::OutboundPayment { payment_id, nonce, .. }) => self
+				.node_signer
+				.verify_bolt12_invoice_using_payer_data(invoice, payment_id, nonce, secp_ctx),
 			_ => Err(()),
 		}
 	}
@@ -8170,12 +8170,10 @@ where
 					// associated with the same payment_hash pending or not.
 					let payment_preimage = if has_recipient_created_payment_secret {
 						if let Some(ref payment_data) = payment_data {
-							let verify_res = inbound_payment::verify(
+							let verify_res = self.node_signer.verify_inbound_payment(
 								payment_hash,
 								&payment_data,
 								self.highest_seen_timestamp.load(Ordering::Acquire) as u64,
-								&self.inbound_payment_key,
-								&self.logger,
 							);
 							let (payment_preimage, min_final_cltv_expiry_delta) = match verify_res {
 								Ok(result) => result,
@@ -8235,9 +8233,9 @@ where
 
 								let verify_opt = invoice_request_opt.and_then(|invreq| {
 									invreq
-										.verify_using_recipient_data(
+										.verify_using_recipient_data_with_signer(
 											offer_nonce,
-											&self.inbound_payment_key,
+											&self.node_signer,
 											&self.secp_ctx,
 										)
 										.ok()
@@ -9172,8 +9170,7 @@ where
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		)
-			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -9211,8 +9208,7 @@ where
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		)
-			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -10224,7 +10220,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 							&self.channel_type_features(), &peer_state.latest_features, &open_channel_msg,
 							user_channel_id, &config, best_block_height, &self.logger, accept_0conf, self.ldk_data_dir.clone(),
-							self.rgb_kv_store.clone(),
+							Arc::clone(&self.rgb_kv_store),
 						).map_err(|err| MsgHandleErrInternal::from_chan_no_close(err, *temporary_channel_id)
 						).map(|mut channel| {
 							Self::apply_inbound_channel_funding_type(&mut channel.context, channel_funding_type);
@@ -10247,7 +10243,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							user_channel_id, &config, best_block_height,
 							&self.logger,
 							self.ldk_data_dir.clone(),
-							self.rgb_kv_store.clone(),
+							Arc::clone(&self.rgb_kv_store),
 						).map_err(|e| {
 							let channel_id = open_channel_msg.common_fields.temporary_channel_id;
 							MsgHandleErrInternal::from_chan_no_close(e, channel_id)
@@ -10519,7 +10515,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 					&self.channel_type_features(), &peer_state.latest_features, msg, user_channel_id,
 					&self.config.read().unwrap(), best_block_height, &self.logger, /*is_0conf=*/false, self.ldk_data_dir.clone(),
-					self.rgb_kv_store.clone(),
+					Arc::clone(&self.rgb_kv_store),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let logger = WithChannelContext::from(&self.logger, &channel.context, None);
 				let message_send_event = channel.accept_inbound_channel(&&logger).map(|msg| {
@@ -10537,7 +10533,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					&peer_state.latest_features, msg, user_channel_id,
 					&self.config.read().unwrap(), best_block_height, &self.logger,
 					self.ldk_data_dir.clone(),
-					self.rgb_kv_store.clone(),
+					Arc::clone(&self.rgb_kv_store),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let message_send_event = MessageSendEvent::SendAcceptChannelV2 {
 					node_id: *counterparty_node_id,
@@ -10679,10 +10675,34 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					// accepted payment from yet. We do, however, need to wait to send our channel_ready
 					// until we have persisted our monitor.
 					if let Some(msg) = funding_msg_opt {
-						peer_state.pending_msg_events.push(MessageSendEvent::SendFundingSigned {
-							node_id: *counterparty_node_id,
-							msg,
-						});
+						#[cfg(any(test, feature = "_rln_test_hooks"))]
+						let drop_funding_signed = DROP_FUNDING_SIGNED_ON_NODE
+							.lock()
+							.unwrap()
+							.as_ref()
+							.map_or(false, |id| *id == self.get_our_node_id());
+						#[cfg(not(any(test, feature = "_rln_test_hooks")))]
+						let drop_funding_signed = false;
+						if drop_funding_signed {
+							log_error!(
+								WithChannelContext::from(&self.logger, &chan.context, None),
+								"TEST: dropping funding_signed for channel {funded_channel_id}, sending error instead"
+							);
+							peer_state.pending_msg_events.push(MessageSendEvent::HandleError {
+								node_id: *counterparty_node_id,
+								action: msgs::ErrorAction::SendErrorMessage {
+									msg: msgs::ErrorMessage {
+										channel_id: msg.channel_id,
+										data: "TEST: funding_signed dropped".to_owned(),
+									},
+								},
+							});
+						} else {
+							peer_state.pending_msg_events.push(MessageSendEvent::SendFundingSigned {
+								node_id: *counterparty_node_id,
+								msg,
+							});
+						}
 					}
 
 					if let Some(funded_chan) = e.insert(Channel::from(chan)).as_funded_mut() {
@@ -10713,16 +10733,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			)
 		};
 
-		let encrypted_ops = match EncryptedOurPeerStorage::new(msg.data) {
-			Ok(encrypted_ops) => encrypted_ops,
-			Err(()) => {
-				log_debug!(logger, "Received a peer backup which wasn't long enough to be valid");
-				return Err(err());
-			},
-		};
-
-		let decrypted = match encrypted_ops.decrypt(&self.node_signer.get_peer_storage_key()) {
-			Ok(decrypted_ops) => decrypted_ops.into_vec(),
+		let decrypted = match self.node_signer.decrypt_peer_storage_payload(msg.data) {
+			Ok(decrypted_ops) => decrypted_ops,
 			Err(()) => {
 				log_debug!(logger, "Received a peer backup which was corrupted");
 				return Err(err());
@@ -13210,7 +13222,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -13618,11 +13630,10 @@ where
 		&self, min_value_msat: Option<u64>, invoice_expiry_delta_secs: u32,
 		min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<(PaymentHash, PaymentSecret), ()> {
-		inbound_payment::create(
-			&self.inbound_payment_key,
+		self.node_signer.create_inbound_payment(
 			min_value_msat,
 			invoice_expiry_delta_secs,
-			&self.entropy_source,
+			self.entropy_source.get_secure_random_bytes(),
 			self.highest_seen_timestamp.load(Ordering::Acquire) as u64,
 			min_final_cltv_expiry_delta,
 		)
@@ -13678,10 +13689,9 @@ where
 		&self, payment_hash: PaymentHash, min_value_msat: Option<u64>,
 		invoice_expiry_delta_secs: u32, min_final_cltv_expiry: Option<u16>,
 	) -> Result<PaymentSecret, ()> {
-		inbound_payment::create_from_hash(
-			&self.inbound_payment_key,
-			min_value_msat,
+		self.node_signer.create_inbound_payment_for_hash(
 			payment_hash,
+			min_value_msat,
 			invoice_expiry_delta_secs,
 			self.highest_seen_timestamp.load(Ordering::Acquire) as u64,
 			min_final_cltv_expiry,
@@ -13695,8 +13705,7 @@ where
 	pub fn get_payment_preimage(
 		&self, payment_hash: PaymentHash, payment_secret: PaymentSecret,
 	) -> Result<PaymentPreimage, APIError> {
-		let expanded_key = &self.inbound_payment_key;
-		inbound_payment::get_payment_preimage(payment_hash, payment_secret, expanded_key)
+		self.node_signer.get_payment_preimage(payment_hash, payment_secret)
 	}
 
 	/// [`BlindedMessagePath`]s for an async recipient to communicate with this node and interactively
@@ -14079,7 +14088,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -14420,7 +14429,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -14455,7 +14464,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -14516,7 +14525,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -14689,7 +14698,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -15017,7 +15026,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -15592,7 +15601,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -15687,7 +15696,7 @@ where
 
 				let entropy = &*self.entropy_source;
 				let (response, context) = self.flow.create_response_for_invoice_request(
-					&self.node_signer, &self.router, entropy, invoice_request, amount_msats,
+					&self.router, entropy, invoice_request, amount_msats,
 					payment_hash, payment_secret, self.list_usable_channels()
 				);
 
@@ -15762,7 +15771,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -15964,7 +15973,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -16032,7 +16041,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -16550,7 +16559,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -16917,7 +16926,7 @@ pub struct ChannelManagerReadArgs<
 	M: Deref,
 	T: Deref,
 	ES: Deref,
-	NS: Deref,
+	NS: Deref + Clone,
 	SP: Deref,
 	F: Deref,
 	R: Deref,
@@ -17003,7 +17012,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -17058,7 +17067,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -17091,7 +17100,7 @@ impl<
 		M: Deref,
 		T: Deref,
 		ES: Deref,
-		NS: Deref,
+		NS: Deref + Clone,
 		SP: Deref,
 		F: Deref,
 		R: Deref,
@@ -17150,7 +17159,7 @@ where
 					&args.signer_provider,
 					&provided_channel_type_features(&args.config),
 					args.ldk_data_dir.clone(),
-					args.rgb_kv_store.clone(),
+					Arc::clone(&args.rgb_kv_store),
 				),
 			)?;
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
@@ -17580,8 +17589,10 @@ where
 			}
 			pending_outbound_payments = Some(outbounds);
 		}
-		let pending_outbounds =
-			OutboundPayments::new(pending_outbound_payments.unwrap(), args.rgb_kv_store.clone());
+		let pending_outbounds = OutboundPayments::new(
+			pending_outbound_payments.unwrap(),
+			Arc::clone(&args.rgb_kv_store),
+		);
 
 		for (peer_pubkey, peer_storage) in peer_storage_dir {
 			if let Some(peer_state) = per_peer_state.get_mut(&peer_pubkey) {
@@ -18196,8 +18207,6 @@ where
 			}
 		}
 
-		let expanded_inbound_key = args.node_signer.get_expanded_key();
-
 		let mut claimable_payments = hash_map_with_capacity(claimable_htlcs_list.len());
 		if let Some(purposes) = claimable_htlc_purposes {
 			if purposes.len() != claimable_htlcs_list.len() {
@@ -18239,12 +18248,10 @@ where
 					OnionPayload::Invoice { _legacy_hop_data } => {
 						if let Some(hop_data) = _legacy_hop_data {
 							events::PaymentPurpose::Bolt11InvoicePayment {
-								payment_preimage: match inbound_payment::verify(
+								payment_preimage: match args.node_signer.verify_inbound_payment(
 									payment_hash,
 									&hop_data,
 									0,
-									&expanded_inbound_key,
-									&args.logger,
 								) {
 									Ok((payment_preimage, _)) => payment_preimage,
 									Err(()) => {
@@ -18452,8 +18459,7 @@ where
 			best_block,
 			our_network_pubkey,
 			highest_seen_timestamp,
-			expanded_inbound_key,
-			args.node_signer.get_receive_auth_key(),
+			args.node_signer.clone(),
 			secp_ctx.clone(),
 			args.message_router,
 			args.logger.clone(),
@@ -18469,8 +18475,6 @@ where
 			flow,
 
 			best_block: RwLock::new(best_block),
-
-			inbound_payment_key: expanded_inbound_key,
 			pending_outbound_payments: pending_outbounds,
 			pending_intercepted_htlcs: Mutex::new(pending_intercepted_htlcs.unwrap()),
 
@@ -19424,7 +19428,7 @@ mod tests {
 		// payment verification fails as expected.
 		let mut bad_payment_hash = payment_hash.clone();
 		bad_payment_hash.0[0] += 1;
-		match inbound_payment::verify(bad_payment_hash, &payment_data, nodes[0].node.highest_seen_timestamp.load(Ordering::Acquire) as u64, &nodes[0].node.inbound_payment_key, &nodes[0].logger) {
+		match inbound_payment::verify(bad_payment_hash, &payment_data, nodes[0].node.highest_seen_timestamp.load(Ordering::Acquire) as u64, &nodes[0].keys_manager.get_expanded_key(), &nodes[0].logger) {
 			Ok(_) => panic!("Unexpected ok"),
 			Err(()) => {
 				nodes[0].logger.assert_log_contains("lightning::ln::inbound_payment", "Failing HTLC with user-generated payment_hash", 1);
@@ -19432,7 +19436,7 @@ mod tests {
 		}
 
 		// Check that using the original payment hash succeeds.
-		assert!(inbound_payment::verify(payment_hash, &payment_data, nodes[0].node.highest_seen_timestamp.load(Ordering::Acquire) as u64, &nodes[0].node.inbound_payment_key, &nodes[0].logger).is_ok());
+		assert!(inbound_payment::verify(payment_hash, &payment_data, nodes[0].node.highest_seen_timestamp.load(Ordering::Acquire) as u64, &nodes[0].keys_manager.get_expanded_key(), &nodes[0].logger).is_ok());
 	}
 
 	fn check_not_connected_to_peer_error<T>(

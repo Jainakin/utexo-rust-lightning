@@ -11,7 +11,6 @@ use crate::ln::channel_state::ChannelDetails;
 use crate::ln::channelmanager::{
 	PhantomRouteHints, MIN_CLTV_EXPIRY_DELTA, MIN_FINAL_CLTV_EXPIRY_DELTA,
 };
-use crate::ln::inbound_payment::{create, create_from_hash};
 use crate::routing::gossip::RoutingFees;
 use crate::routing::router::{RouteHint, RouteHintHop};
 use crate::sign::{EntropySource, NodeSigner, Recipient};
@@ -195,28 +194,27 @@ where
 		},
 	};
 
-	let keys = node_signer.get_expanded_key();
 	let (payment_hash, payment_secret) = if let Some(payment_hash) = payment_hash {
-		let payment_secret = create_from_hash(
-			&keys,
-			amt_msat,
-			payment_hash,
-			invoice_expiry_delta_secs,
-			duration_since_epoch.as_secs(),
-			min_final_cltv_expiry_delta,
-		)
-		.map_err(|_| SignOrCreationError::CreationError(CreationError::InvalidAmount))?;
+		let payment_secret = node_signer
+			.create_inbound_payment_for_hash(
+				payment_hash,
+				amt_msat,
+				invoice_expiry_delta_secs,
+				duration_since_epoch.as_secs(),
+				min_final_cltv_expiry_delta,
+			)
+			.map_err(|_| SignOrCreationError::CreationError(CreationError::InvalidAmount))?;
 		(payment_hash, payment_secret)
 	} else {
-		create(
-			&keys,
-			amt_msat,
-			invoice_expiry_delta_secs,
-			&entropy_source,
-			duration_since_epoch.as_secs(),
-			min_final_cltv_expiry_delta,
-		)
-		.map_err(|_| SignOrCreationError::CreationError(CreationError::InvalidAmount))?
+		node_signer
+			.create_inbound_payment(
+				amt_msat,
+				invoice_expiry_delta_secs,
+				entropy_source.get_secure_random_bytes(),
+				duration_since_epoch.as_secs(),
+				min_final_cltv_expiry_delta,
+			)
+			.map_err(|_| SignOrCreationError::CreationError(CreationError::InvalidAmount))?
 	};
 
 	log_trace!(

@@ -38,7 +38,6 @@ use crate::blinded_path::payment::{
 	BlindedPaymentTlvs, ForwardTlvs, ReceiveTlvs, UnauthenticatedReceiveTlvs,
 };
 use crate::blinded_path::payment::{BlindedTrampolineTlvs, TrampolineForwardTlvs};
-use crate::ln::channelmanager::Verification;
 use crate::ln::onion_utils;
 use crate::ln::types::ChannelId;
 use crate::offers::invoice_request::InvoiceRequest;
@@ -3746,8 +3745,7 @@ where
 						}),
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some()
-						|| total_msat.is_some()
+						|| cltv_value.is_some() || total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 					{
@@ -3765,8 +3763,8 @@ where
 				},
 				ChaChaPolyReadAdapter { readable: BlindedPaymentTlvs::Receive(receive_tlvs) } => {
 					let ReceiveTlvs { tlvs, authentication: (hmac, nonce) } = receive_tlvs;
-					let expanded_key = node_signer.get_expanded_key();
-					if tlvs.verify_for_offer_payment(hmac, nonce, &expanded_key).is_err() {
+					if tlvs.verify_for_offer_payment_with_signer(hmac, nonce, &node_signer).is_err()
+					{
 						return Err(DecodeError::InvalidValue);
 					}
 
@@ -3901,8 +3899,7 @@ where
 						}),
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some()
-						|| total_msat.is_some()
+						|| cltv_value.is_some() || total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 					{
@@ -3921,8 +3918,8 @@ where
 					readable: BlindedTrampolineTlvs::Receive(receive_tlvs),
 				} => {
 					let ReceiveTlvs { tlvs, authentication: (hmac, nonce) } = receive_tlvs;
-					let expanded_key = node_signer.get_expanded_key();
-					if tlvs.verify_for_offer_payment(hmac, nonce, &expanded_key).is_err() {
+					if tlvs.verify_for_offer_payment_with_signer(hmac, nonce, &node_signer).is_err()
+					{
 						return Err(DecodeError::InvalidValue);
 					}
 
