@@ -370,11 +370,7 @@ pub type RgbBackend = NativeRgbBackend;
 impl NativeRgbBackend {
 	/// Creates a persistent native RGB backend from an already restored production wallet.
 	pub fn new(wallet: Wallet, online_options: OnlineOptions) -> Self {
-		Self {
-			wallet: Mutex::new(wallet),
-			online_options,
-			transaction_processor: Mutex::new(()),
-		}
+		Self { wallet: Mutex::new(wallet), online_options, transaction_processor: Mutex::new(()) }
 	}
 
 	/// Prepares a deterministic colored transaction and durably consumes its fascia before
@@ -892,10 +888,7 @@ impl WasmRgbBackend {
 		// Also post the consignment keyed by the txid (mirroring the native backend above), so a
 		// native acceptor — whose `accept_transfer` resolves the funding consignment by raw txid —
 		// can fetch it. `post_pending_consignments` only posts under the P2V/witness recipient_id.
-		wallet
-			.post_consignment_by_txid(funding_txid)
-			.await
-			.map_err(RgbBackendError::from)?;
+		wallet.post_consignment_by_txid(funding_txid).await.map_err(RgbBackendError::from)?;
 		wallet.flush().await.map_err(RgbBackendError::from)?;
 		Ok(PreparedRgbFundingTransfer { signed_psbt, transaction })
 	}
@@ -1170,57 +1163,56 @@ where
 			Ok(data) => Some(bincode::deserialize::<RgbPaymentInfo>(&data).map_err(rgb_color_err)?),
 			Err(_) => None,
 		};
-		let rgb_payment_info = if let Some(info) =
-			cached_payment_info.filter(|info| is_compatible(info))
-		{
-			// Cache hit on the per-channel record. Preserve stored balances: they were the
-			// channel's snapshot at the time this HTLC was first coloured, and the later
-			// `remote_rgb_amount - rgb_received_htlc` (and local/offered) subtraction assumes
-			// that snapshot — using current `rgb_info` values can underflow if the channel
-			// state has since moved. Matches pre-KVStore `channel_rgb_payment_info_path`
-			// behaviour, where `should_persist_channel_info` stayed false on this branch.
-			info
-		} else if let Some(mut info) = kv_store
-			.read_rgb_payment_info(&htlc.payment_hash, inbound)
-			.ok()
-			.filter(|info| is_compatible(info))
-		{
-			// Fall back to the canonical payment-hash-keyed record written by the sender/payee
-			// via `write_rgb_payment_info_file`. Lets a second channel on the same node recover
-			// the authoritative payment info once the first channel has consumed the
-			// `<payment_hash>_pending` marker. Refresh balances, then persist a per-channel
-			// copy so subsequent commitment updates hit the cached branch above.
-			info.local_rgb_amount = rgb_info.local_rgb_amount;
-			info.remote_rgb_amount = rgb_info.remote_rgb_amount;
-			let data = bincode::serialize(&info).map_err(rgb_color_err)?;
-			kv_store
-				.write(RGB_PRIMARY_NS, namespace, &htlc_proxy_id, data.clone())
-				.map_err(rgb_color_err)?;
-			kv_store
-				.write(RGB_PRIMARY_NS, namespace, &htlc_proxy_id_pending, data)
-				.map_err(rgb_color_err)?;
-			info
-		} else {
-			// No compatible record available (e.g. a forwarder that never saw a
-			// sender/payee-side write). Synthesize from the channel's own RGB info plus the
-			// HTLC's amount.
-			let rgb_payment_info = RgbPaymentInfo {
-				contract_id,
-				amount: htlc_amount_rgb,
-				local_rgb_amount: rgb_info.local_rgb_amount,
-				remote_rgb_amount: rgb_info.remote_rgb_amount,
-				swap_payment: true,
-				inbound,
+		let rgb_payment_info =
+			if let Some(info) = cached_payment_info.filter(|info| is_compatible(info)) {
+				// Cache hit on the per-channel record. Preserve stored balances: they were the
+				// channel's snapshot at the time this HTLC was first coloured, and the later
+				// `remote_rgb_amount - rgb_received_htlc` (and local/offered) subtraction assumes
+				// that snapshot — using current `rgb_info` values can underflow if the channel
+				// state has since moved. Matches pre-KVStore `channel_rgb_payment_info_path`
+				// behaviour, where `should_persist_channel_info` stayed false on this branch.
+				info
+			} else if let Some(mut info) = kv_store
+				.read_rgb_payment_info(&htlc.payment_hash, inbound)
+				.ok()
+				.filter(|info| is_compatible(info))
+			{
+				// Fall back to the canonical payment-hash-keyed record written by the sender/payee
+				// via `write_rgb_payment_info_file`. Lets a second channel on the same node recover
+				// the authoritative payment info once the first channel has consumed the
+				// `<payment_hash>_pending` marker. Refresh balances, then persist a per-channel
+				// copy so subsequent commitment updates hit the cached branch above.
+				info.local_rgb_amount = rgb_info.local_rgb_amount;
+				info.remote_rgb_amount = rgb_info.remote_rgb_amount;
+				let data = bincode::serialize(&info).map_err(rgb_color_err)?;
+				kv_store
+					.write(RGB_PRIMARY_NS, namespace, &htlc_proxy_id, data.clone())
+					.map_err(rgb_color_err)?;
+				kv_store
+					.write(RGB_PRIMARY_NS, namespace, &htlc_proxy_id_pending, data)
+					.map_err(rgb_color_err)?;
+				info
+			} else {
+				// No compatible record available (e.g. a forwarder that never saw a
+				// sender/payee-side write). Synthesize from the channel's own RGB info plus the
+				// HTLC's amount.
+				let rgb_payment_info = RgbPaymentInfo {
+					contract_id,
+					amount: htlc_amount_rgb,
+					local_rgb_amount: rgb_info.local_rgb_amount,
+					remote_rgb_amount: rgb_info.remote_rgb_amount,
+					swap_payment: true,
+					inbound,
+				};
+				let data = bincode::serialize(&rgb_payment_info).map_err(rgb_color_err)?;
+				kv_store
+					.write(RGB_PRIMARY_NS, namespace, &htlc_proxy_id, data.clone())
+					.map_err(rgb_color_err)?;
+				kv_store
+					.write(RGB_PRIMARY_NS, namespace, &htlc_proxy_id_pending, data)
+					.map_err(rgb_color_err)?;
+				rgb_payment_info
 			};
-			let data = bincode::serialize(&rgb_payment_info).map_err(rgb_color_err)?;
-			kv_store
-				.write(RGB_PRIMARY_NS, namespace, &htlc_proxy_id, data.clone())
-				.map_err(rgb_color_err)?;
-			kv_store
-				.write(RGB_PRIMARY_NS, namespace, &htlc_proxy_id_pending, data)
-				.map_err(rgb_color_err)?;
-			rgb_payment_info
-		};
 
 		if kv_store.read(RGB_PRIMARY_NS, namespace, &htlc_proxy_id_pending).is_err() {
 			let data = bincode::serialize(&rgb_payment_info).map_err(rgb_color_err)?;
