@@ -1189,7 +1189,8 @@ impl<Descriptor: SocketDescriptor, RM: Deref, L: Deref, NS: Deref>
 		IgnoringMessageHandler,
 		NS,
 		IgnoringMessageHandler,
-	> where
+	>
+where
 	RM::Target: RoutingMessageHandler,
 	L::Target: Logger,
 	NS::Target: NodeSigner,
@@ -2356,9 +2357,8 @@ where
 				{
 					// Forward ad-hoc gossip if the timestamp range is less than six hours ago.
 					// Otherwise, do a full sync.
-					use std::time::{SystemTime, UNIX_EPOCH};
-					let full_sync_threshold = SystemTime::now()
-						.duration_since(UNIX_EPOCH)
+					let full_sync_threshold = web_time::SystemTime::now()
+						.duration_since(web_time::UNIX_EPOCH)
 						.expect("Time must be > 1970")
 						.as_secs() - 6 * 3600;
 					if (_msg.first_timestamp as u64) > full_sync_threshold {
@@ -4022,7 +4022,7 @@ mod tests {
 		// Until we have std::thread::scoped we have to unsafe { turn off the borrow checker }.
 		let peers = Arc::new(create_network(2, unsafe { &*(&*cfgs as *const _) as &'static _ }));
 
-		let start_time = std::time::Instant::now();
+		let start_time = web_time::Instant::now();
 		macro_rules! spawn_thread {
 			($id: expr) => {{
 				let peers = Arc::clone(&peers);

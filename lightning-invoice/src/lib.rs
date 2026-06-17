@@ -53,69 +53,7 @@ use bitcoin::secp256k1::ecdsa::RecoverableSignature;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::{Message, Secp256k1};
 
-#[cfg(feature = "rgb")]
-pub use rgb_lib::ContractId;
-
-#[cfg(not(feature = "rgb"))]
-pub use self::contract_id_stub::ContractId;
-
-#[cfg(not(feature = "rgb"))]
-mod contract_id_stub {
-	use core::fmt;
-	use core::str::FromStr;
-
-	#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
-	/// Stub RGB contract id used when the `rgb` feature is disabled.
-	///
-	/// This keeps `lightning-invoice` buildable (e.g. for `wasm32-unknown-unknown`) without pulling
-	/// the host RGB wallet/database stack via `rgb-lib`.
-	pub struct ContractId(pub [u8; 32]);
-
-	impl ContractId {
-		/// Constructs a `ContractId` from a 32-byte array.
-		pub fn copy_from_slice(bytes: [u8; 32]) -> Result<Self, ()> {
-			Ok(Self(bytes))
-		}
-	}
-
-	impl core::ops::Deref for ContractId {
-		type Target = [u8];
-
-		fn deref(&self) -> &Self::Target {
-			&self.0
-		}
-	}
-
-	impl AsRef<[u8]> for ContractId {
-		fn as_ref(&self) -> &[u8] {
-			&self.0
-		}
-	}
-
-	impl fmt::Display for ContractId {
-		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-			// Keep formatting stable, even without `rgb-lib` in the build.
-			for b in self.0 {
-				write!(f, "{:02x}", b)?;
-			}
-			Ok(())
-		}
-	}
-
-	impl FromStr for ContractId {
-		type Err = core::convert::Infallible;
-
-		fn from_str(s: &str) -> Result<Self, Self::Err> {
-			// Best-effort parse: accept any string and return a deterministic placeholder.
-			// This is sufficient for builds that don't enable RGB invoice semantics.
-			let mut out = [0u8; 32];
-			let bytes = s.as_bytes();
-			let n = core::cmp::min(bytes.len(), 32);
-			out[..n].copy_from_slice(&bytes[..n]);
-			Ok(Self(out))
-		}
-	}
-}
+pub use rgbstd::ContractId;
 
 use alloc::boxed::Box;
 use alloc::string;
@@ -2339,6 +2277,7 @@ mod test {
 			cltv_expiry_delta: 0,
 			htlc_minimum_msat: None,
 			htlc_maximum_msat: None,
+			htlc_maximum_rgb: None,
 		};
 		let too_long_route = RouteHint(vec![route_hop; 13]);
 		let long_route_res =
@@ -2380,6 +2319,7 @@ mod test {
 				cltv_expiry_delta: 145,
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
+				htlc_maximum_rgb: None,
 			},
 			RouteHintHop {
 				src_node_id: public_key,
@@ -2388,6 +2328,7 @@ mod test {
 				cltv_expiry_delta: 146,
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
+				htlc_maximum_rgb: None,
 			},
 		]);
 
@@ -2399,6 +2340,7 @@ mod test {
 				cltv_expiry_delta: 147,
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
+				htlc_maximum_rgb: None,
 			},
 			RouteHintHop {
 				src_node_id: public_key,
@@ -2407,6 +2349,7 @@ mod test {
 				cltv_expiry_delta: 148,
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
+				htlc_maximum_rgb: None,
 			},
 		]);
 
