@@ -7,19 +7,6 @@
 #![deny(unused_mut)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
-#![allow(clippy::clone_on_copy)]
-#![allow(clippy::doc_lazy_continuation)]
-#![allow(clippy::if_same_then_else)]
-#![allow(clippy::legacy_numeric_constants)]
-#![allow(clippy::manual_div_ceil)]
-#![allow(clippy::manual_is_multiple_of)]
-#![allow(clippy::manual_repeat_n)]
-#![allow(clippy::map_flatten)]
-#![allow(clippy::match_like_matches_macro)]
-#![allow(clippy::needless_borrow)]
-#![allow(clippy::redundant_closure)]
-#![allow(clippy::tabs_in_doc_comments)]
-#![allow(clippy::type_complexity)]
 
 //! This crate provides data structures to represent
 //! [lightning BOLT11](https://github.com/lightning/bolts/blob/master/11-payment-encoding.md)
@@ -2277,7 +2264,6 @@ mod test {
 			cltv_expiry_delta: 0,
 			htlc_minimum_msat: None,
 			htlc_maximum_msat: None,
-			htlc_maximum_rgb: None,
 		};
 		let too_long_route = RouteHint(vec![route_hop; 13]);
 		let long_route_res =
@@ -2319,7 +2305,6 @@ mod test {
 				cltv_expiry_delta: 145,
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
-				htlc_maximum_rgb: None,
 			},
 			RouteHintHop {
 				src_node_id: public_key,
@@ -2328,7 +2313,6 @@ mod test {
 				cltv_expiry_delta: 146,
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
-				htlc_maximum_rgb: None,
 			},
 		]);
 
@@ -2340,7 +2324,6 @@ mod test {
 				cltv_expiry_delta: 147,
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
-				htlc_maximum_rgb: None,
 			},
 			RouteHintHop {
 				src_node_id: public_key,
@@ -2349,7 +2332,6 @@ mod test {
 				cltv_expiry_delta: 148,
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
-				htlc_maximum_rgb: None,
 			},
 		]);
 

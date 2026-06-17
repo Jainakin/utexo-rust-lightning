@@ -13333,7 +13333,14 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			invoice = invoice.rgb_amount(amt);
 		}
 
-		let channels = self.list_channels();
+		let mut channels = self.list_channels();
+		// For RGB invoices, only advertise channels that can receive the asset over their inbound
+		// side. Vanilla (BTC-only) channels report `inbound_htlc_maximum_rgb == 0`; including them
+		// as route hints would make the payer attempt to route RGB over a channel with no RGB,
+		// failing with "Cannot send more than our next-HTLC RGB maximum - 0".
+		if contract_id.is_some() {
+			channels.retain(|channel| channel.inbound_htlc_maximum_rgb > 0);
+		}
 		let route_hints = super::invoice_utils::sort_and_filter_channels(channels, amount_msats, &self.logger);
 		for hint in route_hints {
 			invoice = invoice.private_route(hint);
