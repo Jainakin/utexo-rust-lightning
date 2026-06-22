@@ -944,6 +944,10 @@ pub const MAX_CHAN_DUST_LIMIT_SATOSHIS: u64 = MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS
 /// See <https://github.com/lightning/bolts/issues/905> for more details.
 pub const MIN_CHAN_DUST_LIMIT_SATOSHIS: u64 = 354;
 
+pub const VIRTUAL_DUST_LIMIT_SATOSHIS: u64 = 1;
+
+pub const VIRTUAL_HTLC_MINIMUM_MSAT: u64 = 1000;
+
 // Just a reasonable implementation-specific safe lower bound, higher than the dust limit.
 pub const MIN_THEIR_CHAN_RESERVE_SATOSHIS: u64 = 1000;
 
@@ -3477,6 +3481,7 @@ where
 		current_chain_height: u32,
 		logger: &'a L,
 		is_0conf: bool,
+		is_virtual: bool,
 		our_funding_satoshis: u64,
 		counterparty_pubkeys: ChannelPublicKeys,
 		channel_type: ChannelTypeFeatures,
@@ -3558,8 +3563,13 @@ where
 		if open_channel_fields.max_accepted_htlcs < config.channel_handshake_limits.min_max_accepted_htlcs {
 			return Err(ChannelError::close(format!("max_accepted_htlcs ({}) is less than the user specified limit ({})", open_channel_fields.max_accepted_htlcs, config.channel_handshake_limits.min_max_accepted_htlcs)));
 		}
-		if open_channel_fields.dust_limit_satoshis < MIN_CHAN_DUST_LIMIT_SATOSHIS {
-			return Err(ChannelError::close(format!("dust_limit_satoshis ({}) is less than the implementation limit ({})", open_channel_fields.dust_limit_satoshis, MIN_CHAN_DUST_LIMIT_SATOSHIS)));
+		let min_dust_limit_satoshis = if is_virtual {
+			VIRTUAL_DUST_LIMIT_SATOSHIS
+		} else {
+			MIN_CHAN_DUST_LIMIT_SATOSHIS
+		};
+		if open_channel_fields.dust_limit_satoshis < min_dust_limit_satoshis {
+			return Err(ChannelError::close(format!("dust_limit_satoshis ({}) is less than the implementation limit ({})", open_channel_fields.dust_limit_satoshis, min_dust_limit_satoshis)));
 		}
 		if open_channel_fields.dust_limit_satoshis >  MAX_CHAN_DUST_LIMIT_SATOSHIS {
 			return Err(ChannelError::close(format!("dust_limit_satoshis ({}) is greater than the implementation limit ({})", open_channel_fields.dust_limit_satoshis, MAX_CHAN_DUST_LIMIT_SATOSHIS)));
@@ -3762,11 +3772,11 @@ where
 
 			feerate_per_kw: open_channel_fields.commitment_feerate_sat_per_1000_weight,
 			counterparty_dust_limit_satoshis: open_channel_fields.dust_limit_satoshis,
-			holder_dust_limit_satoshis: MIN_CHAN_DUST_LIMIT_SATOSHIS,
+			holder_dust_limit_satoshis: if is_virtual { VIRTUAL_DUST_LIMIT_SATOSHIS } else { MIN_CHAN_DUST_LIMIT_SATOSHIS },
 			counterparty_max_htlc_value_in_flight_msat: cmp::min(open_channel_fields.max_htlc_value_in_flight_msat, channel_value_satoshis * 1000),
 			holder_max_htlc_value_in_flight_msat: get_holder_max_htlc_value_in_flight_msat(channel_value_satoshis, &config.channel_handshake_config),
 			counterparty_htlc_minimum_msat: open_channel_fields.htlc_minimum_msat,
-			holder_htlc_minimum_msat: if config.channel_handshake_config.our_htlc_minimum_msat == 0 { 1 } else { config.channel_handshake_config.our_htlc_minimum_msat },
+			holder_htlc_minimum_msat: if is_virtual { VIRTUAL_HTLC_MINIMUM_MSAT } else if config.channel_handshake_config.our_htlc_minimum_msat == 0 { 1 } else { config.channel_handshake_config.our_htlc_minimum_msat },
 			counterparty_max_accepted_htlcs: open_channel_fields.max_accepted_htlcs,
 			holder_max_accepted_htlcs: cmp::min(config.channel_handshake_config.our_max_accepted_htlcs, max_htlcs(&channel_type)),
 			minimum_depth,
@@ -4359,8 +4369,13 @@ where
 		if common_fields.max_accepted_htlcs < peer_limits.min_max_accepted_htlcs {
 			return Err(ChannelError::close(format!("max_accepted_htlcs ({}) is less than the user specified limit ({})", common_fields.max_accepted_htlcs, peer_limits.min_max_accepted_htlcs)));
 		}
-		if common_fields.dust_limit_satoshis < MIN_CHAN_DUST_LIMIT_SATOSHIS {
-			return Err(ChannelError::close(format!("dust_limit_satoshis ({}) is less than the implementation limit ({})", common_fields.dust_limit_satoshis, MIN_CHAN_DUST_LIMIT_SATOSHIS)));
+		let min_dust_limit_satoshis = if self.is_virtual_dust_set() {
+			VIRTUAL_DUST_LIMIT_SATOSHIS
+		} else {
+			MIN_CHAN_DUST_LIMIT_SATOSHIS
+		};
+		if common_fields.dust_limit_satoshis < min_dust_limit_satoshis {
+			return Err(ChannelError::close(format!("dust_limit_satoshis ({}) is less than the implementation limit ({})", common_fields.dust_limit_satoshis, min_dust_limit_satoshis)));
 		}
 		if common_fields.dust_limit_satoshis > MAX_CHAN_DUST_LIMIT_SATOSHIS {
 			return Err(ChannelError::close(format!("dust_limit_satoshis ({}) is greater than the implementation limit ({})", common_fields.dust_limit_satoshis, MAX_CHAN_DUST_LIMIT_SATOSHIS)));
@@ -4485,6 +4500,10 @@ where
 
 	pub fn is_trusted_no_broadcast(&self) -> bool {
 		self.trusted_no_broadcast
+	}
+
+	pub fn is_virtual_dust_set(&self) -> bool {
+		self.holder_dust_limit_satoshis == VIRTUAL_DUST_LIMIT_SATOSHIS
 	}
 
 	pub fn get_cltv_expiry_delta(&self) -> u16 {
@@ -4612,6 +4631,10 @@ where
 
 	pub fn set_trusted_no_broadcast(&mut self) {
 		self.trusted_no_broadcast = true;
+	}
+
+	pub fn set_virtual_dust_limit(&mut self) {
+		self.holder_dust_limit_satoshis = VIRTUAL_DUST_LIMIT_SATOSHIS;
 	}
 
 	fn can_resume_on_reconnect(&self) -> bool {
@@ -14122,7 +14145,7 @@ where
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
 		counterparty_node_id: PublicKey, our_supported_features: &ChannelTypeFeatures,
 		their_features: &InitFeatures, msg: &msgs::OpenChannel, user_id: u128, config: &UserConfig,
-		current_chain_height: u32, logger: &L, is_0conf: bool, rgb_backend: Arc<RgbBackend>,
+		current_chain_height: u32, logger: &L, is_0conf: bool, is_virtual: bool, rgb_backend: Arc<RgbBackend>,
 		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> Result<InboundV1Channel<SP>, ChannelError>
 		where ES::Target: EntropySource,
@@ -14155,6 +14178,7 @@ where
 			current_chain_height,
 			&&logger,
 			is_0conf,
+			is_virtual,
 			0,
 
 			counterparty_pubkeys,
@@ -14565,6 +14589,7 @@ where
 			config,
 			current_chain_height,
 			logger,
+			false,
 			false,
 			our_funding_contribution_sats,
 			counterparty_pubkeys,

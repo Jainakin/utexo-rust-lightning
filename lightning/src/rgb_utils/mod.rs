@@ -1010,8 +1010,9 @@ pub struct RgbInfo {
 	/// Channel RGB remote amount
 	pub remote_rgb_amount: u64,
 	/// Batch transfer index from rgb-lib (set after rgb_send_begin).
-	// NB: no `skip_serializing_if`/`default` — `RgbInfo` is round-tripped via bincode
-	// (a non-self-describing format), so the field must always be (de)serialized.
+	/// NOTE: no serde skip/default attributes here — RgbInfo is persisted via
+	/// bincode (a positional, non-self-describing format), so the field must be
+	/// serialized unconditionally to stay in sync on read.
 	pub batch_transfer_idx: Option<i32>,
 }
 
@@ -1064,7 +1065,7 @@ mod contract_id_serde {
 	}
 }
 
-fn counterparty_output_index(
+fn _counterparty_output_index(
 	outputs: &[TxOut], channel_type_features: &ChannelTypeFeatures, payment_key: &PublicKey,
 ) -> Option<usize> {
 	let counterparty_payment_script =
@@ -1253,7 +1254,7 @@ where
 		funding_scope.get_counterparty_pubkeys().payment_point
 	};
 
-	if let Some(vout_p2wpkh) = counterparty_output_index(
+	if let Some(vout_p2wpkh) = _counterparty_output_index(
 		&commitment_tx.output,
 		funding_scope.get_channel_type(),
 		&payment_point,

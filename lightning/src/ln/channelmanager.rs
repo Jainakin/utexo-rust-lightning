@@ -2183,7 +2183,7 @@ where
 /// # let channel_manager = channel_manager.get_cm();
 /// let value_sats = 1_000_000;
 /// let push_msats = 10_000_000;
-/// match channel_manager.create_channel(peer_id, value_sats, push_msats, 42, None, None) {
+/// match channel_manager.create_channel(peer_id, value_sats, push_msats, 42, None, None, None, None, false) {
 ///     Ok(channel_id) => println!("Opening channel {}", channel_id),
 ///     Err(e) => println!("Error opening channel: {:?}", e),
 /// }
@@ -4464,7 +4464,7 @@ where
 	/// [`Event::FundingGenerationReady::temporary_channel_id`]: events::Event::FundingGenerationReady::temporary_channel_id
 	/// [`Event::ChannelClosed::channel_id`]: events::Event::ChannelClosed::channel_id
 	#[rustfmt::skip]
-	pub fn create_channel(&self, their_network_key: PublicKey, channel_value_satoshis: u64, push_msat: u64, user_channel_id: u128, temporary_channel_id: Option<ChannelId>, override_config: Option<UserConfig>, consignment_endpoint: Option<RgbTransport>, push_asset_amount: Option<u64>) -> Result<ChannelId, APIError> {
+	pub fn create_channel(&self, their_network_key: PublicKey, channel_value_satoshis: u64, push_msat: u64, user_channel_id: u128, temporary_channel_id: Option<ChannelId>, override_config: Option<UserConfig>, consignment_endpoint: Option<RgbTransport>, push_asset_amount: Option<u64>, is_virtual: bool) -> Result<ChannelId, APIError> {
 		if channel_value_satoshis < 1000 {
 			return Err(APIError::APIMisuseError { err: format!("Channel value must be at least 1000 satoshis. It was {}", channel_value_satoshis) });
 		}
@@ -4510,6 +4510,9 @@ where
 				},
 			}
 		};
+		if is_virtual {
+			channel.context.set_virtual_dust_limit();
+		}
 		let logger = WithChannelContext::from(&self.logger, &channel.context, None);
 		let res = channel.get_open_channel(self.chain_hash, &&logger);
 
@@ -5677,7 +5680,6 @@ where
 		})
 	}
 
-	#[allow(clippy::never_loop)]
 	fn send_payment_along_path(&self, args: SendAlongPathArgs) -> Result<(), APIError> {
 		let SendAlongPathArgs {
 			path,
@@ -6600,6 +6602,12 @@ where
 				if !chan.get().ready_to_fund() {
 					return Err(APIError::APIMisuseError {
 						err: format!("Channel {temporary_channel_id} with counterparty {counterparty_node_id} is not an unfunded, outbound channel ready to fund"),
+					});
+				}
+				if chan.get().context().is_virtual_dust_set() && !is_trusted_no_broadcast {
+					return Err(APIError::APIMisuseError {
+						err: "Channels opened with virtual dust must be completed with ChannelFundingType::Virtual"
+							.to_owned(),
 					});
 				}
 				if is_trusted_no_broadcast && chan.get().minimum_depth() != Some(0) {
@@ -10511,6 +10519,15 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
 		let peer_state = &mut *peer_state_lock;
 		let is_only_peer_channel = peer_state.total_channel_count() == 1;
+		if channel_funding_type == ChannelFundingType::Virtual {
+			if let Some(unaccepted_channel) = peer_state.inbound_channel_request_by_id.get(temporary_channel_id) {
+				if matches!(unaccepted_channel.open_channel_msg, OpenChannelMessage::V2(_)) {
+					return Err(APIError::APIMisuseError {
+						err: "ChannelFundingType::Virtual is not supported for inbound v2 channels".to_owned(),
+					});
+				}
+			}
+		}
 
 		// Find (and remove) the channel in the unaccepted table. If it's not there, something weird is
 		// happening and return an error. N.B. that we create channel with an outbound SCID of zero so
@@ -10524,7 +10541,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						InboundV1Channel::new(
 							&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 							&self.channel_type_features(), &peer_state.latest_features, &open_channel_msg,
-							user_channel_id, &config, best_block_height, &self.logger, accept_0conf, Arc::clone(&self.rgb_backend),
+							user_channel_id, &config, best_block_height, &self.logger, accept_0conf,
+							channel_funding_type == ChannelFundingType::Virtual, Arc::clone(&self.rgb_backend),
 							Arc::clone(&self.rgb_kv_store),
 						).map_err(|err| MsgHandleErrInternal::from_chan_no_close(err, *temporary_channel_id)
 						).map(|mut channel| {
@@ -10819,7 +10837,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				let mut channel = InboundV1Channel::new(
 					&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 					&self.channel_type_features(), &peer_state.latest_features, msg, user_channel_id,
-					&self.config.read().unwrap(), best_block_height, &self.logger, /*is_0conf=*/false, Arc::clone(&self.rgb_backend),
+					&self.config.read().unwrap(), best_block_height, &self.logger, /*is_0conf=*/false, /*is_virtual=*/false, Arc::clone(&self.rgb_backend),
 					Arc::clone(&self.rgb_kv_store),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let logger = WithChannelContext::from(&self.logger, &channel.context, None);
@@ -12864,7 +12882,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	/// Check the holding cell in each channel and free any pending HTLCs in them if possible.
 	/// Returns whether there were any updates such as if pending HTLCs were freed or a monitor
 	/// update was applied.
-	#[allow(clippy::never_loop)]
 	fn check_free_holding_cells(&self) -> bool {
 		let mut has_monitor_update = false;
 		let mut failed_htlcs = Vec::new();
@@ -18938,6 +18955,7 @@ where
 				channel_manager.best_block.read().unwrap().height,
 				&channel_manager.logger,
 				pending.is_0conf,
+				/*is_virtual=*/ false,
 				Arc::clone(&channel_manager.rgb_backend),
 				Arc::clone(&channel_manager.rgb_kv_store),
 			)
