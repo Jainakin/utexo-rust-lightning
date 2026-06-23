@@ -38,7 +38,6 @@ use bitcoin::{secp256k1, Psbt, Sequence, Txid, WPubkeyHash, Witness};
 
 use lightning_invoice::RawBolt11Invoice;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::chain::transaction::OutPoint;
@@ -64,7 +63,7 @@ use crate::ln::script::ShutdownScript;
 use crate::offers::invoice::Bolt12Invoice;
 use crate::offers::invoice::UnsignedBolt12Invoice;
 use crate::offers::nonce::Nonce;
-use crate::rgb_utils::color_htlc;
+use crate::rgb_utils::{color_htlc, RgbBackend};
 use crate::types::features::ChannelTypeFeatures;
 use crate::types::payment::PaymentPreimage;
 use crate::util::async_poll::AsyncResult;
@@ -1378,8 +1377,8 @@ pub struct InMemorySigner {
 	channel_keys_id: [u8; 32],
 	/// A source of random bytes.
 	entropy_source: RandomBytes,
-	/// The LDK data directory
-	ldk_data_dir: PathBuf,
+	/// Long-lived RGB wallet backend.
+	rgb_backend: Arc<RgbBackend>,
 	/// KVStore for RGB data persistence
 	rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 }
@@ -1411,7 +1410,7 @@ impl Clone for InMemorySigner {
 			commitment_seed: self.commitment_seed.clone(),
 			channel_keys_id: self.channel_keys_id,
 			entropy_source: RandomBytes::new(self.get_secure_random_bytes()),
-			ldk_data_dir: self.ldk_data_dir.clone(),
+			rgb_backend: Arc::clone(&self.rgb_backend),
 			rgb_kv_store: Arc::clone(&self.rgb_kv_store),
 		}
 	}
@@ -1423,7 +1422,7 @@ impl InMemorySigner {
 		funding_key: SecretKey, revocation_base_key: SecretKey, payment_key_v1: SecretKey,
 		payment_key_v2: SecretKey, v2_remote_key_derivation: bool,
 		delayed_payment_base_key: SecretKey, htlc_base_key: SecretKey, commitment_seed: [u8; 32],
-		channel_keys_id: [u8; 32], ldk_data_dir: PathBuf, rand_bytes_unique_start: [u8; 32],
+		channel_keys_id: [u8; 32], rgb_backend: Arc<RgbBackend>, rand_bytes_unique_start: [u8; 32],
 		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> InMemorySigner {
 		InMemorySigner {
@@ -1437,7 +1436,7 @@ impl InMemorySigner {
 			commitment_seed,
 			channel_keys_id,
 			entropy_source: RandomBytes::new(rand_bytes_unique_start),
-			ldk_data_dir,
+			rgb_backend,
 			rgb_kv_store,
 		}
 	}
@@ -1447,7 +1446,7 @@ impl InMemorySigner {
 		funding_key: SecretKey, revocation_base_key: SecretKey, payment_key_v1: SecretKey,
 		payment_key_v2: SecretKey, v2_remote_key_derivation: bool,
 		delayed_payment_base_key: SecretKey, htlc_base_key: SecretKey, commitment_seed: [u8; 32],
-		channel_keys_id: [u8; 32], ldk_data_dir: PathBuf, rand_bytes_unique_start: [u8; 32],
+		channel_keys_id: [u8; 32], rgb_backend: Arc<RgbBackend>, rand_bytes_unique_start: [u8; 32],
 		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> InMemorySigner {
 		InMemorySigner {
@@ -1461,7 +1460,7 @@ impl InMemorySigner {
 			commitment_seed,
 			channel_keys_id,
 			entropy_source: RandomBytes::new(rand_bytes_unique_start),
-			ldk_data_dir,
+			rgb_backend,
 			rgb_kv_store,
 		}
 	}
@@ -1503,8 +1502,17 @@ impl InMemorySigner {
 				&keys.revocation_key,
 			);
 			if commitment_tx.is_colored() {
-				if let Err(_e) =
-					color_htlc(&mut htlc_tx, htlc, &self.ldk_data_dir, self.rgb_kv_store.as_ref())
+				if let Err(_e) = color_htlc(
+					&mut htlc_tx,
+					htlc,
+					self.rgb_backend.as_ref(),
+					self.rgb_kv_store.as_ref(),
+				) {
+					return Err(());
+				}
+				if !self
+					.rgb_backend
+					.is_transaction_durable(&htlc_tx.compute_txid(), self.rgb_kv_store.as_ref())
 				{
 					return Err(());
 				}
@@ -1778,6 +1786,11 @@ impl EcdsaChannelSigner for InMemorySigner {
 			make_funding_redeemscript(&funding_pubkey, &counterparty_keys.funding_pubkey);
 
 		let built_tx = trusted_tx.built_transaction();
+		if commitment_tx.is_colored()
+			&& !self.rgb_backend.is_transaction_durable(&built_tx.txid, self.rgb_kv_store.as_ref())
+		{
+			return Err(());
+		}
 		let commitment_sig = built_tx.sign_counterparty_commitment(
 			&funding_key,
 			&channel_funding_redeemscript,
@@ -1809,6 +1822,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 		let funding_redeemscript =
 			make_funding_redeemscript(&funding_pubkey, &counterparty_keys.funding_pubkey);
 		let trusted_tx = commitment_tx.trust();
+		if commitment_tx.deref().is_colored()
+			&& !self.rgb_backend.is_transaction_durable(
+				&trusted_tx.built_transaction().txid,
+				self.rgb_kv_store.as_ref(),
+			) {
+			return Err(());
+		}
 		Ok(trusted_tx.built_transaction().sign_holder_commitment(
 			&funding_key,
 			&funding_redeemscript,
@@ -2024,6 +2044,18 @@ impl EcdsaChannelSigner for InMemorySigner {
 			&channel_parameters.counterparty_pubkeys().expect(MISSING_PARAMS_ERR).funding_pubkey;
 		let channel_funding_redeemscript =
 			make_funding_redeemscript(&funding_pubkey, counterparty_funding_key);
+		if closing_tx
+			.trust()
+			.built_transaction()
+			.output
+			.iter()
+			.any(|output| output.script_pubkey.is_op_return())
+			&& !self.rgb_backend.is_transaction_durable(
+				&closing_tx.trust().built_transaction().compute_txid(),
+				self.rgb_kv_store.as_ref(),
+			) {
+			return Err(());
+		}
 		Ok(closing_tx.trust().sign(
 			&funding_key,
 			&channel_funding_redeemscript,
@@ -2187,7 +2219,7 @@ pub struct KeysManager {
 	seed: [u8; 32],
 	starting_time_secs: u64,
 	starting_time_nanos: u32,
-	ldk_data_dir: PathBuf,
+	rgb_backend: Arc<RgbBackend>,
 	rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 }
 
@@ -2216,7 +2248,7 @@ impl KeysManager {
 	/// [`ChannelMonitor`]: crate::chain::channelmonitor::ChannelMonitor
 	pub fn new(
 		seed: &[u8; 32], starting_time_secs: u64, starting_time_nanos: u32,
-		v2_remote_key_derivation: bool, ldk_data_dir: PathBuf,
+		v2_remote_key_derivation: bool, rgb_backend: Arc<RgbBackend>,
 		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> Self {
 		// Constants for key derivation path indices used in this function.
@@ -2311,7 +2343,7 @@ impl KeysManager {
 					seed: *seed,
 					starting_time_secs,
 					starting_time_nanos,
-					ldk_data_dir,
+					rgb_backend,
 					rgb_kv_store,
 				};
 				let secp_seed = res.get_secure_random_bytes();
@@ -2430,7 +2462,7 @@ impl KeysManager {
 			htlc_base_key,
 			commitment_seed,
 			params.clone(),
-			self.ldk_data_dir.clone(),
+			Arc::clone(&self.rgb_backend),
 			prng_seed,
 			Arc::clone(&self.rgb_kv_store),
 		)
@@ -2849,7 +2881,7 @@ impl PhantomKeysManager {
 	/// [phantom node payments]: PhantomKeysManager
 	pub fn new(
 		seed: &[u8; 32], starting_time_secs: u64, starting_time_nanos: u32,
-		cross_node_seed: &[u8; 32], v2_remote_key_derivation: bool, ldk_data_dir: PathBuf,
+		cross_node_seed: &[u8; 32], v2_remote_key_derivation: bool, rgb_backend: Arc<RgbBackend>,
 		rgb_kv_store: Arc<dyn KVStoreSync + Send + Sync>,
 	) -> Self {
 		let inner = KeysManager::new(
@@ -2857,7 +2889,7 @@ impl PhantomKeysManager {
 			starting_time_secs,
 			starting_time_nanos,
 			v2_remote_key_derivation,
-			ldk_data_dir,
+			rgb_backend,
 			rgb_kv_store,
 		);
 		let (inbound_key, phantom_key) = hkdf_extract_expand_twice(

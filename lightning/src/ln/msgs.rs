@@ -31,7 +31,7 @@ use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{secp256k1, Transaction, Witness};
 
-use rgb_lib::{ContractId, RgbTransport};
+use crate::rgb_utils::{ContractId, RgbTransport};
 
 use crate::blinded_path::message::BlindedMessagePath;
 use crate::blinded_path::payment::{
@@ -2302,7 +2302,7 @@ mod fuzzy_internal_msgs {
 	use crate::types::payment::{PaymentPreimage, PaymentSecret};
 	use bitcoin::secp256k1::PublicKey;
 
-	use rgb_lib::ContractId;
+	use crate::rgb_utils::ContractId;
 
 	#[allow(unused_imports)]
 	use crate::prelude::*;

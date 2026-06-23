@@ -40,7 +40,7 @@ use bitcoin::secp256k1::ecdsa::RecoverableSignature;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::{Message, Secp256k1};
 
-use rgb_lib::ContractId;
+pub use rgbstd::ContractId;
 
 use alloc::boxed::Box;
 use alloc::string;
@@ -1682,7 +1682,7 @@ impl Bolt11Invoice {
 
 	/// Returns the invoice's `rgb_contract_id` if present
 	pub fn rgb_contract_id(&self) -> Option<ContractId> {
-		self.signed_invoice.rgb_contract_id().map(|x| x.0)
+		self.signed_invoice.rgb_contract_id().map(|x| x.0.clone())
 	}
 }
 
