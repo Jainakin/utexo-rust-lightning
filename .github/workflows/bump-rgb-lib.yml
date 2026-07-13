@@ -53,7 +53,7 @@ jobs:
 
       - name: Create pull request
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RGB_LIB_RUST_LIGHTNING_PAT }}
         run: |
           gh pr create \
             --title "chore: bump rgb-lib to ${{ steps.version.outputs.version }}" \
@@ -63,6 +63,6 @@ jobs:
 
       - name: Dispatch CI on bump branch
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RGB_LIB_RUST_LIGHTNING_PAT }}
         run: |
           gh workflow run build.yml --ref "${{ steps.version.outputs.branch }}"
