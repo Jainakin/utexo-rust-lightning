@@ -1534,7 +1534,7 @@ impl BackgroundProcessor {
 							SCORER_PERSISTENCE_KEY,
 							scorer.encode(),
 						) {
-							log_error!(logger, "Error: Failed to persist scorer, check your disk and permissions {}", e)
+							log_error!(logger, "Error: Failed to persist scorer, check your disk and permissions {}", e);
 						}
 					}
 				}
