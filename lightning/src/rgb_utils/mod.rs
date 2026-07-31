@@ -25,9 +25,10 @@ use rgb_lib::{
 		DatabaseType, OnlineOptions, SinglesigKeys, Wallet, WalletData,
 	},
 	AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
-	FileContent, RgbTransfer, RgbTransport, WitnessOrd,
+	Fascia, FileContent, RgbTransfer, RgbTransport, WitnessOrd,
 };
 use serde::{Deserialize, Serialize};
+use strict_encoding::{StrictDeserialize, StrictSerialize};
 use tokio::runtime::Handle;
 
 use crate::io;
@@ -70,6 +71,8 @@ pub const RGB_PAYMENT_INFO_OUTBOUND_NS: &str = "payment_info_outbound";
 pub const RGB_TRANSFER_INFO_NS: &str = "transfer_info";
 /// Secondary namespace for consignment data
 pub const RGB_CONSIGNMENT_NS: &str = "consignment";
+/// Secondary namespace for the latest commitment fascia of each channel
+pub const RGB_COMMITMENT_FASCIA_NS: &str = "commitment_fascia";
 /// Secondary namespace for wallet configuration
 pub const RGB_WALLET_CONFIG_NS: &str = "wallet_config";
 const VANILLA_SYNC_LOOKBACK: u32 = 20;
@@ -298,6 +301,14 @@ fn _counterparty_output_index(
 		.map(|(idx, _)| idx)
 }
 
+/// Deserialize a fascia stored by `color_commitment`
+pub fn deserialize_fascia(data: Vec<u8>) -> Result<Fascia, io::Error> {
+	let confined = amplify::confinement::Confined::try_from(data)
+		.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+	Fascia::from_strict_serialized::<{ usize::MAX }>(confined)
+		.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 /// Return the position of the OP_RETURN output, if present
 pub fn op_return_position(tx: &Transaction) -> Option<usize> {
 	tx.output.iter().position(|o| o.script_pubkey.is_op_return())
@@ -506,6 +517,15 @@ where
 	commitment_transaction.built = BuiltCommitmentTransaction { transaction: modified_tx, txid };
 
 	wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)).unwrap();
+
+	// Keep the latest fascia per commitment side so a wallet restored without
+	// an RGB backup can re-consume it and color force-close sweeps.
+	let fascia_key = format!("{}_{}", chan_id, if counterparty { "cp" } else { "local" });
+	let fascia_bytes =
+		fascia.to_strict_serialized::<{ usize::MAX }>().expect("serializable fascia").release();
+	kv_store
+		.write(RGB_PRIMARY_NS, RGB_COMMITMENT_FASCIA_NS, &fascia_key, fascia_bytes)
+		.expect("KVStore write failed");
 
 	let rgb_amount = if counterparty {
 		vout_p2wpkh_amt + rgb_offered_htlc
